@@ -1,8 +1,15 @@
 # Data files
-.nc
+*.nc
 
 # Images
-.png
-.jpg
-.gif
-.jpeg
+*.png
+*.jpg
+*.gif
+*.jpeg
+
+# Output files
+*.out
+*.err
+*.log
+*.ipynb_checkpoints
+__pycache__/
