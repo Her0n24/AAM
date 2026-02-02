@@ -18,7 +18,7 @@ import gc
 base_path = os.getcwd()
 ear5_path_base = "/badc/ecmwf-era5/data/oper/an_ml/" #an_ml for analysis on model levels
 # an_sfc for analysis on surface levels
-save_path = f"{base_path}/AAM_data/monthly_mean/"
+save_path = f"{base_path}/monthly_mean/variables/"
 os.makedirs(save_path, exist_ok=True)
 # base path hhhn2@sci-vm-01:/badc/ecmwf-era5/data/oper/an_ml/2022/01/01$
 # full file name ecmwf-era5_oper_an_ml_197901011100.u.nc
@@ -92,8 +92,9 @@ def compute_zonal_mean_from_nc(year, month, variable):
         if variable == 'lnsp':
             data_t = np.exp(data_t)
         
+        output_variable = 'sp' if variable == 'lnsp' else variable
         # write to file
-        fname = os.path.join(save_path, f"zonal_mean_ERA5_{variable}_{tstr}.nc")
+        fname = os.path.join(save_path, f"zonal_mean_ERA5_{output_variable}_{tstr}.nc")
         ds_out = xr.Dataset({output_name: data_t})
         ds_out.to_netcdf(fname)
         print(f"Wrote {fname}")
