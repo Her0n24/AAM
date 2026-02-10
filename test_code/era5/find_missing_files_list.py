@@ -1,7 +1,7 @@
 import os
 import xarray as xr
 base_path = "monthly_mean/variables/"
-start_year = 1990
+start_year = 1980
 end_year = 1999
 
 missing_files = []

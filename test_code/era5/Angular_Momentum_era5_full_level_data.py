@@ -1,6 +1,6 @@
 """
 The code uses monthly mean values of surface pressure (ps) and zonal winds (u)
-to compute vertically integrated angular momentum summed over longitude
+to compute angular momentum summed over longitude, variation in latitude and vertical levels, and saves the result as a netCDF file for each month.
 """
 import time
 time_start = time.time()
@@ -17,7 +17,7 @@ monthly_mean_path_base = f"{base_path}/monthly_mean/variables"
 save_path = f"{base_path}/monthly_mean/AAM"
 print(monthly_mean_path_base)
 
-start_yr = 1990
+start_yr = 1980
 end_yr = 2000
 
 # Load the a and b sigma level coefficients
@@ -36,6 +36,8 @@ omega = 7.292116e-5 # rad/s
 r3g = r**3 / g
 two_pi = 2.0 * np.pi
 
+# Flag to check if da/db have been reversed (do this only once)
+da_db_reversed = False
 
 for year in range(start_yr, end_yr + 1):
     for m in range(1, 13):
@@ -98,6 +100,25 @@ for year in range(start_yr, end_yr + 1):
         else:
             raise KeyError("Cannot find surface pressure variable (lnsp, sp, or surface_air_pressure)")
 
+        # Ensure the ordering of the `da`/`db` coefficients matches the dataset `level` ordering.
+        # Coefficients `a` and `b` are provided top->bottom (level 1 is top). If the dataset's
+        # `level` coordinate runs in the opposite direction, reverse `da`/`db` so `dp` aligns
+        # with `u_mid` when we compute layer thickness as `da + db * ps`.
+        # Only check and reverse once (first iteration)
+        if not da_db_reversed:
+            try:
+                level_coords = u_var['level'].values
+                # If level coordinates are decreasing (e.g., 137..1), reverse da/db
+                if np.all(np.diff(level_coords) < 0):
+                    da = da[::-1]
+                    db = db[::-1]
+                    print("Reversed da/db to match dataset level ordering")
+                da_db_reversed = True
+            except Exception:
+                # If we can't determine ordering, warn but continue; user should verify alignment
+                print("Warning: could not determine `level` ordering; verify da/db alignment manually")
+                da_db_reversed = True
+
         # compute u on mid-levels: shape (time, n_mid, lat)
         # compute mid-levels by averaging adjacent model levels; keep as numpy for the later ops
         u_mid = 0.5 * (u_var.isel(level=slice(1, None)).values + u_var.isel(level=slice(0, -1)).values)
@@ -109,6 +130,9 @@ for year in range(start_yr, end_yr + 1):
         # u_mid dims: (time, n_mid, lat)
         time_coords = u_var['time'].values
         lat_coords = u_var['latitude'].values
+        full_lvl_coords = u_var['level'].values
+        # Create mid-level coordinates (average of adjacent full levels)
+        mid_lvl_coords = 0.5 * (full_lvl_coords[:-1] + full_lvl_coords[1:])
 
         # Ensure time_coords is always an array, even if it's a single value
         if time_coords.ndim == 0:
@@ -120,7 +144,7 @@ for year in range(start_yr, end_yr + 1):
         if ps_vals.ndim == 2 and ps_vals.shape[0] == 1:
             ps_vals = ps_vals.squeeze(axis=0)  # (lat,)
 
-        dp = da[:, None] + db[:, None] * ps_vals[None, :]  # (n_mid, lat)
+        dp = da[:, None] + db[:, None] * ps_vals[None, :]  # (n_mid, lat) #da, db and ps are in Pa
 
         # latitude parameters
         lat_rad = np.radians(lat_coords)
@@ -136,23 +160,20 @@ for year in range(start_yr, end_yr + 1):
         delta_phi_b = delta_phi[None, :]  # (1,lat)
 
         # integrand: (rocos + u_mid) * cossq * r3g * dp * 2*pi * delta_phi
-        integrand = (rocos_b + u_mid) * cossq_b * r3g * dp * two_pi * delta_phi_b  # (n_mid,lat), multiply 2pi for the full longitudinal integral (after zonal mean)
-        # integrand shape (n_min, lat)
-
-        # sum over vertical mid-levels (axis=0) -> result shape (lat,)
-        aam_lat = np.sum(integrand, axis=0)
+        AAM = (rocos_b + u_mid) * cossq_b * r3g * dp * two_pi * delta_phi_b  # (n_mid,lat), multiply 2pi for the full longitudinal integral (after zonal mean)
+        # AAM shape (n_min, lat)
 
         # create xarray DataArray and save
         aam_da = xr.DataArray(
-            aam_lat[None,:], # Add time dimension back, date is from the input nc: (1, lat)
-            coords={'time': time_coords, 'latitude': lat_coords},
-            dims=['time', 'latitude'],
+            AAM[None,:, :], # Add time dimension back, date is from the input nc: (1, n_mid, lat)
+            coords={'time': time_coords, 'mid_level': mid_lvl_coords, 'latitude': lat_coords},
+            dims=['time', 'mid_level', 'latitude'],
             name='AAM'
         )
         aam_da.attrs['long_name'] = 'absolute_atmospheric_angular_momentum'
         aam_da.attrs['units'] = 'kg m**-1 s**-1'
 
-        out_fname = f"{save_path}/AAM_ERA5_{np.datetime_as_string(time_coords[0], unit='M')}.nc"
+        out_fname = f"{save_path}/AAM_ERA5_{np.datetime_as_string(time_coords[0], unit='M')}_full_level.nc"
         aam_da.to_dataset(name='AAM').to_netcdf(out_fname)
         print("Wrote", out_fname)
 

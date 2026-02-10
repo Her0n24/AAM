@@ -3,12 +3,12 @@
 #SBATCH --output=logs/repo_%A_%a.out
 #SBATCH --error=logs/repo_%A_%a.err
 #SBATCH --account=leader_epesc
-#SBATCH --time=01:10:00
+#SBATCH --time=01:30:00
 #SBATCH --mem=40G
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=2
 #SBATCH --partition=standard
-#SBATCH --qos=standard
-#SBATCH --array=1-50%3
+#SBATCH --qos=high
+#SBATCH --array=1-40%5
 
 # Activate your conda environment
 module load jaspy
