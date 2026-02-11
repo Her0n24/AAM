@@ -42,8 +42,8 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
     # Load all data for the specified period
     all_files = []
     for year in range(start_year, end_year + 1):
-        pattern = f"{AAM_data_path}AAM_ERA5_{year}*.nc"
-        year_files = glob.glob(pattern)
+        pattern = f"{AAM_data_path}AAM_ERA5_{year}*.nc" # Excludes files starting with 'f' after year
+        year_files = [f for f in glob.glob(pattern) if '_full_level' not in f]
         if not year_files:
             print(f"Warning: No files found for year {year}")
             continue
@@ -148,6 +148,7 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
         boundaries=levels,
         extend='both',
         orientation='horizontal',
+        spacing='proportional',
         pad=0.16,
         fraction=0.03,
         shrink=1.5,

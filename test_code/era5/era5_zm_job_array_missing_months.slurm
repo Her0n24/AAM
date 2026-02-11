@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --partition=standard
 #SBATCH --qos=high
-#SBATCH --array=1-40%5
+#SBATCH --array=1-25%5
 
 # Activate your conda environment
 module load jaspy
