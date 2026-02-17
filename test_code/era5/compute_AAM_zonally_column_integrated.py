@@ -1,6 +1,7 @@
 """
 The code uses monthly mean values of surface pressure (ps) and zonal winds (u)
-to compute vertically integrated angular momentum summed over longitude
+to compute vertically integrated angular momentum summed over longitude.
+output dimensions are (time, lat) and the result is saved as a netCDF file for each month.
 """
 import time
 time_start = time.time()

@@ -133,7 +133,7 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
 
     ax.set_ylabel('Latitude (°)', size=16)
     ax.set_xlabel('Year', size=16)
-    ax.set_title(f"ERA5 Analysis {component} fluctuations from Climatology ({start_year}-{end_year})", size=18)
+    ax.set_title(f"ERA5 Reanalysis {component} fluctuations from Climatology ({start_year}-{end_year})", size=18)
     ax.grid(True, alpha=0.3)
     
     # Add black solid line at equator (latitude = 0)

@@ -1,8 +1,9 @@
 """
-The code obtain ERA5/ ERA-Interim modelled level output files from share folder and computes monthly zonal mean of some physical properties. 
+The code obtains ERA5 model level output files from share folder and computes monthly mean of physical properties. 
+This version preserves the full spatial structure (lat, lon, level) - no zonal averaging.
 Multiprocessing is introduced to use multiple cores on Lotus to speed up computation.
 The variables we're looking for are surface pressure (ps)/ natural log of surface pressure (lnsp) and zonal wind (u).
-The zonal mean .nc files are then saved to local folder for later use in computing Atmospheric Angular Momentum (AAM).
+The monthly mean .nc files are then saved to local folder for later use in computing Atmospheric Angular Momentum (AAM).
 """
 import time
 time_start = time.time()
@@ -41,9 +42,9 @@ def get_available_years_months(base=era5_path_base):
                 years[year_dir] = months
     return years
 
-def compute_zonal_mean_from_nc(year, month, variable):
+def compute_monthly_mean_from_nc(year, month, variable):
     """
-    Load a single variable for a given year/month, compute monthly zonal mean,
+    Load a single variable for a given year/month, compute monthly mean (preserving full spatial structure),
     and write to .nc file.
     """
     if month < 1 or month > 12:
@@ -53,11 +54,11 @@ def compute_zonal_mean_from_nc(year, month, variable):
     if variable == 'u':
         glob_pattern = f"{era5_path_base}{year}/{str(month).zfill(2)}/*/*.u.nc"
         var_name = 'u'
-        output_name = 'u_zonal_mean'
+        output_name = 'u'
     elif variable == 'lnsp':
         glob_pattern = f"{era5_path_base}{year}/{str(month).zfill(2)}/*/*.lnsp.nc"
         var_name = 'lnsp'
-        output_name = 'surface_pressure_zonal_mean'
+        output_name = 'sp'  # Will convert to surface pressure
     
     try:
         ds = xr.open_mfdataset(glob_pattern, combine='by_coords',
@@ -69,8 +70,8 @@ def compute_zonal_mean_from_nc(year, month, variable):
     
     print(f"Processing {variable} for {year}/{month:02d}")
 
-    # monthly mean and zonal mean
-    ds_mm = ds.resample(time='1MS').mean(skipna=True).mean(dim='longitude', skipna=True)
+    # monthly mean (NO zonal averaging - preserve lon dimension)
+    ds_mm = ds.resample(time='1MS').mean(skipna=True)
     ds.close()
     del ds
     gc.collect()
@@ -88,14 +89,16 @@ def compute_zonal_mean_from_nc(year, month, variable):
         tstr = np.datetime_as_string(t, unit='M')  # YYYY-MM
         data_t = ds_mm.sel(time=t)[var_name]
         print(f"Processing time: {tstr}", flush=True)
+        
         # Convert lnsp to pressure 
         if variable == 'lnsp':
             data_t = np.exp(data_t)
         
         output_variable = 'sp' if variable == 'lnsp' else variable
-        # write to file
-        fname = os.path.join(save_path, f"zonal_mean_ERA5_{output_variable}_{tstr}.nc")
-        ds_out = xr.Dataset({output_name: data_t})
+        
+        # write to file (no "zonal_mean_" prefix)
+        fname = os.path.join(save_path, f"ERA5_{output_variable}_{tstr}.nc")
+        ds_out = xr.Dataset({output_variable: data_t})
         ds_out.to_netcdf(fname)
         print(f"Wrote {fname}")
         del ds_out
@@ -105,24 +108,26 @@ def compute_zonal_mean_from_nc(year, month, variable):
     gc.collect()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Compute ERA5 zonal means. If no year/ month specified, process all available years/ months.')
+    parser = argparse.ArgumentParser(
+        description='Compute ERA5 monthly means (full fields, not zonal mean). '
+                    'If no year/month specified, process all available years/months.'
+    )
     parser.add_argument('--year', type=int, help='Year to process')
     parser.add_argument('--month', type=int, help='Month to process')
     args = parser.parse_args()
 
     year = args.year
-    month = str(args.month).zfill(2)  # Convert to string first, then pad with zeros 
     
     if args.year and args.month:
-        compute_zonal_mean_from_nc(year, args.month, 'u')  # Pass integer month
-        compute_zonal_mean_from_nc(year, args.month, 'lnsp')  # Pass integer monthnsp')  # Pass integer month
+        compute_monthly_mean_from_nc(year, args.month, 'u')
+        compute_monthly_mean_from_nc(year, args.month, 'lnsp')
     else:
         avail = get_available_years_months()
         disable_tqdm = not sys.stdout.isatty()
         for variable in ['u', 'lnsp']:
             for year in tqdm.tqdm(avail, disable=disable_tqdm):
                 for month in avail[year]:
-                    compute_zonal_mean_from_nc(year, month, variable)
+                    compute_monthly_mean_from_nc(year, month, variable)
 
     time_end = time.time()
     print(f"Time taken: {time_end - time_start} seconds")

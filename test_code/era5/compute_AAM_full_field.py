@@ -1,6 +1,8 @@
 """
 The code uses monthly mean values of surface pressure (ps) and zonal winds (u)
-to compute angular momentum summed over longitude, variation in latitude and vertical levels, and saves the result as a netCDF file for each month.
+to compute angular momentum at each latitude, longitude, and vertical level, 
+and saves the result as a netCDF file for each month.
+This version computes FULL AAM (not zonal mean) with dimensions (time, level, lat, lon).
 """
 import time
 time_start = time.time()
@@ -34,7 +36,6 @@ r = 6371229.0 # m
 g = 9.80665 # m/s2
 omega = 7.292116e-5 # rad/s
 r3g = r**3 / g
-two_pi = 2.0 * np.pi
 
 # Flag to check if da/db have been reversed (do this only once)
 da_db_reversed = False
@@ -43,9 +44,9 @@ for year in range(start_yr, end_yr + 1):
     for m in range(1, 13):
         # Inspect whether the file exist or not
         print(f"Processing year={year}, month={m:02d}")
-        # Define file paths
-        u_file = f'{monthly_mean_path_base}/zonal_mean_ERA5_u_{year}-{str(m).zfill(2)}.nc'
-        sp_file = f'{monthly_mean_path_base}/zonal_mean_ERA5_sp_{year}-{str(m).zfill(2)}.nc'
+        # Define file paths - use FULL fields (not zonal mean)
+        u_file = f'{monthly_mean_path_base}/ERA5_u_{year}-{str(m).zfill(2)}.nc'
+        sp_file = f'{monthly_mean_path_base}/ERA5_sp_{year}-{str(m).zfill(2)}.nc'
         
         # Check if files exist
         if not os.path.exists(u_file):
@@ -57,16 +58,16 @@ for year in range(start_yr, end_yr + 1):
         
         # Try to load files and check for corruption
         try : 
-            # Load zonal winds 
-            ds_u_mm_zm = xr.open_mfdataset(u_file)
-            # Load natural log of surface pressure
-            ds_lnsp_mm_zm = xr.open_mfdataset(sp_file)
+            # Load zonal winds (full fields with lon dimension)
+            ds_u_mm = xr.open_mfdataset(u_file)
+            # Load surface pressure
+            ds_sp_mm = xr.open_mfdataset(sp_file)
 
             # Test basic data access to catch corruption
-            _ = ds_u_mm_zm.dims
-            _ = ds_lnsp_mm_zm.dims
-            _ = list(ds_u_mm_zm.data_vars.keys())
-            _ = list(ds_lnsp_mm_zm.data_vars.keys())
+            _ = ds_u_mm.dims
+            _ = ds_sp_mm.dims
+            _ = list(ds_u_mm.data_vars.keys())
+            _ = list(ds_sp_mm.data_vars.keys())
 
             print(f"  Files loaded successfully")
             
@@ -75,30 +76,30 @@ for year in range(start_yr, end_yr + 1):
             continue
 
         try:
-            print(ds_lnsp_mm_zm)
-            print(ds_u_mm_zm)
+            print(ds_sp_mm)
+            print(ds_u_mm)
         except Exception as e:
             raise RuntimeError("Error accessing data variables in datasets: " + str(e))
 
         # variable name detection
-        if 'u_zonal_mean' in ds_u_mm_zm.data_vars:
-            u_var = ds_u_mm_zm['u_zonal_mean']
-        elif 'u' in ds_u_mm_zm.data_vars:
-            u_var = ds_u_mm_zm['u']
-        elif 'eastward_wind' in ds_u_mm_zm.data_vars:
-            u_var = ds_u_mm_zm['eastward_wind']
+        if 'u' in ds_u_mm.data_vars:
+            u_var = ds_u_mm['u']
+        elif 'eastward_wind' in ds_u_mm.data_vars:
+            u_var = ds_u_mm['eastward_wind']
+        elif 'u_component_of_wind' in ds_u_mm.data_vars:
+            u_var = ds_u_mm['u_component_of_wind']
         else:
             raise KeyError("Cannot find zonal wind variable (u or eastward_wind) in dataset")
 
-        # surface pressure detection (lnsp -> exp, sp -> direct)
-        if 'surface_pressure_zonal_mean' in ds_lnsp_mm_zm.data_vars:
-            ps_var = ds_lnsp_mm_zm['surface_pressure_zonal_mean']
-        elif 'sp' in ds_lnsp_mm_zm.data_vars:
-            ps_var = ds_lnsp_mm_zm['sp']
-        elif 'surface_air_pressure' in ds_lnsp_mm_zm.data_vars:
-            ps_var = ds_lnsp_mm_zm['surface_air_pressure']
+        # surface pressure detection
+        if 'sp' in ds_sp_mm.data_vars:
+            ps_var = ds_sp_mm['sp']
+        elif 'surface_air_pressure' in ds_sp_mm.data_vars:
+            ps_var = ds_sp_mm['surface_air_pressure']
+        elif 'surface_pressure' in ds_sp_mm.data_vars:
+            ps_var = ds_sp_mm['surface_pressure']
         else:
-            raise KeyError("Cannot find surface pressure variable (lnsp, sp, or surface_air_pressure)")
+            raise KeyError("Cannot find surface pressure variable (sp or surface_air_pressure)")
 
         # Ensure the ordering of the `da`/`db` coefficients matches the dataset `level` ordering.
         # Coefficients `a` and `b` are provided top->bottom (level 1 is top). If the dataset's
@@ -119,17 +120,18 @@ for year in range(start_yr, end_yr + 1):
                 print("Warning: could not determine `level` ordering; verify da/db alignment manually")
                 da_db_reversed = True
 
-        # compute u on mid-levels: shape (time, n_mid, lat)
-        # compute mid-levels by averaging adjacent model levels; keep as numpy for the later ops
+        # compute u on mid-levels: shape (time, n_mid, lat, lon)
+        # compute mid-levels by averaging adjacent model levels
         u_mid = 0.5 * (u_var.isel(level=slice(1, None)).values + u_var.isel(level=slice(0, -1)).values)
 
-        # Squeeze out the time dimension since we only have one time point
+        # Squeeze out the time dimension if we only have one time point
         if u_mid.shape[0] == 1:
-            u_mid = u_mid.squeeze(axis=0)  # (n_mid, lat)
+            u_mid = u_mid.squeeze(axis=0)  # (n_mid, lat, lon)
 
-        # u_mid dims: (time, n_mid, lat)
+        # Extract coordinates
         time_coords = u_var['time'].values
         lat_coords = u_var['latitude'].values
+        lon_coords = u_var['longitude'].values
         full_lvl_coords = u_var['level'].values
         # Create mid-level coordinates (average of adjacent full levels)
         mid_lvl_coords = 0.5 * (full_lvl_coords[:-1] + full_lvl_coords[1:])
@@ -139,41 +141,42 @@ for year in range(start_yr, end_yr + 1):
             time_coords = np.array([time_coords])
 
         # prepare dp: da, db arrays have length n_mid
-        # ps_zm values shape (time, lat)
-        ps_vals = ps_var.values  # (time, lat) surface pressure in Pa
-        if ps_vals.ndim == 2 and ps_vals.shape[0] == 1:
-            ps_vals = ps_vals.squeeze(axis=0)  # (lat,)
+        # ps values shape (time, lat, lon) -> squeeze to (lat, lon) if single time
+        ps_vals = ps_var.values  # (time, lat, lon) surface pressure in Pa
+        if ps_vals.ndim == 3 and ps_vals.shape[0] == 1:
+            ps_vals = ps_vals.squeeze(axis=0)  # (lat, lon)
 
-        dp = da[:, None] + db[:, None] * ps_vals[None, :]  # (n_mid, lat) #da, db and ps are in Pa
+        # Broadcast: dp = da[:, None, None] + db[:, None, None] * ps_vals[None, :, :]
+        # Result: (n_mid, lat, lon)
+        dp = da[:, None, None] + db[:, None, None] * ps_vals[None, :, :]  # (n_mid, lat, lon)
 
         # latitude parameters
         lat_rad = np.radians(lat_coords)
         cos_lat = np.cos(lat_rad)
         cossq = cos_lat**2
         rocos = omega * r * cos_lat  # (lat,)
-        # delta_phi: use gradient (per-lat spacing)
-        delta_phi = np.abs(np.gradient(lat_rad))  # (lat,)
 
-        # broadcast rocos, cossq, delta_phi to (n_mid, lat) shapes as needed
-        rocos_b = rocos[None, :]          # (1,lat)
-        cossq_b = cossq[None, :]          # (1,lat)
-        delta_phi_b = delta_phi[None, :]  # (1,lat)
+        # broadcast rocos, cossq to (n_mid, lat, lon) shapes as needed
+        rocos_b = rocos[None, :, None]  # (1, lat, 1)
+        cossq_b = cossq[None, :, None]  # (1, lat, 1)
 
-        # integrand: (rocos + u_mid) * cossq * r3g * dp * 2*pi * delta_phi
-        AAM = (rocos_b + u_mid) * cossq_b * r3g * dp * two_pi * delta_phi_b  # (n_mid,lat), multiply 2pi for the full longitudinal integral (after zonal mean)
-        # AAM shape (n_min, lat)
+        # AAM at each grid point (no longitudinal or latitudinal integration)
+        # integrand: (rocos + u_mid) * cossq * r3g * dp
+        # Shape: (n_mid, lat, lon)
+        AAM = (rocos_b + u_mid) * cossq_b * r3g * dp
 
         # create xarray DataArray and save
         aam_da = xr.DataArray(
-            AAM[None,:, :], # Add time dimension back, date is from the input nc: (1, n_mid, lat)
-            coords={'time': time_coords, 'mid_level': mid_lvl_coords, 'latitude': lat_coords},
-            dims=['time', 'mid_level', 'latitude'],
+            AAM[None, :, :, :], # Add time dimension back: (1, n_mid, lat, lon)
+            coords={'time': time_coords, 'mid_level': mid_lvl_coords, 'latitude': lat_coords, 'longitude': lon_coords},
+            dims=['time', 'mid_level', 'latitude', 'longitude'],
             name='AAM'
         )
         aam_da.attrs['long_name'] = 'absolute_atmospheric_angular_momentum'
-        aam_da.attrs['units'] = 'kg m**-1 s**-1'
+        aam_da.attrs['units'] = 'kg m**2 s**-1'
+        aam_da.attrs['description'] = 'Full AAM at each lat, lon, and level (not zonal mean)'
 
-        out_fname = f"{save_path}/AAM_ERA5_{np.datetime_as_string(time_coords[0], unit='M')}_full_level.nc"
+        out_fname = f"{save_path}/AAM_ERA5_{np.datetime_as_string(time_coords[0], unit='M')}_full.nc"
         aam_da.to_dataset(name='AAM').to_netcdf(out_fname)
         print("Wrote", out_fname)
 
