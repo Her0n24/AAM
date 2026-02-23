@@ -3,12 +3,12 @@
 #SBATCH --output=logs/%A_%a.out
 #SBATCH --error=logs/%A_%a.err
 #SBATCH --account=leader_epesc
-#SBATCH --time=01:30:00
+#SBATCH --time=01:00:00
 #SBATCH --mem=40G
 #SBATCH --cpus-per-task=2
 #SBATCH --partition=standard
 #SBATCH --qos=high
-#SBATCH --array=1-20%5
+#SBATCH --array=1-100%5
 
 # Load required modules
 module load jaspy
@@ -16,8 +16,8 @@ module load jaspy
 # Activate virtual environment if you have one
 
 # Run your command
-START_YEAR=1997
-END_YEAR=1998
+START_YEAR=1990
+END_YEAR=1996
 
 MONTH_INDEX=$SLURM_ARRAY_TASK_ID
 

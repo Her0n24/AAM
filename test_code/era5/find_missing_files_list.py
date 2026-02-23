@@ -8,9 +8,9 @@ missing_files = []
 
 for year in range(start_year, end_year + 1):
     for month in range(1,13):
-        filename_u = f"zonal_mean_ERA5_u_{year:04d}-{month:02d}.nc"
+        filename_u = f"ERA5_u_{year:04d}-{month:02d}.nc" # zonal_mean_ERA5_u_{year}_{month}.nc
         filepath_u = os.path.join(base_path, filename_u)
-        filename_sp = f"zonal_mean_ERA5_sp_{year:04d}-{month:02d}.nc"
+        filename_sp = f"ERA5_sp_{year:04d}-{month:02d}.nc" # zonal_mean_ERA5_sp_{year}_{month}.nc
         filepath_sp = os.path.join(base_path, filename_sp)
 
         # Check if files exist and are valid

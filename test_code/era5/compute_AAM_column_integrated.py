@@ -1,8 +1,11 @@
 """
 The code uses monthly mean values of surface pressure (ps) and zonal winds (u)
-to compute angular momentum at each latitude, longitude, and vertical level, 
+to compute vertically integrated angular momentum at each latitude and longitude, 
 and saves the result as a netCDF file for each month.
-This version computes FULL AAM (not zonal mean) with dimensions (time, level, lat, lon).
+This version computes vertically integrated AAM (not zonal mean) with dimensions (time, lat, lon).
+
+Usage:
+    python compute_AAM_full_field.py
 """
 import time
 time_start = time.time()
@@ -120,65 +123,79 @@ for year in range(start_yr, end_yr + 1):
                 print("Warning: could not determine `level` ordering; verify da/db alignment manually")
                 da_db_reversed = True
 
-        # compute u on mid-levels: shape (time, n_mid, lat, lon)
-        # compute mid-levels by averaging adjacent model levels
-        u_mid = 0.5 * (u_var.isel(level=slice(1, None)).values + u_var.isel(level=slice(0, -1)).values)
+        try:
+            # compute u on mid-levels: shape (time, n_mid, lat, lon)
+            # compute mid-levels by averaging adjacent model levels
+            u_mid = 0.5 * (u_var.isel(level=slice(1, None)).values + u_var.isel(level=slice(0, -1)).values)
 
-        # Squeeze out the time dimension if we only have one time point
-        if u_mid.shape[0] == 1:
-            u_mid = u_mid.squeeze(axis=0)  # (n_mid, lat, lon)
+            # Squeeze out the time dimension if we only have one time point
+            if u_mid.shape[0] == 1:
+                u_mid = u_mid.squeeze(axis=0)  # (n_mid, lat, lon)
 
-        # Extract coordinates
-        time_coords = u_var['time'].values
-        lat_coords = u_var['latitude'].values
-        lon_coords = u_var['longitude'].values
-        full_lvl_coords = u_var['level'].values
-        # Create mid-level coordinates (average of adjacent full levels)
-        mid_lvl_coords = 0.5 * (full_lvl_coords[:-1] + full_lvl_coords[1:])
+            # Extract coordinates
+            time_coords = u_var['time'].values
+            lat_coords = u_var['latitude'].values
+            lon_coords = u_var['longitude'].values
+            full_lvl_coords = u_var['level'].values
+            # Create mid-level coordinates (average of adjacent full levels)
+            mid_lvl_coords = 0.5 * (full_lvl_coords[:-1] + full_lvl_coords[1:])
 
-        # Ensure time_coords is always an array, even if it's a single value
-        if time_coords.ndim == 0:
-            time_coords = np.array([time_coords])
+            # Ensure time_coords is always an array, even if it's a single value
+            if time_coords.ndim == 0:
+                time_coords = np.array([time_coords])
 
-        # prepare dp: da, db arrays have length n_mid
-        # ps values shape (time, lat, lon) -> squeeze to (lat, lon) if single time
-        ps_vals = ps_var.values  # (time, lat, lon) surface pressure in Pa
-        if ps_vals.ndim == 3 and ps_vals.shape[0] == 1:
-            ps_vals = ps_vals.squeeze(axis=0)  # (lat, lon)
+            # prepare dp: da, db arrays have length n_mid
+            # ps values shape (time, lat, lon) -> squeeze to (lat, lon) if single time
+            ps_vals = ps_var.values  # (time, lat, lon) surface pressure in Pa
+            if ps_vals.ndim == 3 and ps_vals.shape[0] == 1:
+                ps_vals = ps_vals.squeeze(axis=0)  # (lat, lon)
 
-        # Broadcast: dp = da[:, None, None] + db[:, None, None] * ps_vals[None, :, :]
-        # Result: (n_mid, lat, lon)
-        dp = da[:, None, None] + db[:, None, None] * ps_vals[None, :, :]  # (n_mid, lat, lon)
+            # Broadcast: dp = da[:, None, None] + db[:, None, None] * ps_vals[None, :, :]
+            # Result: (n_mid, lat, lon)
+            dp = da[:, None, None] + db[:, None, None] * ps_vals[None, :, :]  # (n_mid, lat, lon)
 
-        # latitude parameters
-        lat_rad = np.radians(lat_coords)
-        cos_lat = np.cos(lat_rad)
-        cossq = cos_lat**2
-        rocos = omega * r * cos_lat  # (lat,)
+            # latitude parameters
+            lat_rad = np.radians(lat_coords)
+            cos_lat = np.cos(lat_rad)
+            cossq = cos_lat**2
+            rocos = omega * r * cos_lat  # (lat,)
 
-        # broadcast rocos, cossq to (n_mid, lat, lon) shapes as needed
-        rocos_b = rocos[None, :, None]  # (1, lat, 1)
-        cossq_b = cossq[None, :, None]  # (1, lat, 1)
+            # broadcast rocos, cossq to (n_mid, lat, lon) shapes as needed
+            rocos_b = rocos[None, :, None]  # (1, lat, 1)
+            cossq_b = cossq[None, :, None]  # (1, lat, 1)
 
-        # AAM at each grid point (no longitudinal or latitudinal integration)
-        # integrand: (rocos + u_mid) * cossq * r3g * dp
-        # Shape: (n_mid, lat, lon)
-        AAM = (rocos_b + u_mid) * cossq_b * r3g * dp
+            # AAM at each grid point (no longitudinal or latitudinal integration)
+            # integrand: (rocos + u_mid) * cossq * r3g * dp
+            # Shape: (n_mid, lat, lon)
+            AAM = (rocos_b + u_mid) * cossq_b * r3g * dp
 
-        # create xarray DataArray and save
-        aam_da = xr.DataArray(
-            AAM[None, :, :, :], # Add time dimension back: (1, n_mid, lat, lon)
-            coords={'time': time_coords, 'mid_level': mid_lvl_coords, 'latitude': lat_coords, 'longitude': lon_coords},
-            dims=['time', 'mid_level', 'latitude', 'longitude'],
-            name='AAM'
-        )
-        aam_da.attrs['long_name'] = 'absolute_atmospheric_angular_momentum'
-        aam_da.attrs['units'] = 'kg m**2 s**-1'
-        aam_da.attrs['description'] = 'Full AAM at each lat, lon, and level (not zonal mean)'
+            # Vertically integrate by summing over mid-levels
+            # Shape: (lat, lon)
+            AAM_vertint = np.sum(AAM, axis=0)
 
-        out_fname = f"{save_path}/AAM_ERA5_{np.datetime_as_string(time_coords[0], unit='M')}_full.nc"
-        aam_da.to_dataset(name='AAM').to_netcdf(out_fname)
-        print("Wrote", out_fname)
+            # create xarray DataArray and save
+            aam_da = xr.DataArray(
+                AAM_vertint[None, :, :], # Add time dimension back: (1, lat, lon)
+                coords={'time': time_coords, 'latitude': lat_coords, 'longitude': lon_coords},
+                dims=['time', 'latitude', 'longitude'],
+                name='AAM'
+            )
+            aam_da.attrs['long_name'] = 'vertically_integrated_atmospheric_angular_momentum'
+            aam_da.attrs['units'] = 'kg m**2 s**-1'
+            aam_da.attrs['description'] = 'Vertically integrated AAM at each lat, lon (not zonal mean)'
+
+            out_fname = f"{save_path}/AAM_ERA5_{np.datetime_as_string(time_coords[0], unit='M')}_vertint.nc"
+            aam_da.to_dataset(name='AAM').to_netcdf(out_fname)
+            print("Wrote", out_fname)
+            
+        except Exception as e:
+            print(f"  Skipping: Error computing AAM - {str(e)}")
+            print(f"  This file may be corrupted: {u_file}")
+        
+        finally:
+            # Close datasets to free file handles
+            ds_u_mm.close()
+            ds_sp_mm.close()
 
 time_end = time.time()
 print(f"Time taken: {time_end - time_start} seconds")
