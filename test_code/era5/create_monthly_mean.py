@@ -22,9 +22,10 @@ import sys
 import gc
 
 base_path = os.getcwd()
+scratch_path = "/work/scratch-nopw2/hhhn2"
 era5_path_base = "/badc/ecmwf-era5/data/oper/an_ml/" #an_ml for analysis on model levels
 # an_sfc for analysis on surface levels
-save_path = f"{base_path}/monthly_mean/variables/"
+save_path = f"{scratch_path}/ERA5/monthly_mean/variables"
 os.makedirs(save_path, exist_ok=True)
 # base path hhhn2@sci-vm-01:/badc/ecmwf-era5/data/oper/an_ml/2022/01/01$
 # full file name ecmwf-era5_oper_an_ml_197901011100.u.nc
