@@ -4,6 +4,11 @@ This version preserves the full spatial structure (lat, lon, level) - no zonal a
 Multiprocessing is introduced to use multiple cores on Lotus to speed up computation.
 The variables we're looking for are surface pressure (ps)/ natural log of surface pressure (lnsp) and zonal wind (u).
 The monthly mean .nc files are then saved to local folder for later use in computing Atmospheric Angular Momentum (AAM).
+
+Usage:
+    python create_monthly_mean.py --year 1980 --month 1
+    python create_monthly_mean.py  # to process all available years/months
+
 """
 import time
 time_start = time.time()

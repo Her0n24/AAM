@@ -2,10 +2,10 @@
 The code uses monthly mean values of surface pressure (ps) and zonal winds (u)
 to compute vertically integrated angular momentum at each latitude and longitude, 
 and saves the result as a netCDF file for each month.
-This version computes vertically integrated AAM (not zonal mean) with dimensions (time, lat, lon).
+This version computes full 4D AAM (not zonal mean) with dimensions (time, level, lat, lon).
 
 Usage:
-    python compute_AAM_column_integrated.py
+    python compute_AAM_full_field.py
 """
 import time
 time_start = time.time()
@@ -18,9 +18,13 @@ import xarray as xr
 import tqdm
 
 base_path = os.getcwd()
-monthly_mean_path_base = f"{base_path}/monthly_mean/variables" 
-save_path = f"{base_path}/monthly_mean/AAM"
+scratch_path = "/work/scratch-nopw2/hhhn2"
+monthly_mean_path_base = f"{scratch_path}/ERA5/monthly_mean/variables" # f"{base_path}/monthly_mean/variables" 
+save_path = f"{scratch_path}/ERA5/monthly_mean/AAM/full"
 print(monthly_mean_path_base)
+
+# Create save path if it doesn't exist
+os.makedirs(save_path, exist_ok=True)
 
 start_yr = 1980
 end_yr = 2000
@@ -169,23 +173,28 @@ for year in range(start_yr, end_yr + 1):
             # Shape: (n_mid, lat, lon)
             AAM = (rocos_b + u_mid) * cossq_b * r3g * dp
 
-            # Vertically integrate by summing over mid-levels
-            # Shape: (lat, lon)
-            AAM_vertint = np.sum(AAM, axis=0)
+            # Keep full 3D field (no vertical integration)
+            # Add time dimension back: (1, n_mid, lat, lon)
+            AAM_4d = AAM[None, :, :, :]
 
             # create xarray DataArray and save
             aam_da = xr.DataArray(
-                AAM_vertint[None, :, :], # Add time dimension back: (1, lat, lon)
-                coords={'time': time_coords, 'latitude': lat_coords, 'longitude': lon_coords},
-                dims=['time', 'latitude', 'longitude'],
+                AAM_4d,
+                coords={'time': time_coords, 'level': mid_lvl_coords, 'latitude': lat_coords, 'longitude': lon_coords},
+                dims=['time', 'level', 'latitude', 'longitude'],
                 name='AAM'
             )
-            aam_da.attrs['long_name'] = 'vertically_integrated_atmospheric_angular_momentum'
+            aam_da.attrs['long_name'] = 'atmospheric_angular_momentum'
             aam_da.attrs['units'] = 'kg m**2 s**-1'
-            aam_da.attrs['description'] = 'Vertically integrated AAM at each lat, lon (not zonal mean)'
+            aam_da.attrs['description'] = 'AAM at each level, lat, lon (full 3D field, not vertically integrated)'
 
-            out_fname = f"{save_path}/AAM_ERA5_{np.datetime_as_string(time_coords[0], unit='M')}_vertint.nc"
-            aam_da.to_dataset(name='AAM').to_netcdf(out_fname)
+            # Use compression to reduce file size (complevel=4 is a good balance of speed vs size)
+            encoding = {
+                'AAM': {'zlib': True, 'complevel': 4, 'dtype': 'float32'}
+            }
+            
+            out_fname = f"{save_path}/AAM_ERA5_{np.datetime_as_string(time_coords[0], unit='M')}_full.nc"
+            aam_da.to_dataset(name='AAM').to_netcdf(out_fname, encoding=encoding)
             print("Wrote", out_fname)
             
         except Exception as e:
