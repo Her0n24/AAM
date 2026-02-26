@@ -14,7 +14,8 @@ import glob
 import argparse
 
 base_dir = os.getcwd()
-Variable_data_path = f"{base_dir}/monthly_mean/AAM/" # Full data path (not zonal mean)
+scratch_path = "/work/scratch-nopw2/hhhn2"
+Variable_data_path = f"{scratch_path}/ERA5/monthly_mean/AAM/full" # Full data path (not zonal mean)
 output_dir = f"{base_dir}/climatology/full/"
 
 # Create output directory if it doesn't exist
