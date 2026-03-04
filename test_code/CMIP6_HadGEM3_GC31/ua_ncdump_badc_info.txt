@@ -1,0 +1,103 @@
+(snapsi) hhhn2@host839:/badc/cmip6/data/CMIP6/CMIP/MOHC/HadGEM3-GC31-LL/historical/r11i1p1f3/Amon/ua/gn/v20230516$ ncdump -h ua_Amon_HadGEM3-GC31-LL_historical_r11i1p1f3_gn_195001-201412.nc
+netcdf ua_Amon_HadGEM3-GC31-LL_historical_r11i1p1f3_gn_195001-201412 {
+dimensions:
+        time = UNLIMITED ; // (780 currently)
+        bnds = 2 ;
+        plev = 19 ;
+        lat = 145 ;
+        lon = 192 ;
+variables:
+        double time(time) ;
+                time:bounds = "time_bnds" ;
+                time:units = "days since 1850-01-01" ;
+                time:calendar = "360_day" ;
+                time:axis = "T" ;
+                time:long_name = "time" ;
+                time:standard_name = "time" ;
+        double time_bnds(time, bnds) ;
+        double plev(plev) ;
+                plev:units = "Pa" ;
+                plev:axis = "Z" ;
+                plev:positive = "down" ;
+                plev:long_name = "pressure" ;
+                plev:standard_name = "air_pressure" ;
+        double lat(lat) ;
+                lat:bounds = "lat_bnds" ;
+                lat:units = "degrees_north" ;
+                lat:axis = "Y" ;
+                lat:long_name = "Latitude" ;
+                lat:standard_name = "latitude" ;
+        double lat_bnds(lat, bnds) ;
+        double lon(lon) ;
+                lon:bounds = "lon_bnds" ;
+                lon:units = "degrees_east" ;
+                lon:axis = "X" ;
+                lon:long_name = "Longitude" ;
+                lon:standard_name = "longitude" ;
+        double lon_bnds(lon, bnds) ;
+        float ua(time, plev, lat, lon) ;
+                ua:standard_name = "eastward_wind" ;
+                ua:long_name = "Eastward Wind" ;
+                ua:comment = "Zonal wind (positive in a eastward direction)." ;
+                ua:units = "m s-1" ;
+                ua:original_name = "mo: (stash: m01s30i201, blev: [1000.0, 925.0, 850.0, 700.0, 600.0, 500.0, 400.0, 300.0, 250.0, 200.0, 150.0, 100.0, 70.0, 50.0, 30.0, 20.0, 10.0, 5.0, 1.0], lbproc: 128) / (stash: m01s30i301, blev: [1000.0, 925.0, 850.0, 700.0, 600.0, 500.0, 400.0, 300.0, 250.0, 200.0, 150.0, 100.0, 70.0, 50.0, 30.0, 20.0, 10.0, 5.0, 1.0], lbproc: 128)" ;
+                ua:cell_methods = "time: mean" ;
+                ua:cell_measures = "area: areacella" ;
+                ua:missing_value = 1.e+20f ;
+                ua:_FillValue = 1.e+20f ;
+                ua:history = "2023-05-16T11:33:30Z altered by CMOR: Inverted axis: plev." ;
+
+// global attributes:
+                :Conventions = "CF-1.7 CMIP-6.2" ;
+                :activity_id = "CMIP" ;
+
+                :experiment = "all-forcing simulation of the recent past" ;
+                :experiment_id = "historical" ;
+                :external_variables = "areacella" ;
+                :forcing_index = 3 ;
+                :frequency = "mon" ;
+                :further_info_url = "https://furtherinfo.es-doc.org/CMIP6.MOHC.HadGEM3-GC31-LL.historical.none.r11i1p1f3" ;
+                :grid = "Native N96 grid (UV points); 192 x 145 longitude/latitude" ;
+                :grid_label = "gn" ;
+                :history = "2023-05-16T11:33:30Z ; CMOR rewrote data to be consistent with CMIP6, CF-1.7 CMIP-6.2 and CF standards.;\n",
+                        "2023-05-16T11:33:09Z MIP Convert v2.4.4, Python v3.8.12, iris v3.1.0, numpy v1.21.2, cftime v1.5.1.1, pyproj v2.6.1.post1" ;
+                :initialization_index = 1 ;
+                :institution = "Met Office Hadley Centre, Fitzroy Road, Exeter, Devon, EX1 3PB, UK" ;
+                :institution_id = "MOHC" ;
+                :mass_ensemble_member = "r001i1p1f1" ;
+                :mip_era = "CMIP6" ;
+                :mo_runid = "u-cp832" ;
+                :nominal_resolution = "250 km" ;
+                :parent_activity_id = "CMIP" ;
+                :parent_experiment_id = "piControl" ;
+                :parent_mip_era = "CMIP6" ;
+                :parent_source_id = "HadGEM3-GC31-LL" ;
+                :parent_time_units = "days since 1850-01-01" ;
+                :parent_variant_label = "r1i1p1f1" ;
+                :physics_index = 1 ;
+                :product = "model-output" ;
+                :realization_index = 11 ;
+                :realm = "atmos" ;
+                :source = "HadGEM3-GC31-LL (2016): \n",
+                        "aerosol: UKCA-GLOMAP-mode\n",
+                        "atmos: MetUM-HadGEM3-GA7.1 (N96; 192 x 144 longitude/latitude; 85 levels; top level 85 km)\n",
+                        "atmosChem: none\n",
+                        "land: JULES-HadGEM3-GL7.1\n",
+                        "landIce: none\n",
+                        "ocean: NEMO-HadGEM3-GO6.0 (eORCA1 tripolar primarily 1 deg with meridional refinement down to 1/3 degree in the tropics; 360 x 330 longitude/latitude; 75 levels; top grid cell 0-1 m)\n",
+                        "ocnBgchem: none\n",
+                        "seaIce: CICE-HadGEM3-GSI8 (eORCA1 tripolar primarily 1 deg; 360 x 330 longitude/latitude)" ;
+                :source_id = "HadGEM3-GC31-LL" ;
+                :source_type = "AOGCM AER" ;
+                :sub_experiment = "none" ;
+                :sub_experiment_id = "none" ;
+                :table_id = "Amon" ;
+                :table_info = "Creation Date:(13 December 2018) MD5:16c6a64f5d008f9be2c4609202b56032" ;
+                :title = "HadGEM3-GC31-LL output prepared for CMIP6" ;
+                :variable_id = "ua" ;
+                :variable_name = "ua" ;
+                :variant_label = "r11i1p1f3" ;
+                :license = "CMIP6 model data produced by the Met Office Hadley Centre is licensed under a Creative Commons Attribution-ShareAlike 4.0 International License (https://creativecommons.org/licenses). Consult https://pcmdi.llnl.gov/CMIP6/TermsOfUse for terms of use governing CMIP6 output, including citation requirements and proper acknowledgment. Further information about this data, including some limitations, can be found via the further_info_url (recorded as a global attribute in this file) and at https://ukesm.ac.uk/cmip6. The data producers and data providers make no warranty, either express or implied, including, but not limited to, warranties of merchantability and fitness for a particular purpose. All liabilities arising from the supply of the information (including any liability arising in negligence) are excluded to the fullest extent permitted by law." ;
+                :cmor_version = "3.7.1" ;
+                :tracking_id = "hdl:21.14100/6743db73-9d9d-4aca-ba81-3781e4ba5ece" ;
+}

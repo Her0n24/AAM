@@ -10,6 +10,14 @@ import glob
 import pandas as pd
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.colors as mcolors
+import matplotlib.cm as cm
+
+# Allow importing shared utilities from AAM/test_code
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from plotting_utils import ensure_dir  # noqa: E402
 
 
 base_dir = os.getcwd()
@@ -23,7 +31,7 @@ pressure_lvl_dir = f"{base_dir}/l137_a_b.csv"
 # zonal_mean_ERA5_u_1988-01.nc
 
 # Create output directory if it doesn't exist
-os.makedirs(output_dir, exist_ok=True)
+ensure_dir(output_dir)
 
 # Default period 
 start_yr, end_yr = 1980, 2000
@@ -240,7 +248,7 @@ def plot_anomalies_3d(start_year, end_year, variable, clim_start_yr=1980, clim_e
     vmax = 5e21
     vmin = -vmax
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-    cmap = plt.cm.RdBu_r
+    cmap = cm.get_cmap('RdBu_r')
     
     for i, t_idx in enumerate(time_indices):
         time_val = anomalies.time.values[t_idx]
@@ -275,7 +283,7 @@ def plot_anomalies_3d(start_year, end_year, variable, clim_start_yr=1980, clim_e
     ax.set_xticklabels(time_labels, rotation=45, ha='right')
     
     # Add colorbar
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
     cbar = plt.colorbar(sm, ax=ax, shrink=0.5, pad=0.01)
     cbar.set_label(f'{variable} anomaly', fontsize=12)
@@ -426,13 +434,13 @@ def plot_anomalies_3d(start_year, end_year, variable, clim_start_yr=1980, clim_e
     # Create discrete levels matching the contour levels
     levels = np.linspace(vmin, vmax, 11)
     norm = mcolors.BoundaryNorm(levels, ncolors=256)
-    sm = plt.cm.ScalarMappable(cmap='RdBu_r', norm=norm)
+    sm = cm.ScalarMappable(cmap=cm.get_cmap('RdBu_r'), norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal', extend='both', spacing='proportional')
     cbar.set_label(f'{variable} anomaly', fontsize=12)
     # Set ticks at every other level boundary for clarity
     tick_indices = np.arange(0, 11, 1)
-    cbar.set_ticks(levels[tick_indices])
+    cbar.set_ticks(list(levels[tick_indices]))
     
     fig.suptitle(f'{variable.upper()} Anomaly: Latitude × Level Snapshots using climatology {clim_start_yr}-{clim_end_yr} with zonal mean zonal wind', fontsize=16, y=0.905)
     plt.tight_layout(rect=[0, 0.04, 1, 0.99])  # Leave space for colorbar at bottom and reduce top gap

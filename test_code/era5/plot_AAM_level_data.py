@@ -39,6 +39,17 @@ end_yr = args.end_year
 p_min = args.p_min * 100  # Convert hPa to Pa
 p_max = args.p_max * 100
 
+
+def _latitude_band_width_radians(lat_deg: np.ndarray) -> np.ndarray:
+    """Return dphi (radians) for latitude bands centered on the latitude points."""
+    lat_rad = np.deg2rad(np.asarray(lat_deg, dtype=float))
+    n = lat_rad.size
+    edges = np.empty(n + 1, dtype=float)
+    edges[1:-1] = 0.5 * (lat_rad[:-1] + lat_rad[1:])
+    edges[0] = -0.5 * np.pi
+    edges[-1] = 0.5 * np.pi
+    return np.abs(np.diff(edges))
+
 def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cmap_name='RdBu_r', 
                        vmin=None, vmax=None, savefile=None, show=True):
     """Plot AAM anomalies (variation from climatological mean) for a given period.
@@ -82,6 +93,21 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
         raise KeyError(f"variable '{component}' not found in dataset")
 
     da = ds[component]
+
+    # Robustly mask non-finite and common fill values early to avoid huge artefacts
+    da = da.where(np.isfinite(da))
+    fv = (
+        da.encoding.get('_FillValue', None)
+        or da.attrs.get('_FillValue', None)
+        or da.attrs.get('missing_value', None)
+    )
+    if fv is not None:
+        try:
+            fv_float = float(fv)
+        except Exception:
+            fv_float = None
+        if fv_float is not None and np.isfinite(fv_float):
+            da = da.where(da != fv_float)
     
     print(f"===== INITIAL DATA =====")
     print(f"AAM data shape: {da.shape}, dims: {da.dims}")
@@ -211,14 +237,25 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
                 print(f"After .compute() - shape: {da.shape}, dims: {da.dims}")
             print(f"============================================")
     
-    # Integrate over longitude if it exists (to get zonal mean/integral)
+    # Integrate over longitude and apply latitude band width.
+    # AAM from compute step includes dp but NOT dλ dφ, so to get totals per latitude band
+    # we need ∫ AAM dλ and then multiply by band width dφ.
     print(f"===== LONGITUDE INTEGRATION =====")
     print(f"Before longitude check - shape: {da.shape}, dims: {da.dims}")
     print(f"Has longitude dimension: {'longitude' in da.dims}")
     if 'longitude' in da.dims:
-        print("Longitude dimension found - integrating...")
-        da = da.sum(dim='longitude')
-        print(f"After .sum(dim='longitude') - sh: {da.shape}, dims: {da.dims}")
+        print("Longitude dimension found - performing zonal integral (radians)...")
+        # Convert longitude coordinate to radians so integrate() gives a true ∫ dλ
+        lon_rad = np.deg2rad(da['longitude'].astype(float))
+        da = da.assign_coords(longitude=lon_rad).sortby('longitude')
+        try:
+            dlon = np.diff(da['longitude'].values)
+            if dlon.size:
+                print(f"Mean dλ (rad): {float(np.nanmean(dlon)):.3e} ; 2π={2*np.pi:.3e}")
+        except Exception:
+            pass
+        da = da.integrate('longitude')
+        print(f"After .integrate('longitude') - sh: {da.shape}, dims: {da.dims}")
         # Force computation if using dask
         if hasattr(da, 'compute'):
             print("Computing dask array...") 
@@ -227,6 +264,17 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
     else:
         print("No longitude dimension found - skipping longitude integration")
     print(f"=================================")
+
+    # Multiply by latitude band width dφ to get kg m^2 s^-1 per latitude band
+    if 'latitude' in da.dims:
+        da = da.sortby('latitude')
+        dphi = _latitude_band_width_radians(da['latitude'].values)
+        dphi_deg = np.rad2deg(dphi)
+        print(f"Median Δφ (deg): {float(np.nanmedian(dphi_deg)):.3f} ; min/max: {float(np.nanmin(dphi_deg)):.3f}/{float(np.nanmax(dphi_deg)):.3f}")
+        dphi_da = xr.DataArray(dphi, coords={'latitude': da['latitude']}, dims=('latitude',))
+        da = da * dphi_da
+        da.attrs['units'] = 'kg m**2 s**-1'
+        da.attrs['description'] = 'AAM per latitude band (dp, dλ, dφ applied)'
     
     # ensure dims include time and latitude
     print(f"===== FINAL DATA CHECK =====")
@@ -322,7 +370,7 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
 
     ax.set_ylabel('Latitude (°)', size=16)
     ax.set_xlabel('Year', size=16)
-    title = f"ERA5 Reanalysis {component} fluctuations from Climatology ({start_year}-{end_year})"
+    title = f"ERA5 Reanalysis zonal mean {component} fluctuations from Climatology ({start_year}-{end_year})"
     if p_min > 0 and p_max > 0:
         title += f"\n(Integrated: {p_min/100:.0f}-{p_max/100:.0f} hPa)"
     ax.set_title(title, size=18)
@@ -347,12 +395,24 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
         aspect=100
     )
     
+    dphi_med = round(float(np.nanmedian(dphi_deg)), 2)
+    
     # Determine if we need to factor out scientific notation
     max_abs_value = max(abs(vmin), abs(vmax))
     if max_abs_value >= 1e3 or max_abs_value <= 1e-3:
         # Calculate the order of magnitude
         order = int(np.floor(np.log10(max_abs_value)))
         factor = 10**order
+        
+        # Convert order to superscript notation
+        def format_exponent(exp):
+            """Convert integer exponent to superscript string"""
+            exp_str = str(exp)
+            superscript_map = {'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', 
+                              '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '-': '⁻'}
+            return ''.join(superscript_map.get(c, c) for c in exp_str)
+        
+        exponent_str = format_exponent(order)
         
         # Convert order to superscript for display
         order_str = str(abs(order))
@@ -370,10 +430,10 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
             units_formatted = units_formatted.replace('m^-2', 'm⁻²').replace('s^-2', 's⁻²').replace('kg^-2', 'kg⁻²')
             units_formatted = units_formatted.replace('^2', '²').replace('^-1', '⁻¹').replace('^3', '³')
             units_formatted = units_formatted.replace('^-2', '⁻²').replace('^-3', '⁻³').replace('^1', '¹')
-            label_text = f"{component} Anomalies (10{order_superscript} {units_formatted})"
+            label_text = f"{component} Anomalies 10{exponent_str} {units_formatted} per {dphi_med}° latitude band"
         else:
-            label_text = f"{component} Anomalies (×10{order_superscript})"
-        
+            label_text = f"{component} Anomalies 10{exponent_str} per {dphi_med}° latitude band "
+            
         # Scale tick labels by the factor
         scaled_levels = levels / factor
         cbar.set_ticks(levels[::max(1, len(levels)//8)])
@@ -387,9 +447,10 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
             units_formatted = units_formatted.replace('m^-2', 'm⁻²').replace('s^-2', 's⁻²').replace('kg^-2', 'kg⁻²')
             units_formatted = units_formatted.replace('^2', '²').replace('^-1', '⁻¹').replace('^3', '³')
             units_formatted = units_formatted.replace('^-2', '⁻²').replace('^-3', '⁻³').replace('^1', '¹')
-            label_text = f"{component} Anomalies ({units_formatted})"
+            label_text = f"{component} Anomalies ({units_formatted}) per {dphi_med}° latitude band"
         else:
-            label_text = f"{component} Anomalies"
+            label_text = f"{component} Anomalies per {dphi_med}° latitude band"
+        
         
         # Normal tick formatting
         tick_spacing = max(1, len(levels)//8)
@@ -424,5 +485,5 @@ if __name__ == '__main__':
     savefile = f'AAM_anomalies_{start_yr}-{end_yr}_p{int(p_min/100)}-{int(p_max/100)}hPa_new.png'
     plot_AAM_anomalies(start_yr, end_yr, component='AAM', 
                        savefile=savefile, 
-                       show=True, vmin=-0.2e24, vmax=0.2e24)
+                       show=True, vmin=-1e21, vmax=1e21)
 # %%

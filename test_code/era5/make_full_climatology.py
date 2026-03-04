@@ -15,8 +15,8 @@ import argparse
 
 base_dir = os.getcwd()
 scratch_path = "/work/scratch-nopw2/hhhn2"
-Variable_data_path = f"{scratch_path}/ERA5/monthly_mean/AAM/full" # Full data path (not zonal mean)
-output_dir = f"{base_dir}/climatology/full/"
+Variable_data_path = f"{scratch_path}/ERA5/monthly_mean/AAM/full/" # Full data path (not zonal mean)
+output_dir = f"{scratch_path}/ERA5/climatology/"
 
 # Create output directory if it doesn't exist
 os.makedirs(output_dir, exist_ok=True)
@@ -40,7 +40,7 @@ def make_full_climatology(start_year, end_year, variable, vertically_integrated=
         If True, data is already vertically integrated (no level dimension)
     """
     # Load all data for the specified period
-    suf = '_vertint' if vertically_integrated else ''
+    suf = '_vertint' if vertically_integrated else '_full'
     all_files = []
     for year in range(start_year, end_year):
         for month in range(1, 13):
