@@ -1,6 +1,4 @@
-"""
-This script plots the 3D structure of AAM anomalies from CMIP6 full field data.
-Based on plot_momentum_anomalies_3d.py but adapted for CMIP6 data structure.
+"""Generate MP4 movies of AAM anomaly latitude×level structure from CMIP6 full field data.
 
 CMIP6 data structure:
 - Single file with all years: AAM_CMIP6_HadGEM3_GC31_YYYY-MM_YYYY-MM.nc
@@ -14,16 +12,13 @@ import os
 import argparse
 import glob
 import pandas as pd
-from mpl_toolkits.mplot3d import Axes3D
-import matplotlib.colors as mcolors
-import matplotlib.cm as cm
 
 # Allow importing shared utilities from AAM/test_code
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from plotting_utils import ensure_dir, plot_anomalies_3d_slices, plot_latitude_level_snapshots_HadGEN3  # noqa: E402
+from plotting_utils import ensure_dir, plot_latitude_level_movie_HadGEM3  # noqa: E402
 
 
 base_dir = os.getcwd()
@@ -345,25 +340,8 @@ def plot_anomalies_3d(
     if n_nans > 0:
         print(f"Warning: {n_nans} NaN values found in anomalies data")
     
-    # === 3D SURFACE PLOT ===
-    output_file = f"{output_dir}AAM_anomalies_3d_{ensemble_member}_{start_year}-{end_year}.png"
-    plot_anomalies_3d_slices(
-        anomalies,
-        output_file=output_file,
-        title=(
-            f"CMIP6 HadGEM3_GC31 {ensemble_member} AAM Anomaly 3D Structure: Time × Latitude (mean) × Level\n"
-            f"Climatology: {clim_start_yr}-{clim_end_yr}"
-        ),
-        time_step=3,
-        vpercentile=95.0,
-        cmap_name='RdBu_r',
-    )
-    print(f"3D figure saved to: {output_file}")
-    
-    # === SNAPSHOT PLOT ===
-    # Show multiple latitude-level snapshots
-    # Compute color limits from data (ignore NaN values)
-    plot_latitude_level_snapshots_HadGEN3(
+    # === MOVIE PLOT ===
+    plot_latitude_level_movie_HadGEM3(
         anomalies,
         zonal_wind_da=u_zm,
         output_dir=output_dir,

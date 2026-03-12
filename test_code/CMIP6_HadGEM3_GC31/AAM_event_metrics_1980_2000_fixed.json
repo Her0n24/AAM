@@ -1,0 +1,773 @@
+{
+  "config": {
+    "ensemble_member": "r1i1p1f3",
+    "start_year": 1980,
+    "end_year": 2000,
+    "p_min_hpa": 150.0,
+    "p_max_hpa": 700.0,
+    "anomaly_threshold": 0.0,
+    "intermittency_constraint": 6,
+    "gap_bridge_months": 0,
+    "winter_constraint": false,
+    "el_nino_constraint": false,
+    "sym_constraint": false,
+    "tropics_band_deg": 20.0,
+    "onset_com_lat_max_deg": 20.0,
+    "max_com_jump_deg": 50.0,
+    "tracker": "dp",
+    "rolling_smooth_months": 3,
+    "dp_jump_penalty": 0.01,
+    "dp_south_penalty": 2.0,
+    "dp_max_step_deg": 15.0,
+    "dp_scale_quantile": 0.5,
+    "track_require_tropical": false
+  },
+  "events": [
+    {
+      "event_id": 1,
+      "onset": "1980-01-16",
+      "end": "1980-02-16",
+      "speed_deg_per_month": 4.999999999999997,
+      "mean_amp_at_com": 1.1636694759546744e+24,
+      "max_amp_at_com": 1.4295305365777708e+24,
+      "max_lat_reached_com": 25.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1980-01-16",
+          "1980-02-16"
+        ],
+        "com_latitude_deg": [
+          20.0,
+          25.0
+        ]
+      }
+    },
+    {
+      "event_id": 2,
+      "onset": "1980-05-16",
+      "end": "1980-05-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 8.714349014294445e+23,
+      "max_amp_at_com": 8.714349014294445e+23,
+      "max_lat_reached_com": 27.5,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1980-05-16"
+        ],
+        "com_latitude_deg": [
+          27.5
+        ]
+      }
+    },
+    {
+      "event_id": 3,
+      "onset": "1980-09-16",
+      "end": "1980-09-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 3.1003130152135494e+23,
+      "max_amp_at_com": 3.1003130152135494e+23,
+      "max_lat_reached_com": 20.0,
+      "max_lat_extent_threshold": 50.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1980-09-16"
+        ],
+        "com_latitude_deg": [
+          20.0
+        ]
+      }
+    },
+    {
+      "event_id": 7,
+      "onset": "1981-11-16",
+      "end": "1981-12-16",
+      "speed_deg_per_month": -4.8022512628630484e-15,
+      "mean_amp_at_com": 3.262827865373528e+23,
+      "max_amp_at_com": 4.1651116717077484e+23,
+      "max_lat_reached_com": 37.5,
+      "max_lat_extent_threshold": 45.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1981-11-16",
+          "1981-12-16"
+        ],
+        "com_latitude_deg": [
+          37.5,
+          37.5
+        ]
+      }
+    },
+    {
+      "event_id": 8,
+      "onset": "1982-02-16",
+      "end": "1982-07-16",
+      "speed_deg_per_month": 2.928571428571427,
+      "mean_amp_at_com": 1.222668329923573e+24,
+      "max_amp_at_com": 1.8312787591531173e+24,
+      "max_lat_reached_com": 37.5,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1982-02-16",
+          "1982-03-16",
+          "1982-04-16",
+          "1982-05-16",
+          "1982-06-16",
+          "1982-07-16"
+        ],
+        "com_latitude_deg": [
+          20.0,
+          20.0,
+          22.5,
+          22.5,
+          25.0,
+          37.5
+        ]
+      }
+    },
+    {
+      "event_id": 9,
+      "onset": "1982-10-16",
+      "end": "1982-11-16",
+      "speed_deg_per_month": -8.799054151513612e-15,
+      "mean_amp_at_com": 7.625902685132102e+23,
+      "max_amp_at_com": 9.381657496041786e+23,
+      "max_lat_reached_com": 42.5,
+      "max_lat_extent_threshold": 52.5,
+      "monthly_com_latitude": {
+        "months": [
+          "1982-10-16",
+          "1982-11-16"
+        ],
+        "com_latitude_deg": [
+          42.5,
+          42.5
+        ]
+      }
+    },
+    {
+      "event_id": 10,
+      "onset": "1983-02-16",
+      "end": "1983-04-16",
+      "speed_deg_per_month": 3.7500000000000067,
+      "mean_amp_at_com": 4.5475550932992606e+23,
+      "max_amp_at_com": 7.686625964047476e+23,
+      "max_lat_reached_com": 52.5,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1983-02-16",
+          "1983-03-16",
+          "1983-04-16"
+        ],
+        "com_latitude_deg": [
+          45.0,
+          47.5,
+          52.5
+        ]
+      }
+    },
+    {
+      "event_id": 11,
+      "onset": "1983-07-16",
+      "end": "1983-07-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 5.273930401833306e+23,
+      "max_amp_at_com": 5.273930401833306e+23,
+      "max_lat_reached_com": 25.0,
+      "max_lat_extent_threshold": 32.5,
+      "monthly_com_latitude": {
+        "months": [
+          "1983-07-16"
+        ],
+        "com_latitude_deg": [
+          25.0
+        ]
+      }
+    },
+    {
+      "event_id": 12,
+      "onset": "1983-09-16",
+      "end": "1983-09-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 2.5152904298659175e+23,
+      "max_amp_at_com": 2.5152904298659175e+23,
+      "max_lat_reached_com": 47.5,
+      "max_lat_extent_threshold": 57.5,
+      "monthly_com_latitude": {
+        "months": [
+          "1983-09-16"
+        ],
+        "com_latitude_deg": [
+          47.5
+        ]
+      }
+    },
+    {
+      "event_id": 13,
+      "onset": "1983-11-16",
+      "end": "1984-04-16",
+      "speed_deg_per_month": -1.2781193015314974e-15,
+      "mean_amp_at_com": 8.323775220942501e+23,
+      "max_amp_at_com": 1.3554720186046044e+24,
+      "max_lat_reached_com": 20.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1983-11-16",
+          "1983-12-16",
+          "1984-01-16",
+          "1984-02-16",
+          "1984-03-16",
+          "1984-04-16"
+        ],
+        "com_latitude_deg": [
+          20.0,
+          20.0,
+          20.0,
+          20.0,
+          20.0,
+          20.0
+        ]
+      }
+    },
+    {
+      "event_id": 14,
+      "onset": "1984-08-16",
+      "end": "1984-08-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 4.3060820595415515e+23,
+      "max_amp_at_com": 4.3060820595415515e+23,
+      "max_lat_reached_com": 17.5,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1984-08-16"
+        ],
+        "com_latitude_deg": [
+          17.5
+        ]
+      }
+    },
+    {
+      "event_id": 15,
+      "onset": "1984-10-16",
+      "end": "1984-11-16",
+      "speed_deg_per_month": 7.499999999999996,
+      "mean_amp_at_com": 5.147824437891854e+23,
+      "max_amp_at_com": 5.672340839991189e+23,
+      "max_lat_reached_com": 27.5,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1984-10-16",
+          "1984-11-16"
+        ],
+        "com_latitude_deg": [
+          20.0,
+          27.5
+        ]
+      }
+    },
+    {
+      "event_id": 16,
+      "onset": "1985-02-16",
+      "end": "1985-02-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 3.403851377954941e+23,
+      "max_amp_at_com": 3.403851377954941e+23,
+      "max_lat_reached_com": 15.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1985-02-16"
+        ],
+        "com_latitude_deg": [
+          15.0
+        ]
+      }
+    },
+    {
+      "event_id": 17,
+      "onset": "1985-07-16",
+      "end": "1985-07-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 4.465276649312742e+23,
+      "max_amp_at_com": 4.465276649312742e+23,
+      "max_lat_reached_com": 20.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1985-07-16"
+        ],
+        "com_latitude_deg": [
+          20.0
+        ]
+      }
+    },
+    {
+      "event_id": 19,
+      "onset": "1986-01-16",
+      "end": "1986-06-16",
+      "speed_deg_per_month": -1.2781193015314974e-15,
+      "mean_amp_at_com": 6.997957159262846e+23,
+      "max_amp_at_com": 1.0263366395780715e+24,
+      "max_lat_reached_com": 20.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1986-01-16",
+          "1986-02-16",
+          "1986-03-16",
+          "1986-04-16",
+          "1986-05-16",
+          "1986-06-16"
+        ],
+        "com_latitude_deg": [
+          20.0,
+          20.0,
+          20.0,
+          20.0,
+          20.0,
+          20.0
+        ]
+      }
+    },
+    {
+      "event_id": 20,
+      "onset": "1986-09-16",
+      "end": "1986-12-16",
+      "speed_deg_per_month": 5.750000000000002,
+      "mean_amp_at_com": 3.249591927529619e+23,
+      "max_amp_at_com": 5.2532023469902565e+23,
+      "max_lat_reached_com": 35.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1986-09-16",
+          "1986-10-16",
+          "1986-11-16",
+          "1986-12-16"
+        ],
+        "com_latitude_deg": [
+          17.5,
+          30.0,
+          35.0,
+          35.0
+        ]
+      }
+    },
+    {
+      "event_id": 22,
+      "onset": "1987-06-16",
+      "end": "1987-06-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 2.3927371997278804e+23,
+      "max_amp_at_com": 2.3927371997278804e+23,
+      "max_lat_reached_com": 15.0,
+      "max_lat_extent_threshold": 37.5,
+      "monthly_com_latitude": {
+        "months": [
+          "1987-06-16"
+        ],
+        "com_latitude_deg": [
+          15.0
+        ]
+      }
+    },
+    {
+      "event_id": 25,
+      "onset": "1988-06-16",
+      "end": "1988-08-16",
+      "speed_deg_per_month": 13.750000000000005,
+      "mean_amp_at_com": 3.244037704536894e+23,
+      "max_amp_at_com": 4.532439335405244e+23,
+      "max_lat_reached_com": 50.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1988-06-16",
+          "1988-07-16",
+          "1988-08-16"
+        ],
+        "com_latitude_deg": [
+          22.5,
+          37.5,
+          50.0
+        ]
+      }
+    },
+    {
+      "event_id": 26,
+      "onset": "1988-12-16",
+      "end": "1988-12-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 6.004303463433584e+23,
+      "max_amp_at_com": 6.004303463433584e+23,
+      "max_lat_reached_com": 17.5,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1988-12-16"
+        ],
+        "com_latitude_deg": [
+          17.5
+        ]
+      }
+    },
+    {
+      "event_id": 27,
+      "onset": "1989-03-16",
+      "end": "1989-03-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": NaN,
+      "max_amp_at_com": NaN,
+      "max_lat_reached_com": 60.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1989-03-16"
+        ],
+        "com_latitude_deg": [
+          60.0
+        ]
+      }
+    },
+    {
+      "event_id": 28,
+      "onset": "1989-05-16",
+      "end": "1989-06-16",
+      "speed_deg_per_month": -2.2901033289690086e-15,
+      "mean_amp_at_com": 3.1153000676195354e+23,
+      "max_amp_at_com": 4.4958543402917e+23,
+      "max_lat_reached_com": 17.5,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1989-05-16",
+          "1989-06-16"
+        ],
+        "com_latitude_deg": [
+          17.5,
+          17.5
+        ]
+      }
+    },
+    {
+      "event_id": 30,
+      "onset": "1990-01-16",
+      "end": "1990-07-16",
+      "speed_deg_per_month": 2.6785714285714297,
+      "mean_amp_at_com": 8.251230924136658e+23,
+      "max_amp_at_com": 1.6788380638235268e+24,
+      "max_lat_reached_com": 30.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1990-01-16",
+          "1990-02-16",
+          "1990-03-16",
+          "1990-04-16",
+          "1990-05-16",
+          "1990-06-16",
+          "1990-07-16"
+        ],
+        "com_latitude_deg": [
+          10.0,
+          22.5,
+          25.0,
+          25.0,
+          25.0,
+          30.0,
+          30.0
+        ]
+      }
+    },
+    {
+      "event_id": 31,
+      "onset": "1990-12-16",
+      "end": "1990-12-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 8.020691861669055e+23,
+      "max_amp_at_com": 8.020691861669055e+23,
+      "max_lat_reached_com": 17.5,
+      "max_lat_extent_threshold": 42.5,
+      "monthly_com_latitude": {
+        "months": [
+          "1990-12-16"
+        ],
+        "com_latitude_deg": [
+          17.5
+        ]
+      }
+    },
+    {
+      "event_id": 33,
+      "onset": "1991-08-16",
+      "end": "1992-03-16",
+      "speed_deg_per_month": 2.916666666666666,
+      "mean_amp_at_com": 1.0734292404595181e+24,
+      "max_amp_at_com": 1.7853320256232493e+24,
+      "max_lat_reached_com": 25.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1991-08-16",
+          "1991-09-16",
+          "1991-10-16",
+          "1991-11-16",
+          "1991-12-16",
+          "1992-01-16",
+          "1992-02-16",
+          "1992-03-16"
+        ],
+        "com_latitude_deg": [
+          7.5,
+          7.5,
+          7.5,
+          20.0,
+          22.5,
+          22.5,
+          22.5,
+          25.0
+        ]
+      }
+    },
+    {
+      "event_id": 34,
+      "onset": "1992-05-16",
+      "end": "1992-05-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 6.865888016553063e+23,
+      "max_amp_at_com": 6.865888016553063e+23,
+      "max_lat_reached_com": 20.0,
+      "max_lat_extent_threshold": 42.5,
+      "monthly_com_latitude": {
+        "months": [
+          "1992-05-16"
+        ],
+        "com_latitude_deg": [
+          20.0
+        ]
+      }
+    },
+    {
+      "event_id": 35,
+      "onset": "1992-07-16",
+      "end": "1992-08-16",
+      "speed_deg_per_month": -2.2901033289690086e-15,
+      "mean_amp_at_com": 4.2340566762616334e+23,
+      "max_amp_at_com": 4.85334477474868e+23,
+      "max_lat_reached_com": 17.5,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1992-07-16",
+          "1992-08-16"
+        ],
+        "com_latitude_deg": [
+          17.5,
+          17.5
+        ]
+      }
+    },
+    {
+      "event_id": 38,
+      "onset": "1994-03-16",
+      "end": "1994-03-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 1.0211517232708063e+24,
+      "max_amp_at_com": 1.0211517232708063e+24,
+      "max_lat_reached_com": 12.5,
+      "max_lat_extent_threshold": 45.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1994-03-16"
+        ],
+        "com_latitude_deg": [
+          12.5
+        ]
+      }
+    },
+    {
+      "event_id": 41,
+      "onset": "1995-06-16",
+      "end": "1995-06-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 3.5771163532772285e+23,
+      "max_amp_at_com": 3.5771163532772285e+23,
+      "max_lat_reached_com": 15.0,
+      "max_lat_extent_threshold": 57.5,
+      "monthly_com_latitude": {
+        "months": [
+          "1995-06-16"
+        ],
+        "com_latitude_deg": [
+          15.0
+        ]
+      }
+    },
+    {
+      "event_id": 42,
+      "onset": "1995-11-16",
+      "end": "1995-12-16",
+      "speed_deg_per_month": 2.499999999999995,
+      "mean_amp_at_com": 5.474619491371471e+23,
+      "max_amp_at_com": 9.255483887913672e+23,
+      "max_lat_reached_com": 27.5,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1995-11-16",
+          "1995-12-16"
+        ],
+        "com_latitude_deg": [
+          25.0,
+          27.5
+        ]
+      }
+    },
+    {
+      "event_id": 43,
+      "onset": "1996-02-16",
+      "end": "1996-05-16",
+      "speed_deg_per_month": 4.5,
+      "mean_amp_at_com": 6.044151721818561e+23,
+      "max_amp_at_com": 1.382426939130452e+24,
+      "max_lat_reached_com": 25.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1996-02-16",
+          "1996-03-16",
+          "1996-04-16",
+          "1996-05-16"
+        ],
+        "com_latitude_deg": [
+          10.0,
+          17.5,
+          17.5,
+          25.0
+        ]
+      }
+    },
+    {
+      "event_id": 46,
+      "onset": "1997-07-16",
+      "end": "1997-07-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 1.511525738563112e+23,
+      "max_amp_at_com": 1.511525738563112e+23,
+      "max_lat_reached_com": 47.5,
+      "max_lat_extent_threshold": 52.5,
+      "monthly_com_latitude": {
+        "months": [
+          "1997-07-16"
+        ],
+        "com_latitude_deg": [
+          47.5
+        ]
+      }
+    },
+    {
+      "event_id": 47,
+      "onset": "1997-09-16",
+      "end": "1997-11-16",
+      "speed_deg_per_month": 6.250000000000003,
+      "mean_amp_at_com": 7.071168557007869e+23,
+      "max_amp_at_com": 1.216283641313472e+24,
+      "max_lat_reached_com": 15.0,
+      "max_lat_extent_threshold": 45.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1997-09-16",
+          "1997-10-16",
+          "1997-11-16"
+        ],
+        "com_latitude_deg": [
+          2.5,
+          2.5,
+          15.0
+        ]
+      }
+    },
+    {
+      "event_id": 48,
+      "onset": "1998-07-16",
+      "end": "1998-07-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 4.0416301083125936e+23,
+      "max_amp_at_com": 4.0416301083125936e+23,
+      "max_lat_reached_com": 17.5,
+      "max_lat_extent_threshold": 52.5,
+      "monthly_com_latitude": {
+        "months": [
+          "1998-07-16"
+        ],
+        "com_latitude_deg": [
+          17.5
+        ]
+      }
+    },
+    {
+      "event_id": 49,
+      "onset": "1998-10-16",
+      "end": "1998-11-16",
+      "speed_deg_per_month": -4.28850477329429e-15,
+      "mean_amp_at_com": 3.7918929737149605e+23,
+      "max_amp_at_com": 4.527273386411399e+23,
+      "max_lat_reached_com": 20.0,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1998-10-16",
+          "1998-11-16"
+        ],
+        "com_latitude_deg": [
+          20.0,
+          20.0
+        ]
+      }
+    },
+    {
+      "event_id": 50,
+      "onset": "1999-04-16",
+      "end": "1999-04-16",
+      "speed_deg_per_month": null,
+      "mean_amp_at_com": 4.607343468924226e+23,
+      "max_amp_at_com": 4.607343468924226e+23,
+      "max_lat_reached_com": 22.5,
+      "max_lat_extent_threshold": 42.5,
+      "monthly_com_latitude": {
+        "months": [
+          "1999-04-16"
+        ],
+        "com_latitude_deg": [
+          22.5
+        ]
+      }
+    },
+    {
+      "event_id": 51,
+      "onset": "1999-07-16",
+      "end": "1999-08-16",
+      "speed_deg_per_month": -8.57700954658858e-15,
+      "mean_amp_at_com": 2.62201998656483e+23,
+      "max_amp_at_com": 3.032160771353804e+23,
+      "max_lat_reached_com": 40.0,
+      "max_lat_extent_threshold": 47.5,
+      "monthly_com_latitude": {
+        "months": [
+          "1999-07-16",
+          "1999-08-16"
+        ],
+        "com_latitude_deg": [
+          40.0,
+          40.0
+        ]
+      }
+    }
+  ]
+}

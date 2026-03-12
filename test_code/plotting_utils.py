@@ -525,11 +525,248 @@ def plot_latitude_level_snapshots_HadGEN3(
     plt.close()
     
 
+def plot_latitude_level_movie_HadGEM3(
+    anomalies: xr.DataArray,
+    zonal_wind_da: Optional["xr.DataArray | xr.Dataset"] = None,
+    *,
+    ensemble_member: str,
+    start_year: int,
+    end_year: int,
+    clim_start_yr: int,
+    clim_end_yr: int,
+    vpercentile: float = 95.0,
+    cmap_name: str = "RdBu_r",
+    output_dir: str | Path = "output/",
+    find_extremum: str = "max",
+    fps: int = 4,
+) -> None:
+    """Animate latitude×level frames into an MP4 movie.
+
+    Expects anomalies with dims including ('time', 'level', 'latitude') and *no* longitude.
+    Each frame shows one time step: a contourf of the anomaly with optional zonal-wind
+    overlay and a vertically-integrated profile strip below.
+
+    Requires ffmpeg to be available on the system PATH.
+    """
+    import matplotlib.animation as animation
+    import matplotlib.cm as cm
+    import matplotlib.colors as mcolors
+    import matplotlib.ticker as mticker
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    from matplotlib.gridspec import GridSpec
+
+    vmax = np.nanpercentile(np.abs(anomalies.values), vpercentile)
+    vmin = -vmax
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax == 0:
+        print(f"Warning: Invalid color limits (vmin={vmin}, vmax={vmax}), using fallback values")
+        vmax = 1e22
+        vmin = -vmax
+
+    lat_dim = "latitude" if "latitude" in anomalies.dims else ("lat" if "lat" in anomalies.dims else None)
+    level_dim = "level" if "level" in anomalies.dims else ("plev" if "plev" in anomalies.dims else None)
+    if lat_dim is None:
+        raise ValueError("anomalies must have a latitude dimension ('latitude' or 'lat')")
+    if level_dim is None:
+        raise ValueError("anomalies must have a vertical dimension ('level' or 'plev')")
+
+    lat_vals = anomalies[lat_dim].values
+    level_vals = anomalies[level_dim].values
+
+    level_units = str(anomalies[level_dim].attrs.get("units", "")).lower()
+    level_max = float(np.nanmax(level_vals.astype(float)))
+    looks_like_pa = ("pa" in level_units) or (level_max > 2000.0)
+    pressure_hpa = level_vals.astype(float) / 100.0 if looks_like_pa else level_vals.astype(float)
+    vertical_label = "Pressure (hPa)" if looks_like_pa or ("hpa" in level_units) else level_dim
+
+    finite_mask = np.isfinite(pressure_hpa)
+    if np.count_nonzero(finite_mask) < 2:
+        raise ValueError("pressure/level coordinate has insufficient finite values")
+    if pressure_hpa[finite_mask][0] > pressure_hpa[finite_mask][-1]:
+        pressure_hpa = pressure_hpa[::-1]
+        anomalies_for_plot = anomalies.isel({level_dim: slice(None, None, -1)})
+    else:
+        anomalies_for_plot = anomalies
+
+    n_times = len(anomalies_for_plot.time)
+    pressure_pa = pressure_hpa * 100.0
+    levels_cont = np.linspace(vmin, vmax, 21)
+
+    # Pressure tick marks for contour axis
+    if (vertical_label.lower().startswith("pressure")
+            and np.all(np.isfinite(pressure_hpa))
+            and np.all(pressure_hpa > 0)):
+        pmin = float(np.nanmin(pressure_hpa))
+        pmax = float(np.nanmax(pressure_hpa))
+        common_ticks = np.array([1000, 850, 700, 500, 300, 200, 100, 70, 50, 30, 20, 10], dtype=float)
+        p_ticks = common_ticks[(common_ticks >= pmin) & (common_ticks <= pmax)]
+        p_ticks = p_ticks if p_ticks.size >= 3 else None
+    else:
+        p_ticks = None
+        pmin = float(np.nanmin(pressure_hpa))
+        pmax = float(np.nanmax(pressure_hpa))
+
+    if zonal_wind_da is not None:
+        print(f"Using zonal wind overlay for {n_times} frames ...")
+
+    # Pre-compute vertically integrated profiles for consistent y-axis range
+    all_vi: list[np.ndarray] = []
+    for t_idx in range(n_times):
+        data_sl = anomalies_for_plot.isel(time=t_idx).transpose(level_dim, lat_dim).to_numpy()
+        vi = np.full(data_sl.shape[1], np.nan, dtype=float)
+        for j in range(data_sl.shape[1]):
+            col = data_sl[:, j]
+            m = np.isfinite(col) & np.isfinite(pressure_pa)
+            if np.count_nonzero(m) >= 2:
+                vi[j] = float(np.trapz(col[m], x=pressure_pa[m]))
+        all_vi.append(vi)
+
+    finite_vi_all = np.concatenate([v[np.isfinite(v)] for v in all_vi])
+    if finite_vi_all.size >= 2:
+        vi_ymin = float(np.nanmin(finite_vi_all))
+        vi_ymax = float(np.nanmax(finite_vi_all))
+    else:
+        vi_ymin, vi_ymax = -1e25, 1e25
+
+    # Build static figure layout
+    fig = plt.figure(figsize=(10, 8))
+    gs = GridSpec(2, 1, figure=fig, height_ratios=[6, 1], hspace=0.35)
+    ax_cont = fig.add_subplot(gs[0])
+    ax_prof = fig.add_subplot(gs[1])
+
+    # Static colorbar
+    norm = mcolors.BoundaryNorm(np.linspace(vmin, vmax, 11), ncolors=256)
+    cmap = cm.get_cmap(cmap_name)
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar_ax = fig.add_axes([0.15, 0.02, 0.7, 0.015])
+    variable = anomalies.attrs.get("long_name", anomalies.name if anomalies.name is not None else "Variable")
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", extend="both", spacing="proportional")
+    cbar.set_label(f"{variable} (kg m\u00b2 s\u207b\u00b9)", fontsize=10)
+    cbar.set_ticks(list(np.linspace(vmin, vmax, 11)))
+
+    fig.suptitle(
+        f"CMIP6 HadGEM3_GC31 {ensemble_member} zonally integrated AAM Anomaly: Latitude \u00d7 Level\n"
+        f"Climatology: {clim_start_yr}\u2013{clim_end_yr}",
+        fontsize=14,
+    )
+    plt.tight_layout(rect=[0, 0.05, 1, 0.96])
+
+    def _render_frame(t_idx: int) -> None:
+        ax_cont.cla()
+        ax_prof.cla()
+
+        time_val = pd.to_datetime(anomalies_for_plot.time.values[t_idx])
+        data_slice = anomalies_for_plot.isel(time=t_idx).transpose(level_dim, lat_dim)
+
+        ax_cont.contourf(lat_vals, pressure_hpa, data_slice.values, levels=levels_cont, cmap=cmap_name, extend="both")
+
+        # Zonal wind overlay
+        if zonal_wind_da is not None:
+            try:
+                wind_data = zonal_wind_da
+                if isinstance(wind_data, xr.Dataset):
+                    wind_var = "ua" if "ua" in wind_data.data_vars else list(wind_data.data_vars)[0]
+                    wind_data = wind_data[wind_var]
+
+                wind_lat_dim = "latitude" if "latitude" in wind_data.dims else ("lat" if "lat" in wind_data.dims else None)
+                wind_level_dim = "level" if "level" in wind_data.dims else ("plev" if "plev" in wind_data.dims else None)
+                if wind_lat_dim is None or wind_level_dim is None:
+                    raise ValueError("zonal wind must have latitude and vertical dimensions")
+
+                wind_lat = wind_data[wind_lat_dim].values
+                wind_data_t = wind_data.isel(time=t_idx) if "time" in wind_data.dims else wind_data
+
+                lon_dim = "longitude" if "longitude" in wind_data_t.dims else ("lon" if "lon" in wind_data_t.dims else None)
+                if lon_dim is not None:
+                    wind_data_t = wind_data_t.mean(dim=lon_dim) if wind_data_t.sizes[lon_dim] > 1 else wind_data_t.isel({lon_dim: 0})
+
+                for d in [dd for dd in wind_data_t.dims if dd not in (wind_level_dim, wind_lat_dim)]:
+                    if wind_data_t.sizes.get(d, 0) == 1:
+                        wind_data_t = wind_data_t.isel({d: 0})
+                    else:
+                        raise ValueError(f"Unexpected extra wind dimension {d!r}")
+
+                wind_level_vals = wind_data_t[wind_level_dim].values.astype(float)
+                wind_level_units = str(wind_data_t[wind_level_dim].attrs.get("units", "")).lower()
+                wind_looks_like_pa = ("pa" in wind_level_units) or (float(np.nanmax(wind_level_vals)) > 2000.0)
+                wind_pressure_hpa = wind_level_vals / 100.0 if wind_looks_like_pa else wind_level_vals
+                if np.isfinite(wind_pressure_hpa[0]) and np.isfinite(wind_pressure_hpa[-1]) and wind_pressure_hpa[0] > wind_pressure_hpa[-1]:
+                    wind_pressure_hpa = wind_pressure_hpa[::-1]
+                    wind_data_t = wind_data_t.isel({wind_level_dim: slice(None, None, -1)})
+
+                wind_values = wind_data_t.transpose(wind_level_dim, wind_lat_dim).to_numpy()
+                if wind_values.shape[0] == len(pressure_hpa) + 1:
+                    wind_values = (wind_values[:-1, :] + wind_values[1:, :]) / 2
+                    wind_pressure_hpa = (wind_pressure_hpa[:-1] + wind_pressure_hpa[1:]) / 2
+                if wind_values.shape[0] != len(pressure_hpa):
+                    raise ValueError(f"wind vertical size ({wind_values.shape[0]}) != AAM ({len(pressure_hpa)})")
+
+                wind_contour_levels = np.arange(-60, 61, 10)
+                wind_contour_levels = wind_contour_levels[np.abs(wind_contour_levels) >= 10]
+                cs = ax_cont.contour(wind_lat, pressure_hpa, wind_values, levels=wind_contour_levels,
+                                     colors="black", linewidths=0.8, alpha=0.6)
+                ax_cont.clabel(cs, inline=True, fontsize=7, fmt="%d")
+            except Exception as exc:
+                print(f"Warning: wind overlay failed for frame {t_idx}: {exc}")
+
+        # NH extremum marker
+        nh_mask = (lat_vals > 0) & (lat_vals >= -60) & (lat_vals <= 60)
+        lvl_mask = pressure_hpa > 100 if vertical_label.lower().startswith("pressure") else np.ones_like(pressure_hpa, dtype=bool)
+        nh_data = data_slice.values[np.ix_(lvl_mask, nh_mask)]
+        nh_lats = lat_vals[nh_mask]
+        if np.any(np.isfinite(nh_data)):
+            extreme_idx = np.unravel_index(
+                np.nanargmin(nh_data) if find_extremum == "min" else np.nanargmax(nh_data),
+                nh_data.shape,
+            )
+            extreme_lat = nh_lats[extreme_idx[1]]
+            if np.isfinite(extreme_lat):
+                ax_cont.axvline(extreme_lat, color="C1", linewidth=2, linestyle="-", alpha=0.8, zorder=10)
+
+        ax_cont.set_xlabel("Latitude (°N)", fontsize=10)
+        ax_cont.set_xlim(-60, 60)
+        ax_cont.set_ylabel(vertical_label, fontsize=10)
+        ax_cont.set_title(f"{time_val.strftime('%Y-%m')}", fontsize=12, pad=4)
+        if p_ticks is not None:
+            ax_cont.set_yticks(p_ticks)
+            ax_cont.yaxis.set_major_formatter(mticker.ScalarFormatter())
+            ax_cont.yaxis.set_minor_formatter(mticker.NullFormatter())
+        ax_cont.invert_yaxis()
+
+        # Profile strip
+        vi_plot = all_vi[t_idx].copy()
+        vi_finite = np.isfinite(vi_plot)
+        if np.count_nonzero(vi_finite) >= 2 and np.count_nonzero(~vi_finite) > 0:
+            vi_plot[~vi_finite] = np.interp(lat_vals[~vi_finite], lat_vals[vi_finite], vi_plot[vi_finite])
+        ax_prof.plot(lat_vals, vi_plot, "C0-", linewidth=1.5)
+        ax_prof.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax_prof.axvline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax_prof.set_xlim(-60, 60)
+        ax_prof.set_ylim(vi_ymin, vi_ymax)
+        ax_prof.set_ylabel("Total", fontsize=9)
+        ax_prof.grid(True, alpha=0.3)
+
+    ensure_dir(Path(output_dir))
+    output_file = Path(output_dir) / f"AAM_anomalies_lat_level_movie_{ensemble_member}_{start_year}-{end_year}.mp4"
+    print(f"Rendering {n_times} frames to {output_file} ...")
+    writer = animation.FFMpegWriter(fps=fps, bitrate=2000)
+    with writer.saving(fig, str(output_file), dpi=300):
+        for t_idx in range(n_times):
+            _render_frame(t_idx)
+            writer.grab_frame()
+            if (t_idx + 1) % 12 == 0:
+                print(f"  Rendered {t_idx + 1}/{n_times} frames")
+    plt.close(fig)
+    print(f"Movie saved to: {output_file}")
+
+
 __all__ = [
     "ClimatologyCacheSpec",
     "compute_monthly_climatology",
     "ensure_dir",
     "load_or_compute_monthly_climatology_from_file",
     "plot_anomalies_3d_slices",
+    "plot_latitude_level_movie_HadGEM3",
     "plot_latitude_level_snapshots_HadGEN3",
 ]

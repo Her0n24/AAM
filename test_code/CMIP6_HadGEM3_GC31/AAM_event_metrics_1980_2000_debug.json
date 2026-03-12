@@ -1,0 +1,43 @@
+{
+  "config": {
+    "ensemble_member": "r1i1p1f3",
+    "start_year": 1980,
+    "end_year": 2000,
+    "p_min_hpa": 150.0,
+    "p_max_hpa": 700.0,
+    "anomaly_threshold": 0.0,
+    "intermittency_constraint": 3,
+    "winter_constraint": false,
+    "el_nino_constraint": false,
+    "sym_constraint": false,
+    "tropics_band_deg": 10.0,
+    "onset_com_lat_max_deg": 10.0,
+    "max_com_jump_deg": null
+  },
+  "events": [
+    {
+      "event_id": 5,
+      "onset": "1995-11-16",
+      "end": "1996-02-16",
+      "speed_deg_per_month": 5.452219277325515,
+      "mean_amp_at_com": 4.7660805877110454e+23,
+      "max_amp_at_com": 9.060468417831253e+23,
+      "max_lat_reached_com": 27.859996241880815,
+      "max_lat_extent_threshold": 60.0,
+      "monthly_com_latitude": {
+        "months": [
+          "1995-11-16",
+          "1995-12-16",
+          "1996-01-16",
+          "1996-02-16"
+        ],
+        "com_latitude_deg": [
+          9.685931984129097,
+          27.859996241880815,
+          27.859996241880815,
+          27.859996241880815
+        ]
+      }
+    }
+  ]
+}
