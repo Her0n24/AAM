@@ -144,7 +144,8 @@ def vertical_sum_over_pressure_range(
     return out
 
 
-def get_ENSO_index(start_year, end_year) -> tuple[Optional[pd.DatetimeIndex], Optional[np.ndarray]]:
+def get_ENSO_index(start_year, end_year, ensemble_member, 
+                   nino34_directory = "/gws/nopw/j04/leader_epesc/CMIP6_SinglForcHistSimul/ProcessedFlds/Omon/sst_indices/nino34/historical/HadGEM3-GC31-LL/") -> tuple[Optional[pd.DatetimeIndex], Optional[np.ndarray]]:
     """Get the Nino3.4 index from CMIP6 data for the specified period."""
 
     file_pattern = os.path.join(nino34_directory, f"nino34_ssta_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc")

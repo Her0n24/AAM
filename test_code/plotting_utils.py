@@ -251,6 +251,7 @@ def plot_latitude_level_snapshots_HadGEN3(
     cmap_name: str = "RdBu_r",
     output_dir: str | Path = "output/",
     find_extremum: str = "max",
+    title_suffix: str = "",
 ) -> None:
     """Plot a grid of latitude×level snapshots from anomalies.
 
@@ -327,7 +328,11 @@ def plot_latitude_level_snapshots_HadGEN3(
         if i >= len(contour_axes):
             break
         
-        time_val = pd.to_datetime(anomalies_for_plot.time.values[t_idx])
+        _raw_t = anomalies_for_plot.time.values[t_idx]
+        _is_composite_month = isinstance(_raw_t, (int, np.integer)) or (
+            isinstance(_raw_t, float) and _raw_t == int(_raw_t) and 1 <= int(_raw_t) <= 36
+        )
+        _panel_label = f"Composite-{int(_raw_t):02d}" if _is_composite_month else pd.to_datetime(_raw_t).strftime("%Y-%m")
         data_slice = anomalies_for_plot.isel(time=t_idx).transpose(level_dim, lat_dim)
         
         # Use explicit levels array to ensure consistent colorbar
@@ -413,7 +418,7 @@ def plot_latitude_level_snapshots_HadGEN3(
         contour_axes[i].set_xlabel('Latitude (°N)', fontsize=10)
         contour_axes[i].set_xlim(-60, 60)
         contour_axes[i].set_ylabel(vertical_label, fontsize=10)
-        contour_axes[i].set_title(f'{time_val.strftime("%Y-%m")}', fontsize=11, pad=3)
+        contour_axes[i].set_title(_panel_label, fontsize=11, pad=3)
         # Pressure axis: decreasing upward, with sensible pressure ticks
         if vertical_label.lower().startswith("pressure") and np.all(np.isfinite(pressure_hpa)) and np.all(pressure_hpa > 0):
             pmin = float(np.nanmin(pressure_hpa))
@@ -515,8 +520,12 @@ def plot_latitude_level_snapshots_HadGEN3(
     tick_indices = np.arange(0, 11, 1)
     cbar.set_ticks(list(levels[tick_indices]))
     
-    fig.suptitle(f'CMIP6 HadGEM3_GC31 {ensemble_member} zonally integrated AAM Anomaly: Latitude × Level Snapshots\nClimatology: {clim_start_yr}-{clim_end_yr}', 
-                 fontsize=26, y=0.99)
+    _suffix_str = f"  |  {title_suffix}" if title_suffix else ""
+    fig.suptitle(
+        f'CMIP6 HadGEM3_GC31 {ensemble_member} zonally integrated AAM Anomaly: Latitude × Level Snapshots\n'
+        f'Climatology: {clim_start_yr}-{clim_end_yr}{_suffix_str}',
+        fontsize=26, y=0.99,
+    )
     plt.tight_layout(rect=[0, 0.04, 1, 0.99])  # Leave space for colorbar at bottom and reduce top gap
 
     output_file = f'{output_dir}/AAM_anomalies_lat_level_snapshots_{ensemble_member}_{start_year}-{end_year}.png'
@@ -540,14 +549,15 @@ def plot_latitude_level_movie_HadGEM3(
     find_extremum: str = "max",
     fps: int = 4,
 ) -> None:
-    """Animate latitude×level frames into an MP4 movie.
+    """
+    Animate latitude×level frames into an MP4 movie.
 
     Expects anomalies with dims including ('time', 'level', 'latitude') and *no* longitude.
     Each frame shows one time step: a contourf of the anomaly with optional zonal-wind
     overlay and a vertically-integrated profile strip below.
 
-    Requires ffmpeg to be available on the system PATH.
-    """
+    Requires ffmpeg to be available on the system PATH."""
+    
     import matplotlib.animation as animation
     import matplotlib.cm as cm
     import matplotlib.colors as mcolors

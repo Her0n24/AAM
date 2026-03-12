@@ -37,12 +37,11 @@ args = parser.parse_args()
 
 base_dir = os.getcwd()
 AAM_data_path_base = f"{base_dir}/monthly_mean/AAM/"
-output_dir = f"{base_dir}/figures/"
 
 climatology_path_base = f"{base_dir}/climatology/"
 CMIP6_path_base = "/gws/nopw/j04/leader_epesc/CMIP6_SinglForcHistSimul"
 nino34_directory = f"{CMIP6_path_base}/ProcessedFlds/Omon/sst_indices/nino34/historical/HadGEM3-GC31-LL/"
-output_dir = f"{base_dir}/figures/"
+output_dir = f"{base_dir}/figures/composites"
 
 
 # 1. Calculate deviation (in AAM, or U) from annual mean for each poleward propagating year. Can be for each month
@@ -235,10 +234,31 @@ def detect_poleward_propagation_time(
     _argmax_capped = np.array([_argmax_lat(ti, lat_max=float(onset_lat_max_deg)) for ti in range(_nt_full)])
     _argmax_free   = np.array([_argmax_lat(ti)                                    for ti in range(_nt_full)])
 
+    # Pre-compute SH onset-band argmax for sym_constraint (equatorial SH, mirrors NH capped logic)
+    _sh_argmax_capped = None
+    if sym_constraint:
+        _sh_idx   = np.where(_lat_arr < 0.0)[0]
+        _lat_sh   = _lat_arr[_sh_idx]
+        _Avals_sh = np.asarray(anomaly.values, dtype=float)[:, _sh_idx]  # (time, lat_sh)
+
+        def _sh_argmax_lat(t_idx):
+            """Latitude of max anomaly in equatorial SH onset band [-onset_lat_max_deg, 0)."""
+            row = _Avals_sh[t_idx, :]
+            cand = (_lat_sh >= -float(onset_lat_max_deg)) & np.isfinite(row) & (row > anomaly_thres)
+            if not np.any(cand):
+                return np.nan
+            idx = np.where(cand)[0]
+            return float(_lat_sh[idx[np.argmax(row[idx])]])
+
+        _sh_argmax_capped = np.array([_sh_argmax_lat(ti) for ti in range(_nt_full)])
+
     # Enforce El_nino_constraint 
     djf_all_above = None
     if el_nino_constraint:
-        enso_times, enso_vals = get_ENSO_index(start_yr, end_yr - 1)
+        _enso_member = f"r{args.member}i1p1f3"
+        enso_times, enso_vals = get_ENSO_index(start_yr, end_yr - 1, ensemble_member=_enso_member)
+        if enso_times is None or enso_vals is None:
+            raise RuntimeError(f"El Niño constraint enabled but no Nino3.4 file found for member {_enso_member}")
         ENSO_da = xr.DataArray(enso_vals, coords={"time": enso_times}, dims=("time",))
         
         # Check for each event, if the onset year DJF has a value above 0.5 for that winter
@@ -249,8 +269,8 @@ def detect_poleward_propagation_time(
         djf = ENSO_da.where(month.isin([11, 12, 1, 2, 3]), drop=True)
         djf_winter_year = winter_year.sel(time=djf["time"])
         djf = djf.assign_coords(winter_year = djf_winter_year)
-        # For each winter, require ALL DJF months > threshold:
-        djf_all_above = (djf > 0.5).groupby(djf_winter_year).all(dim="time")
+        # For each winter, require the mean of DJF months >= 0.5 (El Niño threshold):
+        djf_all_above = djf.groupby(djf_winter_year).mean(dim="time") >= 0.5
         
     results = {}
     eid = 0
@@ -341,10 +361,63 @@ def detect_poleward_propagation_time(
             if djf_all_above is None:
                 raise ValueError("el_nino_constraint=True but ENSO DJF mask was not computed")
             evt_winter_year = onset_time.year + 1 if onset_time.month == 12 else onset_time.year
-            is_el_nino = bool(djf_all_above.sel(winter_year=evt_winter_year))
+            is_el_nino = bool(djf_all_above.sel(group=evt_winter_year))
             if not is_el_nino:
                 t += 1
                 continue
+
+        if sym_constraint:
+            # Run the same argmax_track_latitude tracking on the SH.
+            # Poleward in SH = southward = decreasing latitude.
+            # To reuse argmax_track_latitude (which is NH-only, lat >= 0) without
+            # modification, we negate the SH latitudes so that -60° → +60°,
+            # making southward propagation appear as northward in the flipped space.
+            sh_lat_onset = _sh_argmax_capped[t]
+            if not np.isfinite(sh_lat_onset):
+                print(f"  \u274c FILTERED: sym_constraint (no SH onset anomaly at t={t})")
+                t += 1
+                continue
+
+            anom_sh = anomaly.isel(time=slice(t, None))
+            anom_sh = anom_sh.where(anom_sh["latitude"] < 0, drop=True)
+            anom_sh = anom_sh.assign_coords(
+                latitude=(-anom_sh["latitude"].values)
+            ).sortby("latitude")
+
+            com_sh = argmax_track_latitude(
+                anom_sh,
+                threshold=anomaly_thres,
+                continuity_deg=float(argmax_continuity_deg),
+                max_southward_jump_deg=float(max_southward_jump_deg),
+                start_latitude=float(-sh_lat_onset),  # negate: e.g. -15°S → +15° in flipped space
+            )
+            keep_sh = _truncate_on_stuck_latitude(
+                com_sh,
+                max_stuck_len=intermittency_constraint,
+                max_southward_jump_deg=max_southward_jump_deg,
+            )
+            _com_sh_vals = np.asarray(com_sh.values[:keep_sh], dtype=float)
+            _sh_finite   = np.where(np.isfinite(_com_sh_vals))[0]
+            _sh_final_neg = float(_com_sh_vals[_sh_finite[-1]]) if _sh_finite.size > 0 else np.nan
+            sh_onset_neg  = float(-sh_lat_onset)  # onset in flipped space
+            if (
+                keep_sh < min_event_len
+                or not np.isfinite(_sh_final_neg)
+                or _sh_final_neg <= sh_onset_neg  # did not propagate poleward
+            ):
+                sh_final_real = -_sh_final_neg if np.isfinite(_sh_final_neg) else float("nan")
+                print(
+                    f"  \u274c FILTERED: sym_constraint "
+                    f"(SH tracking: {keep_sh} months, "
+                    f"{sh_lat_onset:.2f}\u00b0 \u2192 {sh_final_real:.2f}\u00b0)"
+                )
+                t += 1
+                continue
+            sh_final_real = -_sh_final_neg
+            print(
+                f"  \u2713 sym_constraint passed "
+                f"(SH: {sh_lat_onset:.2f}\u00b0 \u2192 {sh_final_real:.2f}\u00b0)"
+            )
 
         # Track from onset with continuity constraint
         anom_evt = anomaly.isel(time=slice(t, None))
@@ -692,6 +765,7 @@ def composite_propagating_years(
     winter_constraint: bool = False,
     el_nino_constraint: bool = False,
     sym_constraint: bool = False,
+    nlevels: int = 11,
 ):
     """Composite AAM anomalies for detected propagating event years.
 
@@ -849,14 +923,28 @@ def composite_propagating_years(
           f"p<0.10: {int(np.sum(p_vals < 0.10))} pts")
 
     fig, ax = plt.subplots(figsize=(10, 6))
+    fig.subplots_adjust(bottom=0.18)
     vmax = float(np.nanpercentile(np.abs(aam_vals), 95))
+    vmin = -vmax
     vmax = vmax if vmax > 0 else 1.0
     cf = ax.contourf(
         month_vals, lat_vals, aam_vals,
-        levels=np.linspace(-vmax, vmax, 21),
+        levels=np.linspace(-vmax, vmax, nlevels),
         cmap="RdBu_r", extend="both",
     )
-    plt.colorbar(cf, ax=ax, label="AAM anomaly (kg m² s⁻¹ per lat band)")
+    
+    _abs = max(abs(vmin), abs(vmax))
+    order = int(np.floor(np.log10(_abs))) if _abs > 0 else 0
+    factor = 10 ** order
+    cax = fig.add_axes([0.125, 0.06, 0.775, 0.015])  # [left, bottom, width, height] #thin colorbar
+    cbar = fig.colorbar(cf, cax=cax, orientation='horizontal', extend='both')
+    _sup = str.maketrans("0123456789-", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207b")
+    _order_sup = str(order).translate(_sup)
+    cbar.set_label(f"AAM anomaly (\u00d710{_order_sup} kg m\u00b2 s\u207b\u00b9 per lat band)", size=12)
+    _tick_levels = cf.levels[::2]
+    cbar.set_ticks(_tick_levels)
+    cbar.set_ticklabels([f'{v / factor:.1f}' for v in _tick_levels])
+    cbar.ax.tick_params(labelsize=11)
 
     if composite_wind is not None:
         wind_vals = composite_wind.values
@@ -873,7 +961,6 @@ def composite_propagating_years(
         ax.scatter(
             month_vals[sig_month_idx], lat_vals[sig_lat_idx],
             s=20, c="k", marker=".", linewidths=0, zorder=10,
-            label="p < 0.05",
         )
     else:
         print("  No grid points reach p<0.05 significance.")
@@ -903,20 +990,19 @@ def composite_propagating_years(
             _mlines.Line2D([], [], color="lime", linewidth=2, linestyle="--",
                            label=f"mean speed {mean_speed:.1f}°/month")
         )
-    if sig_lat_idx.size > 0:
-        import matplotlib.patches as _mpatch
-        legend_handles.append(
-            _mpatch.Patch(facecolor="none", edgecolor="none",
-                          label="· p < 0.05")
-        )
     if legend_handles:
         ax.legend(handles=legend_handles, loc="upper left", fontsize=9)
 
     ax.set_xlabel("Month since onset (1 = onset month)")
     ax.set_ylabel("Latitude (°N)")
+    _constraint_parts = []
+    if winter_constraint:   _constraint_parts.append("winter")
+    if el_nino_constraint:  _constraint_parts.append("El Niño")
+    if sym_constraint:      _constraint_parts.append("SH")
+    _constraint_str = ", ".join(_constraint_parts) + " constraints" if _constraint_parts else "No constraints"
     ax.set_title(
-        f"Composite AAM anomaly ({p_min_hpa}–{p_max_hpa} hPa)\n"
-        f"{ensemble_member}  {n_events} events  clim {clim_start_yr}–{clim_end_yr}"
+        f"HadGEM3_GC31 {ensemble_member} Composite AAM anomaly ({p_min_hpa}–{p_max_hpa} hPa)\n"
+        f"{n_events} events  {args.start_year}–{args.end_year}  clim {clim_start_yr}–{clim_end_yr}  |  {_constraint_str}"
     )
     ax.xaxis.set_major_locator(mticker.MultipleLocator(1))
     ax.set_xlim(1, 12)
@@ -932,10 +1018,10 @@ def composite_propagating_years(
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(
         output_dir,
-        f"AAM_composite_{ensemble_member}_{clim_start_yr}-{clim_end_yr}"
+        f"AAM_composite_{ensemble_member}_{args.start_year}-{args.end_year}"
         f"_{p_min_hpa}-{p_max_hpa}hPa{_constraint_tag}.png",
     )
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Composite plot saved to {out_path}")
     
@@ -1041,3 +1127,68 @@ if __name__ == '__main__':
             el_nino_constraint=bool(args.el_nino_constraint),
             sym_constraint=bool(args.sym_constraint),
         )
+
+    # --- Step 5: Latitude×level composite snapshot plot ---
+    # Re-uses the full multi-level AAM_da (all levels, all lats) but zonally integrates
+    # (removes longitude) before compositing. No vertical integration here — the snapshot
+    # function shows the full lat×level cross-section.
+    if date_list:
+        import pandas as _pd
+
+        # Zonal integral only (keeps all pressure levels) → (time, level, latitude)
+        aam_full = AAM_da["AAM"] if isinstance(AAM_da, xr.Dataset) and "AAM" in AAM_da else AAM_da
+        aam_full = _to_per_latitude_band(aam_full)
+
+        # Anomaly vs climatology (same pipeline as the rest of the script)
+        clim_full = clim_da["AAM"] if isinstance(clim_da, xr.Dataset) and "AAM" in clim_da else clim_da
+        aam_full, clim_on_time_full = _reindex_to_climatology_dims(aam_full, clim_full)
+        anom_full = aam_full - clim_on_time_full  # (time, level, latitude)
+
+        # Composite over events aligned to relative month 1–12 (1 = onset month)
+        stacked_full = []
+        seen_ev: set = set()
+        for onset_str, _ in date_list:
+            if not isinstance(onset_str, str):
+                onset_str = _time_value_to_ymd_string(onset_str)
+            ym = onset_str[:7]
+            if ym in seen_ev:
+                continue
+            seen_ev.add(ym)
+            onset_year = int(onset_str[:4])
+            onset_month = int(onset_str[5:7])
+            t_start = _pd.Timestamp(f"{onset_year}-{onset_month:02d}-01")
+            window_end = (t_start + _pd.DateOffset(months=11)).strftime("%Y-%m")
+            evt = anom_full.sel(time=slice(ym, window_end))
+            if int(evt.sizes["time"]) < 12:
+                print(f"  snapshot composite: onset {ym} window incomplete, skipping.")
+                continue
+            evt = evt.isel(time=slice(0, 12))
+            evt = evt.assign_coords(time=np.arange(1, 13, dtype=int))
+            if "month" in evt.coords:
+                evt = evt.drop_vars("month")
+            evt = evt.rename({"time": "month"})
+            stacked_full.append(evt)
+
+        if stacked_full:
+            n_ev = len(stacked_full)
+            composite_full = xr.concat(stacked_full, dim="event").mean("event", skipna=True)
+            # Rename month → time so plot_latitude_level_snapshots_HadGEN3 sees a 'time' dim
+            composite_full = composite_full.rename({"month": "time"})
+            composite_full.attrs["long_name"] = "AAM anomaly"
+            _constraint_parts_snap = []
+            if args.winter_constraint:  _constraint_parts_snap.append("winter")
+            if args.el_nino_constraint: _constraint_parts_snap.append("El Niño")
+            if args.sym_constraint:     _constraint_parts_snap.append("SH")
+            _snap_suffix = ", ".join(_constraint_parts_snap) + " constraints" if _constraint_parts_snap else ""
+            print(f"Plotting lat×level composite snapshots for {n_ev} events...")
+            plot_latitude_level_snapshots_HadGEN3(
+                composite_full,
+                ensemble_member=ensemble_member,
+                start_year=args.start_year,
+                end_year=args.end_year,
+                clim_start_yr=clim_start_yr,
+                vpercentile = 99.0,
+                clim_end_yr=clim_end_yr,
+                output_dir=output_dir,
+                title_suffix=_snap_suffix,
+            )

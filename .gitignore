@@ -13,3 +13,9 @@
 *.log
 *.ipynb_checkpoints
 __pycache__/
+*.json
+
+#python files
+*.pyc
+*.pyo
+*.pyd
