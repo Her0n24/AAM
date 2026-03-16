@@ -33,6 +33,7 @@ parser.add_argument('--max-southward-jump', type=float, default=5.0, help='Termi
 parser.add_argument('--winter-constraint', action='store_true', default=False, help='Only accept events whose onset is in NDJFM (default: off)')
 parser.add_argument('--el-nino-constraint', action='store_true', default=False, help='Only accept events coinciding with El Nino (Nino3.4 > 0.5 in DJF; default: off)')
 parser.add_argument('--sym-constraint', action='store_true', default=False, help='Only accept events with concurrent SH poleward propagation (default: off)')
+parser.add_argument('--rolling-period', type=int, default=1, help='Rolling-month window for composite analysis (default: 1 = no rolling; 3 gives DJF/JFM/FMA labels)')
 args = parser.parse_args()
 
 base_dir = os.getcwd()
@@ -59,6 +60,16 @@ output_dir = f"{base_dir}/figures/composites"
 # If (intermittancy) criteria has been satisfied, do a fit line to the maximum values across latitude in time.
 
 
+def _rolling_mean_time(da: xr.DataArray, window: int) -> xr.DataArray:
+    """Centered rolling mean over the time axis for chronological monthly data."""
+    window = int(window)
+    if window < 1:
+        raise ValueError("rolling_period must be >= 1")
+    if window == 1:
+        return da
+    return da.rolling(time=window, center=True, min_periods=window).mean()
+
+
 def detect_poleward_propagation_time(
     da,
     clim_da,
@@ -76,6 +87,7 @@ def detect_poleward_propagation_time(
     max_com_jump_deg=None,
     argmax_continuity_deg: float = 20.0,
     max_southward_jump_deg: float = 15.0,
+    rolling_period: int = 1,
 ) -> dict:
     """
     Given a dataarray of zonally integrated AAM in latitude and time, detect poleward propagating events in the NH.
@@ -114,6 +126,7 @@ def detect_poleward_propagation_time(
     da, clim_on_time = _reindex_to_climatology_dims(da, clim_da)
 
     anomaly = da - clim_on_time
+    anomaly = _rolling_mean_time(anomaly, rolling_period)
 
     def argmax_track_latitude(
         anom_event: xr.DataArray,
@@ -621,6 +634,7 @@ def plot_hovmoller_with_events(
     output_dir: str = "figures/",
     nlevels: int = 11,
     cmap_name: str = "RdBu_r",
+    rolling_period: int = 1,
 ) -> None:
     """Hovmöller (latitude–time) plot of AAM anomalies with detected event trajectories."""
     import matplotlib
@@ -642,6 +656,7 @@ def plot_hovmoller_with_events(
     clim  = vertical_sum_over_pressure_range(clim,  p_min_hpa=p_min_hpa, p_max_hpa=p_max_hpa, level_dim="level")
     field, clim_on_time = _reindex_to_climatology_dims(field, clim)
     anomaly = field - clim_on_time
+    anomaly = _rolling_mean_time(anomaly, rolling_period)
 
     times = pd.DatetimeIndex(
         [pd.Timestamp(f"{t.year:04d}-{t.month:02d}-01") for t in anomaly["time"].values]
@@ -687,11 +702,19 @@ def plot_hovmoller_with_events(
     ax.set_xlabel('Year', size=15)
     ax.set_ylabel('Latitude (°)', size=15)
     ax.axhline(y=0, color='black', linewidth=1.5, linestyle='-', zorder=10)
-    ax.set_title(
-        f"CMIP6 HadGEM3-GC3.1 {ensemble_member} AAM anomalies ({start_yr}\u2013{end_yr})  "
-        f"{p_min_hpa:.0f}\u2013{p_max_hpa:.0f} hPa  |  {len(results)} events detected",
-        size=15,
-    )
+    if rolling_period > 1:
+        ax.set_title(
+            f"CMIP6 HadGEM3-GC3.1 {ensemble_member} AAM anomalies ({start_yr}\u2013{end_yr})  "
+            f"{p_min_hpa:.0f}\u2013{p_max_hpa:.0f} hPa  | {rolling_period} months rolling |  {len(results)} events detected",
+            size=12,
+        )
+    else:
+        ax.set_title(
+            f"CMIP6 HadGEM3-GC3.1 {ensemble_member} AAM anomalies ({start_yr}\u2013{end_yr})  "
+            f"{p_min_hpa:.0f}\u2013{p_max_hpa:.0f} hPa |  {len(results)} events detected",
+            size=15,
+        )
+        
     ax.grid(True, alpha=0.3)
 
     # Overlay detected event trajectories
@@ -739,11 +762,18 @@ def plot_hovmoller_with_events(
     cax.set_position([cax_pos.x0, cax_pos.y0 - 0.05, cax_pos.width, cax_pos.height * 0.75])
 
     os.makedirs(output_dir, exist_ok=True)
-    savepath = os.path.join(
-        output_dir,
-        f"AAM_hovmoller_{ensemble_member}_{start_yr}-{end_yr}"
-        f"_{p_min_hpa:.0f}-{p_max_hpa:.0f}hPa_wEvents.png",
-    )
+    if rolling_period > 1:
+        savepath = os.path.join(
+            output_dir,
+            f"AAM_hovmoller_{ensemble_member}_{start_yr}-{end_yr}"
+            f"_{p_min_hpa:.0f}-{p_max_hpa:.0f}hPa_rolling{rolling_period}wEvents.png",
+        )
+    else:
+        savepath = os.path.join(
+            output_dir,
+            f"AAM_hovmoller_{ensemble_member}_{start_yr}-{end_yr}"
+            f"_{p_min_hpa:.0f}-{p_max_hpa:.0f}hPa_Events.png",
+        )
     fig.savefig(savepath, dpi=300, bbox_inches='tight')
     plt.close(fig)
     print(f"Hovmöller plot saved to: {savepath}")
@@ -765,6 +795,7 @@ def composite_propagating_years(
     winter_constraint: bool = False,
     el_nino_constraint: bool = False,
     sym_constraint: bool = False,
+    rolling_period: int = 1,
     nlevels: int = 11,
 ):
     """Composite AAM anomalies for detected propagating event years.
@@ -786,6 +817,35 @@ def composite_propagating_years(
     if not date_list:
         print("composite_propagating_years: date_list is empty, nothing to composite.")
         return
+
+    rolling_period = int(rolling_period)
+    if rolling_period < 1:
+        raise ValueError("rolling_period must be >= 1")
+
+    def _circular_rolling_mean(da: xr.DataArray, *, dim: str, window: int) -> xr.DataArray:
+        """Circular rolling mean over `dim` to preserve Jan/Dec continuity."""
+        if window <= 1:
+            return da
+        n = int(da.sizes[dim])
+        if window > n:
+            raise ValueError(f"rolling_period ({window}) cannot exceed number of {dim} bins ({n})")
+        left = window // 2
+        right = window - left - 1
+        rolled = [da.roll({dim: -offset}, roll_coords=False) for offset in range(-left, right + 1)]
+        return xr.concat(rolled, dim="_roll").mean("_roll", skipna=True)
+
+    def _rolling_tick_labels(window: int, n_bins: int = 12) -> list[str]:
+        """Return month-window labels for axis ticks (e.g., DJF, JFM, FMA for window=3)."""
+        month_initials = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"]
+        if window <= 1:
+            return [f"M{m:02d}" for m in range(1, n_bins + 1)]
+        left = window // 2
+        right = window - left - 1
+        labels = []
+        for center in range(n_bins):
+            parts = [month_initials[(center + off) % 12] for off in range(-left, right + 1)]
+            labels.append("".join(parts))
+        return labels
 
     # --- Unwrap Datasets ---
     AAM_field = AAM_da["AAM"] if isinstance(AAM_da, xr.Dataset) and "AAM" in AAM_da else AAM_da
@@ -893,11 +953,14 @@ def composite_propagating_years(
 
     print(f"Compositing {n_events} event year(s) (full Jan–Dec).")
     aam_stack = xr.concat(stacked_AAM, dim="event")
-    composite_AAM = aam_stack.mean("event", skipna=True)
+    aam_stack_for_plot = _circular_rolling_mean(aam_stack, dim="month", window=rolling_period)
+    composite_AAM = aam_stack_for_plot.mean("event", skipna=True)
 
     composite_wind = None
     if stacked_wind:
-        composite_wind = xr.concat(stacked_wind, dim="event").mean("event", skipna=True)
+        wind_stack = xr.concat(stacked_wind, dim="event")
+        wind_stack = _circular_rolling_mean(wind_stack, dim="month", window=rolling_period)
+        composite_wind = wind_stack.mean("event", skipna=True)
 
     # --- Plot lat×time Hovmöller of composite ---
     import matplotlib.pyplot as plt
@@ -915,7 +978,7 @@ def composite_propagating_years(
 
     # --- T-test: significance vs zero along event dimension ---
     from scipy import stats as _stats
-    aam_for_ttest = aam_stack.transpose("event", lat_dim, "month").values
+    aam_for_ttest = aam_stack_for_plot.transpose("event", lat_dim, "month").values
     _, p_vals = _stats.ttest_1samp(aam_for_ttest, 0.0, axis=0, nan_policy="omit")
     # p_vals is (lat, month), matching aam_vals layout
     print(f"  t-test: shape={p_vals.shape}, min p={float(np.nanmin(p_vals)):.4f}, "
@@ -993,18 +1056,33 @@ def composite_propagating_years(
     if legend_handles:
         ax.legend(handles=legend_handles, loc="upper left", fontsize=9)
 
-    ax.set_xlabel("Month since onset (1 = onset month)")
+    if rolling_period == 3:
+        ax.set_xlabel("Rolling 3-month window")
+    elif rolling_period > 1:
+        ax.set_xlabel(f"Rolling {rolling_period}-month window")
+    else:
+        ax.set_xlabel("Month since onset (1 = onset month)")
     ax.set_ylabel("Latitude (°N)")
     _constraint_parts = []
     if winter_constraint:   _constraint_parts.append("winter")
     if el_nino_constraint:  _constraint_parts.append("El Niño")
     if sym_constraint:      _constraint_parts.append("SH")
     _constraint_str = ", ".join(_constraint_parts) + " constraints" if _constraint_parts else "No constraints"
-    ax.set_title(
-        f"HadGEM3_GC31 {ensemble_member} Composite AAM anomaly ({p_min_hpa}–{p_max_hpa} hPa)\n"
-        f"{n_events} events  {args.start_year}–{args.end_year}  clim {clim_start_yr}–{clim_end_yr}  |  {_constraint_str}"
-    )
+    
+    if rolling_period > 1:
+        ax.set_title(
+            f"HadGEM3_GC31 {ensemble_member} Composite AAM anomaly ({p_min_hpa}–{p_max_hpa} hPa)\n"
+            f"{n_events} events  {args.start_year}–{args.end_year}  clim {clim_start_yr}–{clim_end_yr}  |  {rolling_period}-month rolling  |  {_constraint_str}"
+        )
+    else:
+        ax.set_title(
+            f"HadGEM3_GC31 {ensemble_member} Composite AAM anomaly ({p_min_hpa}–{p_max_hpa} hPa)\n"
+            f"{n_events} events  {args.start_year}–{args.end_year}  clim {clim_start_yr}–{clim_end_yr}  |  {_constraint_str}"
+        )
     ax.xaxis.set_major_locator(mticker.MultipleLocator(1))
+    if rolling_period >= 3:
+        ax.set_xticks(month_vals)
+        ax.set_xticklabels(_rolling_tick_labels(rolling_period, n_bins=len(month_vals)), rotation=0, ha="center")
     ax.set_xlim(1, 12)
     ax.set_ylim(-60, 60)
 
@@ -1016,11 +1094,18 @@ def composite_propagating_years(
     if sym_constraint:
         _constraint_tag += "_sym"
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(
-        output_dir,
-        f"AAM_composite_{ensemble_member}_{args.start_year}-{args.end_year}"
-        f"_{p_min_hpa}-{p_max_hpa}hPa{_constraint_tag}.png",
-    )
+    if rolling_period > 1:
+        out_path = os.path.join(
+            output_dir,
+            f"AAM_composite_{ensemble_member}_{args.start_year}-{args.end_year}"
+            f"_{p_min_hpa}-{p_max_hpa}hPa_rolling{rolling_period}_{_constraint_tag}.png",
+        )
+    else:
+        out_path = os.path.join(
+            output_dir,
+            f"AAM_composite_{ensemble_member}_{args.start_year}-{args.end_year}"
+            f"_{p_min_hpa}-{p_max_hpa}hPa{_constraint_tag}.png",
+        )
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Composite plot saved to {out_path}")
@@ -1059,6 +1144,7 @@ if __name__ == '__main__':
         max_com_jump_deg=args.max_com_jump,
         argmax_continuity_deg=float(args.argmax_continuity_deg),
         max_southward_jump_deg=float(args.max_southward_jump),
+        rolling_period=int(args.rolling_period),
     )
 
     # Build constraint tag for filename and title
@@ -1088,6 +1174,7 @@ if __name__ == '__main__':
             "max_com_jump_deg": args.max_com_jump,
             "argmax_continuity_deg": float(args.argmax_continuity_deg),
             "max_southward_jump_deg": float(args.max_southward_jump),
+            "rolling_period": int(args.rolling_period),
         },
     )
     print(f"Detected {len(results)} events")
@@ -1104,6 +1191,7 @@ if __name__ == '__main__':
         p_max_hpa=float(args.p_max),
         ensemble_member=ensemble_member,
         output_dir=output_dir,
+        rolling_period=int(args.rolling_period),
     )
 
     # --- Step 4: Read JSON back and composite ---
@@ -1126,6 +1214,7 @@ if __name__ == '__main__':
             winter_constraint=bool(args.winter_constraint),
             el_nino_constraint=bool(args.el_nino_constraint),
             sym_constraint=bool(args.sym_constraint),
+            rolling_period=int(args.rolling_period),
         )
 
     # --- Step 5: Latitude×level composite snapshot plot ---
@@ -1171,7 +1260,26 @@ if __name__ == '__main__':
 
         if stacked_full:
             n_ev = len(stacked_full)
-            composite_full = xr.concat(stacked_full, dim="event").mean("event", skipna=True)
+            full_stack = xr.concat(stacked_full, dim="event")
+
+            # Apply circular rolling over the 12 relative months before averaging events.
+            # This wraps across year-end, so NDJ uses Nov-Dec-Jan and DJF uses Dec-Jan-Feb.
+            rp = int(args.rolling_period)
+            if rp > 1:
+                n_month = int(full_stack.sizes["month"])
+                if rp > n_month:
+                    raise ValueError(
+                        f"rolling_period ({rp}) cannot exceed number of month bins ({n_month})"
+                    )
+                left = rp // 2
+                right = rp - left - 1
+                _rolled = [
+                    full_stack.roll(month=-offset, roll_coords=False)
+                    for offset in range(-left, right + 1)
+                ]
+                full_stack = xr.concat(_rolled, dim="_roll").mean("_roll", skipna=True)
+
+            composite_full = full_stack.mean("event", skipna=True)
             # Rename month → time so plot_latitude_level_snapshots_HadGEN3 sees a 'time' dim
             composite_full = composite_full.rename({"month": "time"})
             composite_full.attrs["long_name"] = "AAM anomaly"
@@ -1191,4 +1299,6 @@ if __name__ == '__main__':
                 clim_end_yr=clim_end_yr,
                 output_dir=output_dir,
                 title_suffix=_snap_suffix,
+                rolling_period=int(args.rolling_period),
+                filename_suffix=constraint_tag,
             )

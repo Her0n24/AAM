@@ -252,6 +252,8 @@ def plot_latitude_level_snapshots_HadGEN3(
     output_dir: str | Path = "output/",
     find_extremum: str = "max",
     title_suffix: str = "",
+    rolling_period: int | None = None,
+    filename_suffix: str = "",
 ) -> None:
     """Plot a grid of latitude×level snapshots from anomalies.
 
@@ -332,7 +334,14 @@ def plot_latitude_level_snapshots_HadGEN3(
         _is_composite_month = isinstance(_raw_t, (int, np.integer)) or (
             isinstance(_raw_t, float) and _raw_t == int(_raw_t) and 1 <= int(_raw_t) <= 36
         )
-        _panel_label = f"Composite-{int(_raw_t):02d}" if _is_composite_month else pd.to_datetime(_raw_t).strftime("%Y-%m")
+        if _is_composite_month:
+            if rolling_period is not None and rolling_period > 1:
+                _panel_label = f"Composite-Rolling-{int(_raw_t):02d}"
+            else:
+                _panel_label = f"Composite-{int(_raw_t):02d}"
+        else:
+            _panel_label = pd.to_datetime(_raw_t).strftime("%Y-%m")
+        
         data_slice = anomalies_for_plot.isel(time=t_idx).transpose(level_dim, lat_dim)
         
         # Use explicit levels array to ensure consistent colorbar
@@ -528,7 +537,20 @@ def plot_latitude_level_snapshots_HadGEN3(
     )
     plt.tight_layout(rect=[0, 0.04, 1, 0.99])  # Leave space for colorbar at bottom and reduce top gap
 
-    output_file = f'{output_dir}/AAM_anomalies_lat_level_snapshots_{ensemble_member}_{start_year}-{end_year}.png'
+    rolling_tag = ""
+    if rolling_period is not None:
+        rp = int(rolling_period)
+        if rp > 1:
+            rolling_tag = f"_rolling{rp}"
+
+    file_suffix = ""
+    if filename_suffix:
+        file_suffix = f"_{str(filename_suffix).strip('_')}"
+
+    output_file = (
+        f'{output_dir}/AAM_anomalies_lat_level_snapshots_{ensemble_member}_{start_year}-{end_year}'
+        f'{rolling_tag}{file_suffix}.png'
+    )
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     print(f"Snapshot figure saved to: {output_file}")
     plt.close()
