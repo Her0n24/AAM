@@ -12,6 +12,8 @@ python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 20
 To composite 24 months starting from December of each onset year:
 python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --composite-months 24 --composite-start december_onset_year
 
+To detect La Niña events that onset in NDJFM and composite 24 months from onset month:
+python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --member 1 --composite-start onset --onset-season ndjfm --enso-state la_nina --nino-threshold -0.5
 Reference 
 Hardiman et al., 2025
 https://doi.org/10.1038/s41612-025-01283-7
@@ -26,7 +28,7 @@ import argparse
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from utilities import _to_per_latitude_band, _reindex_to_climatology_dims, vertical_sum_over_pressure_range, get_ENSO_index
-from plotting_utils import plot_latitude_level_snapshots_HadGEN3
+from plotting_utils import plot_latitude_level_snapshots_HadGEN3, plot_lat_lon_snapshots
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Plot CMIP6 AAM anomalies integrated over specified pressure levels')
@@ -48,13 +50,20 @@ parser.add_argument('--onset-season', type=str, default='all', choices=['all', '
 args = parser.parse_args()
 
 base_dir = os.getcwd()
-AAM_data_path_base = f"{base_dir}/monthly_mean/AAM/"
+# AAM_data_path_base = f"{base_dir}/monthly_mean/AAM/"
 
-climatology_path_base = f"{base_dir}/climatology/"
-CMIP6_path_base = "/gws/nopw/j04/leader_epesc/CMIP6_SinglForcHistSimul"
-nino34_directory = f"{CMIP6_path_base}/ProcessedFlds/Omon/sst_indices/nino34/historical/HadGEM3-GC31-LL/"
+#climatology_path_base = f"{base_dir}/climatology/"
+
+# CMIP6_path_base = "/gws/nopw/j04/leader_epesc/CMIP6_SinglForcHistSimul" 
+# nino34_directory = f"{CMIP6_path_base}/ProcessedFlds/Omon/sst_indices/nino34/historical/HadGEM3-GC31-LL/"
+# output_dir = f"{base_dir}/figures/composites/non_tracking_algorithm/"
+
+# Use scratch space and new directory structure due to workspace migration
+CMIP6_path_base = "/work/scratch-nopw2/hhhn2/"
+nino34_directory = f"{CMIP6_path_base}/HadGEM3-GC31-LL/ProcessedFlds/Omon/sst_indices/nino34/historical/"
 output_dir = f"{base_dir}/figures/composites/non_tracking_algorithm/"
-
+climatology_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/AAM/climatology/"
+AAM_data_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/AAM/full/"
 
 # 1. Calculate deviation (in AAM, or U) from annual mean for each poleward propagating year. Can be for each month
 # or for each season or rolling season
@@ -199,10 +208,11 @@ def plot_hovmoller_selected_periods(
     if isinstance(AAM_field, xr.Dataset):
         AAM_field = next(iter(AAM_field.data_vars.values()))
 
-    AAM_field = _to_per_latitude_band(AAM_field)
+    #AAM_field = _to_per_latitude_band(AAM_field)
     AAM_field = vertical_sum_over_pressure_range(
         AAM_field, p_min_hpa=p_min_hpa, p_max_hpa=p_max_hpa, level_dim="level"
     )
+    #import pdb; pdb.set_trace()
     AAM_field = AAM_field.sel(time=slice(f"{int(start_year)}-01", f"{int(end_year)}-12"))
 
     if clim_da is not None:
@@ -213,10 +223,19 @@ def plot_hovmoller_selected_periods(
             clim_field, p_min_hpa=p_min_hpa, p_max_hpa=p_max_hpa, level_dim="level"
         )
         AAM_anom = AAM_field.groupby("time.month") - clim_field
+        # if "longitude" in AAM_anom.dims:
+        #     AAM_anom = AAM_anom.sum(dim="longitude", skipna=True)
+        # elif "lon" in AAM_anom.dims:
+        #     AAM_anom = AAM_anom.sum(dim="lon", skipna=True)
     else:
         clim_inline = AAM_field.groupby("time.month").mean("time")
         AAM_anom = AAM_field.groupby("time.month") - clim_inline
-
+        # if "longitude" in AAM_anom.dims:
+        #     AAM_anom = AAM_anom.sum(dim="longitude", skipna=True)
+        # elif "lon" in AAM_anom.dims:
+        #     AAM_anom = AAM_anom.sum(dim="lon", skipna=True)
+            
+            
     lat_dim = "latitude" if "latitude" in AAM_anom.dims else "lat"
     lat_vals = AAM_anom[lat_dim].values
     time_raw = AAM_anom["time"].values
@@ -230,7 +249,7 @@ def plot_hovmoller_selected_periods(
         aam_vals = aam_vals.T
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    vmax = float(np.nanpercentile(np.abs(aam_vals), 95))
+    vmax = float(np.nanpercentile(np.abs(aam_vals), 99))
     vmax = vmax if np.isfinite(vmax) and vmax > 0 else 1.0
     cf = ax.contourf(
         x_vals,
@@ -284,7 +303,7 @@ def plot_hovmoller_selected_periods(
     out_path = os.path.join(
         output_dir,
         f"AAM_hovmoller_selected_periods_{ensemble_member}_{start_year}-{end_year}_{enso_state}_state"
-        f"{season_suffix}_m{int(composite_months)}{start_suffix}.png",
+        f"{season_suffix}_m{int(composite_months)}{start_suffix}_new.png",
     )
     fig.savefig(out_path, dpi=250, bbox_inches="tight")
     plt.close(fig)
@@ -313,7 +332,7 @@ def composite_propagating_years(
     rolling_period: int = 1,
     composite_months: int = 24,
     composite_start: str = "onset",
-    nlevels: int = 11,
+    nlevels: int = 13,
     onset_season: str = "all",
 ):
     """Composite AAM anomalies for El Nino onset windows.
@@ -383,7 +402,8 @@ def composite_propagating_years(
 
     # --- Zonal integral for AAM per latitude band
     # and zonal mean for wind (intensive quantity) ---
-    AAM_field = _to_per_latitude_band(AAM_field)
+    # if "longitude" in AAM_field.dims or "lon" in AAM_field.dims:
+    #     AAM_field = _to_per_latitude_band(AAM_field)
     if wind_field is not None:
         for lon_name in ("longitude", "lon"):
             if lon_name in wind_field.dims:
@@ -403,6 +423,11 @@ def composite_propagating_years(
         clim_field = clim_da["AAM"] if isinstance(clim_da, xr.Dataset) and "AAM" in clim_da else clim_da
         if isinstance(clim_field, xr.Dataset):
             clim_field = next(iter(clim_field.data_vars.values()))
+        # # Only sum over longitude if it still exists (not already zonally integrated)
+        # if "longitude" in clim_field.dims:
+        #     clim_field = clim_field.sum(dim="longitude", skipna=True)
+        # elif "lon" in clim_field.dims:
+        #     clim_field = clim_field.sum(dim="lon", skipna=True)
         clim_field = vertical_sum_over_pressure_range(
             clim_field, p_min_hpa=p_min_hpa, p_max_hpa=p_max_hpa, level_dim="level"
         )
@@ -411,7 +436,8 @@ def composite_propagating_years(
         clim_period = AAM_field.sel(time=slice(f"{clim_start_yr}-01", f"{clim_end_yr}-12"))
         clim_inline = clim_period.groupby("time.month").mean("time")
         AAM_anom = AAM_field.groupby("time.month") - clim_inline
-
+    #import pdb; pdb.set_trace()
+    
     # --- Extract composite window for each event ---
     stacked_AAM = []
     stacked_wind = []
@@ -503,7 +529,7 @@ def composite_propagating_years(
 
     fig, ax = plt.subplots(figsize=(10, 6))
     fig.subplots_adjust(bottom=0.18)
-    vmax = float(np.nanpercentile(np.abs(aam_vals), 95))
+    vmax = float(np.nanpercentile(np.abs(aam_vals), 98))
     vmin = -vmax
     vmax = vmax if vmax > 0 else 1.0
     cf = ax.contourf(
@@ -590,13 +616,13 @@ def composite_propagating_years(
         out_path = os.path.join(
             output_dir,
             f"AAM_composite_{ensemble_member}_{args.start_year}-{args.end_year}"
-            f"_{p_min_hpa}-{p_max_hpa}hPa_{enso_state}_state_rolling{rolling_period}.png",
+            f"_{p_min_hpa}-{p_max_hpa}hPa_{enso_state}_state_rolling{rolling_period}_new.png",
         )
     else:
         out_path = os.path.join(
             output_dir,
             f"AAM_composite_{ensemble_member}_{args.start_year}-{args.end_year}"
-            f"_{p_min_hpa}-{p_max_hpa}hPa_{enso_state}_state.png",
+            f"_{p_min_hpa}-{p_max_hpa}hPa_{enso_state}_state_new.png",
         )
     _season_suffix = f"_{onset_season}" if onset_season != "all" else ""
     _start_suffix = "_decstart" if composite_start == "december_onset_year" else "_onsetstart"
@@ -604,13 +630,13 @@ def composite_propagating_years(
         out_path = os.path.join(
             output_dir,
             f"AAM_composite_{ensemble_member}_{args.start_year}-{args.end_year}"
-            f"_{p_min_hpa}-{p_max_hpa}hPa_{enso_state}_state{_season_suffix}_m{composite_months}{_start_suffix}_rolling{rolling_period}.png",
+            f"_{p_min_hpa}-{p_max_hpa}hPa_{enso_state}_state{_season_suffix}_m{composite_months}{_start_suffix}_rolling{rolling_period}_new.png",
         )
     else:
         out_path = os.path.join(
             output_dir,
             f"AAM_composite_{ensemble_member}_{args.start_year}-{args.end_year}"
-            f"_{p_min_hpa}-{p_max_hpa}hPa_{enso_state}_state{_season_suffix}_m{composite_months}{_start_suffix}.png",
+            f"_{p_min_hpa}-{p_max_hpa}hPa_{enso_state}_state{_season_suffix}_m{composite_months}{_start_suffix}_new.png",
         )
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -625,14 +651,21 @@ if __name__ == '__main__':
     ensemble_member = f"r{args.member}i1p1f3"
     
     # Load data
-    AAM_da = xr.open_dataset(f"{AAM_data_path_base}AAM_CMIP6_HadGEM3_GC31_{ensemble_member}_1850-01_2014-12.nc"
-    )['AAM']  
-    # IMPORTANT: use the per-latitude-band + zonal-integral climatology (matches _to_per_latitude_band convention)
-    clim_kind = "latband_lonint"
+    AAM_da = xr.open_dataset(f"{AAM_data_path_base}AAM_CMIP6_HadGEM3_GC31_{ensemble_member}_1850-01_2014-12.nc")['AAM']
+    # Ensure zonal integration (remove longitude) if present
+    if "longitude" in AAM_da.dims or "lon" in AAM_da.dims:
+        AAM_da = _to_per_latitude_band(AAM_da)  # (time, level, latitude)
+    
     clim_da = xr.open_dataset(
-        f"{climatology_path_base}AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_{clim_start_yr}-{clim_end_yr}_{clim_kind}.nc"
-    )  # dims: month, level, latitude
-
+        f"{climatology_path_base}AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_{clim_start_yr}-{clim_end_yr}.nc"
+        )  #dims: month, level, latitude, longitude 
+    #import pdb; pdb.set_trace()
+    # IMPORTANT: use the per-latitude-band + zonal-integral climatology (matches _to_per_latitude_band convention)
+    if 'longitude' in clim_da['AAM'].dims or 'lon' in clim_da['AAM'].dims:
+        clim_da = _to_per_latitude_band(clim_da['AAM'])
+    else:
+        clim_da = clim_da['AAM']
+        
     # --- Step 1: Detect ENSO state windows from Nino3.4 ---
     _onset_months_map: dict = {"all": None, "ndjfm": {11, 12, 1, 2, 3}}
     onset_months_filter = _onset_months_map[args.onset_season]
@@ -730,16 +763,113 @@ if __name__ == '__main__':
     # Re-uses the full multi-level AAM_da (all levels, all lats) but zonally integrates
     # (removes longitude) before compositing. No vertical integration here — the snapshot
     # function shows the full lat×level cross-section.
+    # if date_list:
+    #     # Zonal integral only (keeps all pressure levels) → (time, level, latitude)
+    #     aam_full = AAM_da["AAM"] if isinstance(AAM_da, xr.Dataset) and "AAM" in AAM_da else AAM_da
+    #     aam_full = _to_per_latitude_band(aam_full)
+
+    #     # Anomaly vs climatology (same pipeline as the rest of the script)
+    #     clim_full = clim_da["AAM"] if isinstance(clim_da, xr.Dataset) and "AAM" in clim_da else clim_da
+    #     aam_full, clim_on_time_full = _reindex_to_climatology_dims(aam_full, clim_full)
+    #     anom_full = aam_full - clim_on_time_full  # (time, level, latitude)
+
+    #     # Composite over events aligned to relative month 1..N
+    #     stacked_full = []
+    #     seen_ev: set = set()
+    #     for onset_str, _ in date_list:
+    #         if not isinstance(onset_str, str):
+    #             onset_str = _time_value_to_ymd_string(onset_str)
+    #         ym = onset_str[:7]
+    #         if ym in seen_ev:
+    #             continue
+    #         seen_ev.add(ym)
+    #         window_start, window_end = _compute_composite_window_from_onset(
+    #             onset_str,
+    #             composite_months=int(args.composite_months),
+    #             composite_start=str(args.composite_start),
+    #         )
+    #         evt = anom_full.sel(time=slice(window_start, window_end))
+    #         if int(evt.sizes["time"]) < int(args.composite_months):
+    #             print(f"  snapshot composite: onset {ym} window incomplete, skipping.")
+    #             continue
+    #         evt = evt.isel(time=slice(0, int(args.composite_months)))
+    #         evt = evt.assign_coords(time=np.arange(1, int(args.composite_months) + 1, dtype=int))
+    #         if "month" in evt.coords:
+    #             evt = evt.drop_vars("month")
+    #         evt = evt.rename({"time": "month"})
+    #         stacked_full.append(evt)
+
+    #     if stacked_full:
+    #         n_ev = len(stacked_full)
+    #         full_stack = xr.concat(stacked_full, dim="event")
+
+    #         # Apply circular rolling over relative-month bins before averaging events.
+    #         # This wraps across year-end, so NDJ uses Nov-Dec-Jan and DJF uses Dec-Jan-Feb.
+    #         rp = int(args.rolling_period)
+    #         if rp > 1:
+    #             n_month = int(full_stack.sizes["month"])
+    #             if rp > n_month:
+    #                 raise ValueError(
+    #                     f"rolling_period ({rp}) cannot exceed number of month bins ({n_month})"
+    #                 )
+    #             left = rp // 2
+    #             right = rp - left - 1
+    #             _rolled = [
+    #                 full_stack.roll(month=-offset, roll_coords=False)
+    #                 for offset in range(-left, right + 1)
+    #             ]
+    #             full_stack = xr.concat(_rolled, dim="_roll").mean("_roll", skipna=True)
+
+    #         composite_full = full_stack.mean("event", skipna=True)
+    #         # Rename month → time so plot_latitude_level_snapshots_HadGEN3 sees a 'time' dim
+    #         composite_full = composite_full.rename({"month": "time"})
+    #         composite_full.attrs["long_name"] = "AAM anomaly"
+    #         _cmp = ">" if args.enso_state == "el_nino" else "<"
+    #         _snap_season_label = "  |  NDJFM onsets only" if args.onset_season == "ndjfm" else ""
+    #         _snap_suffix = (
+    #             f"{state_pretty} state: Nino3.4{_cmp}{float(args.nino_threshold):.2f} "
+    #             f"for >= {int(args.min_elnino_months)} months"
+    #             f" | {int(args.composite_months)}-month composite from "
+    #             f"{'Dec of onset year' if args.composite_start == 'december_onset_year' else 'onset month'}"
+    #             f"{_snap_season_label}"
+    #         )
+    #         _snap_file_season = f"_{args.onset_season}" if args.onset_season != "all" else ""
+    #         print(f"Plotting lat×level composite snapshots for {n_ev} events...")
+    #         plot_latitude_level_snapshots_HadGEN3(
+    #             composite_full,
+    #             ensemble_member=ensemble_member,
+    #             start_year=args.start_year,
+    #             end_year=args.end_year,
+    #             clim_start_yr=clim_start_yr,
+    #             vpercentile=99.0,
+    #             clim_end_yr=clim_end_yr,
+    #             output_dir=output_dir,
+    #             title_suffix=_snap_suffix,
+    #             rolling_period=int(args.rolling_period),
+    #             filename_suffix=f"_{args.enso_state}_state{_snap_file_season}_new",
+    #         )
+    
+    # Step 6: LAT*Lon composite snapshots plots
+    # IMPORTANT: Here we require different kind of Climatology not the latband version
+    aam_full = xr.open_dataset(f"{AAM_data_path_base}AAM_CMIP6_HadGEM3_GC31_{ensemble_member}_1850-01_2014-12.nc")['AAM']
+    clim_full = clim_da = xr.open_dataset(
+        f"{climatology_path_base}AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_{clim_start_yr}-{clim_end_yr}.nc"
+    )  # dims: month, level, latitude
+    
+    # Similar to Step 5 but without zonal integration, so the full lat×lon×level structure is retained.
     if date_list:
-        # Zonal integral only (keeps all pressure levels) → (time, level, latitude)
-        aam_full = AAM_da["AAM"] if isinstance(AAM_da, xr.Dataset) and "AAM" in AAM_da else AAM_da
-        aam_full = _to_per_latitude_band(aam_full)
-
-        # Anomaly vs climatology (same pipeline as the rest of the script)
+        # Vertical integral only (keeps all longitudes) → (time, latitude, longitude)
+        aam_vs = vertical_sum_over_pressure_range(aam_full, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
+        #import pdb; pdb.set_trace()
         clim_full = clim_da["AAM"] if isinstance(clim_da, xr.Dataset) and "AAM" in clim_da else clim_da
-        aam_full, clim_on_time_full = _reindex_to_climatology_dims(aam_full, clim_full)
-        anom_full = aam_full - clim_on_time_full  # (time, level, latitude)
-
+        clim_vs = vertical_sum_over_pressure_range(clim_full, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
+        # Anomaly vs climatology (same pipeline as the rest of the script)
+        clim_vs = clim_vs["AAM"] if isinstance(clim_vs, xr.Dataset) and "AAM" in clim_vs else clim_vs
+        aam_full, clim_on_time = _reindex_to_climatology_dims(aam_vs, clim_vs)
+        anom_full = aam_full - clim_on_time  # (time, latitude, longitude)
+        
+        #import pdb; pdb.set_trace()
+        
         # Composite over events aligned to relative month 1..N
         stacked_full = []
         seen_ev: set = set()
@@ -801,17 +931,18 @@ if __name__ == '__main__':
                 f"{_snap_season_label}"
             )
             _snap_file_season = f"_{args.onset_season}" if args.onset_season != "all" else ""
-            print(f"Plotting lat×level composite snapshots for {n_ev} events...")
-            plot_latitude_level_snapshots_HadGEN3(
+            print(f"Plotting lat×longitude composite snapshots for {n_ev} events...")
+
+            plot_lat_lon_snapshots(
                 composite_full,
+                output_dir= output_dir,
                 ensemble_member=ensemble_member,
                 start_year=args.start_year,
                 end_year=args.end_year,
                 clim_start_yr=clim_start_yr,
                 vpercentile=99.0,
                 clim_end_yr=clim_end_yr,
-                output_dir=output_dir,
                 title_suffix=_snap_suffix,
                 rolling_period=int(args.rolling_period),
-                filename_suffix=f"_{args.enso_state}_state{_snap_file_season}",
+                filename_suffix=f"_{args.enso_state}_state{_snap_file_season}_new",
             )

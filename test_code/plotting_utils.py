@@ -17,7 +17,6 @@ Typical usage from a script inside e.g. `AAM/test_code/era5/`:
     )
 
 """
-
 from __future__ import annotations
 
 from calendar import month
@@ -27,6 +26,207 @@ from typing import Callable, Iterable, Optional
 
 import numpy as np
 import xarray as xr
+
+def plot_lat_lon_snapshots(
+anomalies: xr.DataArray,
+zonal_wind_da: Optional["xr.DataArray | xr.Dataset"] = None,
+*,
+ensemble_member: str,
+start_year: int,
+end_year: int,
+clim_start_yr: int,
+clim_end_yr: int,
+vpercentile: float = 99.0,
+cmap_name: str = "RdBu_r",
+output_dir: str | Path = "output/",
+find_extremum: str = "max",
+title_suffix: str = "",
+rolling_period: int | None = None,
+filename_suffix: str = "",
+dec_onset_month: Optional[str] = None,
+onset_season_ndjfm: Optional[str] = None,
+) -> None:
+    
+    """Plot a grid of latitude × longitude anomaly snapshots for CMIP6 composites (HadGEM3 style)."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    import matplotlib.colors as mcolors
+    from matplotlib.gridspec import GridSpec
+    import matplotlib.cm as cm
+
+    coastlines, borders = True, True
+    lat_extent: tuple = (-60, 60)
+    n_snapshots = min(24, anomalies.sizes["time"])
+    tick_fontsize = 35
+    title_fontsize = 35
+    suptitle_fontsize = 32
+    if not {"time", "latitude", "longitude"}.issubset(set(anomalies.dims)):
+        raise ValueError(f"anomalies must have dims (time, latitude, longitude), got {anomalies.dims}")
+
+
+    lat_vals = anomalies["latitude"].values
+    lon_vals = anomalies["longitude"].values
+    time_vals = anomalies["time"].values
+
+    # --- Patch: Add +180° longitude column for seamless plotting if needed ---
+    # If longitude runs from -180 to 177.5 (step 2.5), add a +180 column duplicating -180 values
+    # Only patch if longitude is regularly spaced and missing +180 endpoint
+    lon_step = np.round(np.diff(lon_vals).mean(), 6) if len(lon_vals) > 1 else None
+    if lon_step is not None and np.isclose(lon_vals[0], -180) and not np.isclose(lon_vals[-1], 180):
+        # Add +180 column
+        new_lon_vals = np.append(lon_vals, 180.0)
+        # Patch DataArray
+        if isinstance(anomalies, xr.DataArray):
+            arr = anomalies.values
+            arr_patched = np.concatenate([arr, arr[..., 0:1]], axis=-1)
+            # Create new DataArray with updated longitude
+            anomalies = xr.DataArray(
+                arr_patched,
+                dims=anomalies.dims,
+                coords={**anomalies.coords, "longitude": new_lon_vals},
+                attrs=anomalies.attrs,
+                name=anomalies.name,
+            )
+            lon_vals = new_lon_vals
+        else:
+            # Dataset: patch each variable with lon dim
+            for v in anomalies.data_vars:
+                if "longitude" in anomalies[v].dims:
+                    arr = anomalies[v].values
+                    arr_patched = np.concatenate([arr, arr[..., 0:1]], axis=-1)
+                    anomalies[v].data_vars[v].values[...] = arr_patched
+            anomalies = anomalies.assign_coords(longitude=new_lon_vals)
+            lon_vals = new_lon_vals
+
+    # Choose snapshots
+    n_times = len(time_vals)
+    n_snapshots = min(n_snapshots, n_times)
+    snapshot_indices = np.linspace(0, n_times - 1, n_snapshots, dtype=int)
+
+    # Color limits (symmetric)
+    # vmin = np.nanpercentile(anomalies.values, 100 - vpercentile)
+    # vmax = np.nanpercentile(anomalies.values, vpercentile)
+    vmax = 5e24
+    vmin = -vmax
+    vlim = max(abs(vmin), abs(vmax))
+    vmin, vmax = -vlim, vlim
+    levels = np.linspace(vmin, vmax, 21)
+
+    # Layout
+    n_cols = 4
+    n_rows = int(np.ceil(n_snapshots / n_cols))
+    fig = plt.figure(figsize=(10 * n_cols, 4 * n_rows))
+    from matplotlib.gridspec import GridSpec
+    gs = GridSpec(n_rows, n_cols, figure=fig, hspace=0.25, wspace=0.15)
+    map_axes = []
+
+    
+    
+    for i, t_idx in enumerate(snapshot_indices):
+        row, col = divmod(i, n_cols)
+        ax = fig.add_subplot(gs[row, col], projection=ccrs.PlateCarree(central_longitude=180))
+        map_axes.append(ax)
+        data_slice = anomalies.isel(time=t_idx)
+        time_val = pd.to_datetime(time_vals[t_idx])
+        
+        _raw_t = anomalies.time.values[t_idx]
+        _is_composite_month = isinstance(_raw_t, (int, np.integer)) or (
+            isinstance(_raw_t, float) and _raw_t == int(_raw_t) and 1 <= int(_raw_t) <= 36
+        )
+        if _is_composite_month:
+            if rolling_period is not None and rolling_period > 1:
+                _panel_label = f"Composite-Rolling-{int(_raw_t):02d}"
+            else:
+                _panel_label = f"Composite-{int(_raw_t):02d}"
+        else:
+            _panel_label = pd.to_datetime(_raw_t).strftime("%Y-%m")
+        
+        im = ax.contourf(lon_vals, lat_vals, data_slice.values, levels=levels, cmap=cmap_name, extend="both", transform=ccrs.PlateCarree())
+        if coastlines:
+            ax.coastlines(resolution="110m", linewidth=0.5)
+        if borders:
+            ax.add_feature(cfeature.BORDERS, linewidth=0.3)
+        gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5, linestyle="--")
+        gl.top_labels = False
+        gl.right_labels = False
+        ax.set_ylim(*lat_extent)
+        ax.set_xlabel("Longitude (°E)", fontsize=tick_fontsize)
+        ax.set_ylabel("Latitude (°N)", fontsize=tick_fontsize)
+        ax.set_title(_panel_label, fontsize=title_fontsize, pad=3)
+        ax.tick_params(labelsize=tick_fontsize)
+        ax.tick_params(axis='x', labelsize=tick_fontsize)
+        ax.tick_params(axis='y', labelsize=tick_fontsize)
+        # Mark extremum in NH
+        nh_mask = lat_vals > 0
+        data_nh = data_slice.values[nh_mask, :]
+        lat_nh = lat_vals[nh_mask]
+        if np.any(np.isfinite(data_nh)):
+            if find_extremum == "min":
+                extreme_idx = np.unravel_index(np.nanargmin(data_nh), data_nh.shape)
+            else:
+                extreme_idx = np.unravel_index(np.nanargmax(data_nh), data_nh.shape)
+            extreme_lat = lat_nh[extreme_idx[0]]
+            extreme_lon = lon_vals[extreme_idx[1]]
+            ax.plot(extreme_lon, extreme_lat, color="C2", marker="x", markersize=12, markeredgewidth=2, transform=ccrs.PlateCarree())
+
+    # Colorbar
+    # Move colorbar lower and make it a bit taller
+    cbar_ax = fig.add_axes([0.25, 0.03, 0.5, 0.025])
+    
+    variable = anomalies.attrs.get("long_name", anomalies.name if anomalies.name is not None else "Variable")
+    
+    # Create discrete levels matching the contour levels
+    levels = np.linspace(vmin, vmax, 13)
+    norm = mcolors.BoundaryNorm(levels, ncolors=256)
+    sm = cm.ScalarMappable(cmap=cm.get_cmap('RdBu_r'), norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal', extend='both', spacing='proportional')
+    cbar.set_label(f'{variable} (kg m² s⁻¹)', fontsize=35)
+    # Set ticks at every other level boundary for clarity
+    tick_indices = np.arange(0, 13, 2)
+    cbar.set_ticks(list(levels[tick_indices]))
+    # Increase colorbar tick label size
+    cbar.ax.tick_params(labelsize=28)
+
+    _suffix_str = f"  |  {title_suffix}" if title_suffix else ""
+    fig.suptitle(
+        f'CMIP6 HadGEM3_GC31 {ensemble_member} vertically summed AAM anomaly: Latitude × Longitude Snapshots\n'
+        f'Climatology: {clim_start_yr}-{clim_end_yr}{_suffix_str}',
+        fontsize=suptitle_fontsize, y=0.99,
+    )
+    plt.tight_layout(rect=[0, 0.04, 1, 0.99]) 
+
+    rolling_tag = ""
+    if rolling_period is not None:
+        rp = int(rolling_period)
+        if rp > 1:
+            rolling_tag = f"_rolling{rp}"
+
+    file_suffix = ""
+    if filename_suffix:
+        file_suffix = f"_{str(filename_suffix).strip('_')}"
+        
+    if dec_onset_month == "onset":
+        pass
+    elif dec_onset_month == "december_onset_year":
+        file_suffix += "_december_onset_year"
+    
+    if onset_season_ndjfm == "ndjfm":
+        file_suffix += "_onset_season_NDJFM"
+    else:
+        file_suffix += "_onset_season_all"
+
+    output_file = (
+        f'{output_dir}AAM_anomalies_lat_lon_snapshots_{ensemble_member}_{start_year}-{end_year}'
+        f'{rolling_tag}{file_suffix}.png'
+    )
+    ensure_dir(Path(output_dir))
+    plt.savefig(output_file, dpi=400, bbox_inches="tight")
+    print(f"Lat-lon snapshot figure saved to: {output_file}")
+    plt.close(fig)
 
 
 @dataclass(frozen=True)
@@ -247,14 +447,13 @@ def plot_latitude_level_snapshots_HadGEN3(
     end_year: int,
     clim_start_yr: int,
     clim_end_yr: int,
-    vpercentile: float = 95.0,
+    vpercentile: float = 99.0,
     cmap_name: str = "RdBu_r",
     output_dir: str | Path = "output/",
     find_extremum: str = "max",
     title_suffix: str = "",
     rolling_period: int | None = None,
-    filename_suffix: str = "",
-) -> None:
+    filename_suffix: str = "",) -> None:
     """Plot a grid of latitude×level snapshots from anomalies.
 
     Expects anomalies with dims including ('time', 'level', 'latitude') and *no* longitude.
@@ -265,11 +464,12 @@ def plot_latitude_level_snapshots_HadGEN3(
     import matplotlib.pyplot as plt
     import pandas as pd
     
-    vmax = np.nanpercentile(np.abs(anomalies.values), vpercentile)
+    # vmax = np.nanpercentile(np.abs(anomalies.values), vpercentile)
+    vmax = 1e23
     vmin = -vmax
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax == 0:
         print(f"Warning: Invalid color limits (vmin={vmin}, vmax={vmax}), using fallback values")
-        vmax = 1e22
+        vmax = 1e23
         vmin = -vmax
         
     n_snapshots = min(24, len(anomalies.time))
@@ -289,7 +489,7 @@ def plot_latitude_level_snapshots_HadGEN3(
     gs = GridSpec(n_rows * 2, n_cols, figure=fig, height_ratios=[6, 1] * n_rows, hspace=0.3, wspace=0.2)
     
     # Contour levels
-    levels = np.linspace(vmin, vmax, 21)
+    levels = np.linspace(vmin, vmax, 13)
     
     lat_dim = "latitude" if "latitude" in anomalies.dims else ("lat" if "lat" in anomalies.dims else None)
     level_dim = "level" if "level" in anomalies.dims else ("plev" if "plev" in anomalies.dims else None)
@@ -345,7 +545,7 @@ def plot_latitude_level_snapshots_HadGEN3(
         data_slice = anomalies_for_plot.isel(time=t_idx).transpose(level_dim, lat_dim)
         
         # Use explicit levels array to ensure consistent colorbar
-        levels = np.linspace(vmin, vmax, 21)
+        levels = np.linspace(vmin, vmax, 13)
         im = contour_axes[i].contourf(lat_vals, pressure_hpa, data_slice.values,
                              levels=levels, cmap='RdBu_r', extend='both')
         
@@ -465,7 +665,7 @@ def plot_latitude_level_snapshots_HadGEN3(
         
         # Add vertical line at the latitude of extremum AAM
         if np.isfinite(extreme_lat):
-            contour_axes[i].axvline(extreme_lat, color='C1', linewidth=2, linestyle='-', alpha=0.8, zorder=10)
+            contour_axes[i].axvline(extreme_lat, color='C2', linewidth=2, linestyle='-', alpha=0.8, zorder=10)
         
         # Add vertical line at equator
         # contour_axes[i].axvline(0, color='black', linewidth=1, linestyle='-', alpha=0.9)
@@ -519,14 +719,14 @@ def plot_latitude_level_snapshots_HadGEN3(
     variable = anomalies.attrs.get("long_name", anomalies.name if anomalies.name is not None else "Variable")
     
     # Create discrete levels matching the contour levels
-    levels = np.linspace(vmin, vmax, 11)
+    levels = np.linspace(vmin, vmax, 13)
     norm = mcolors.BoundaryNorm(levels, ncolors=256)
     sm = cm.ScalarMappable(cmap=cm.get_cmap('RdBu_r'), norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal', extend='both', spacing='proportional')
     cbar.set_label(f'{variable} (kg m² s⁻¹)', fontsize=12)
     # Set ticks at every other level boundary for clarity
-    tick_indices = np.arange(0, 11, 1)
+    tick_indices = np.arange(0, 13, 2)
     cbar.set_ticks(list(levels[tick_indices]))
     
     _suffix_str = f"  |  {title_suffix}" if title_suffix else ""
@@ -548,7 +748,7 @@ def plot_latitude_level_snapshots_HadGEN3(
         file_suffix = f"_{str(filename_suffix).strip('_')}"
 
     output_file = (
-        f'{output_dir}/AAM_anomalies_lat_level_snapshots_{ensemble_member}_{start_year}-{end_year}'
+        f'{output_dir}AAM_anomalies_lat_level_snapshots_{ensemble_member}_{start_year}-{end_year}'
         f'{rolling_tag}{file_suffix}.png'
     )
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -592,7 +792,7 @@ def plot_latitude_level_movie_HadGEM3(
     vmin = -vmax
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax == 0:
         print(f"Warning: Invalid color limits (vmin={vmin}, vmax={vmax}), using fallback values")
-        vmax = 1e22
+        vmax = 1e23
         vmin = -vmax
 
     lat_dim = "latitude" if "latitude" in anomalies.dims else ("lat" if "lat" in anomalies.dims else None)
@@ -754,7 +954,7 @@ def plot_latitude_level_movie_HadGEM3(
             )
             extreme_lat = nh_lats[extreme_idx[1]]
             if np.isfinite(extreme_lat):
-                ax_cont.axvline(extreme_lat, color="C1", linewidth=2, linestyle="-", alpha=0.8, zorder=10)
+                ax_cont.axvline(extreme_lat, color="C2", linewidth=2, linestyle="-", alpha=0.8, zorder=10)
 
         ax_cont.set_xlabel("Latitude (°N)", fontsize=10)
         ax_cont.set_xlim(-60, 60)

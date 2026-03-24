@@ -22,14 +22,23 @@ import datetime
 from multiprocessing import Pool
 import os
 import xarray as xr
+import tqdm
 
 base_path = os.getcwd()
-CMIP6_path_base = "/gws/nopw/j04/leader_epesc/CMIP6_SinglForcHistSimul"
-u_directory = f"{CMIP6_path_base}/InterpolatedFlds/Amon/ua/historical/HadGEM3-GC31-LL/"
-ps_directory = f"{CMIP6_path_base}/InterpolatedFlds/Amon/ps/historical/HadGEM3-GC31-LL/"
-ensemble_members = [f'r{i}i1p1f3' for i in range(3, 18)]
+# Use scratch space and new directory structure due to workspace migration
+CMIP6_path_base = "/work/scratch-nopw2/hhhn2/HadGEM3-GC31-LL"
+u_directory = f"{CMIP6_path_base}/Amon/ua/historical/"
+ps_directory = f"{CMIP6_path_base}/Amon/ps/historical/"
+output_dir = f"{CMIP6_path_base}/AAM/full/"
 
-save_path = f"{base_path}/monthly_mean/AAM"
+# output_dir = f"{base_dir}/figures/composites/non_tracking_algorithm/"
+# climatology_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/climatology/AAM/"
+# u_directory = f"{CMIP6_path_base}/InterpolatedFlds/Amon/ua/historical/HadGEM3-GC31-LL/"
+# ps_directory = f"{CMIP6_path_base}/InterpolatedFlds/Amon/ps/historical/HadGEM3-GC31-LL/"
+
+ensemble_members = [f'r{i}i1p1f3' for i in range(6, 12)]
+
+save_path = output_dir
 
 print("u directory:", u_directory)
 print("ps directory:", ps_directory)
@@ -67,7 +76,7 @@ omega = 7.292116e-5 # rad/s
 r3g = r**3 / g
 two_pi = 2.0 * np.pi
 
-for ensemble_member in ensemble_members:
+for ensemble_member in tqdm.tqdm(ensemble_members):
     print(f"\n=== Processing ensemble member: {ensemble_member} ===")
 
     # Define file paths

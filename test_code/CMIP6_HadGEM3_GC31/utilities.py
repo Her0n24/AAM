@@ -33,6 +33,11 @@ def _zonal_integral_radians(da: xr.DataArray) -> xr.DataArray:
 
 
 def _to_per_latitude_band(da: xr.DataArray) -> xr.DataArray:
+    """
+    Converts a zonally integrated xarray.DataArray to per-latitude-band
+    values by multiplying with the latitude band width in radians. Expects a
+    latitude dimension named latitude or lat.
+    """
     lat_dim = 'latitude' if 'latitude' in da.dims else ('lat' if 'lat' in da.dims else None)
     if lat_dim is None:
         raise ValueError("Expected a latitude dimension ('latitude' or 'lat')")
@@ -68,7 +73,7 @@ def _reindex_to_climatology_dims(input_da: xr.DataArray, climatology_da: xr.Data
 
     # Rename common dimension aliases in `input_da` to match `climatology_da`.
     rename_map: dict[str, str] = {}
-    for src, dst in (("lat", "latitude"), ("lev", "level"), ("plev", "level")):
+    for src, dst in (("lat", "latitude"), ("lev", "level"), ("plev", "level"), ("lon", "longitude")):
         if dst in climatology_da.dims and src in input_da.dims and dst not in input_da.dims:
             rename_map[src] = dst
     if rename_map:
