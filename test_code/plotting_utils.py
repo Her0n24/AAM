@@ -30,6 +30,7 @@ import xarray as xr
 def plot_lat_lon_snapshots(
 anomalies: xr.DataArray,
 zonal_wind_da: Optional["xr.DataArray | xr.Dataset"] = None,
+uv_latlev_profile: Optional[xr.DataArray] = None,
 *,
 ensemble_member: str,
 start_year: int,
@@ -45,6 +46,8 @@ rolling_period: int | None = None,
 filename_suffix: str = "",
 dec_onset_month: Optional[str] = None,
 onset_season_ndjfm: Optional[str] = None,
+pmin: Optional[float] = None,
+pmax: Optional[float] = None,
 ) -> None:
     
     """Plot a grid of latitude × longitude anomaly snapshots for CMIP6 composites (HadGEM3 style)."""
@@ -56,12 +59,13 @@ onset_season_ndjfm: Optional[str] = None,
     import matplotlib.colors as mcolors
     from matplotlib.gridspec import GridSpec
     import matplotlib.cm as cm
+    from scipy.ndimage import gaussian_filter
 
     coastlines, borders = True, True
     lat_extent: tuple = (-60, 60)
     n_snapshots = min(24, anomalies.sizes["time"])
     tick_fontsize = 35
-    title_fontsize = 35
+    title_fontsize = 25
     suptitle_fontsize = 32
     if not {"time", "latitude", "longitude"}.issubset(set(anomalies.dims)):
         raise ValueError(f"anomalies must have dims (time, latitude, longitude), got {anomalies.dims}")
@@ -115,20 +119,29 @@ onset_season_ndjfm: Optional[str] = None,
     vmin, vmax = -vlim, vlim
     levels = np.linspace(vmin, vmax, 21)
 
-    # Layout
-    n_cols = 4
-    n_rows = int(np.ceil(n_snapshots / n_cols))
-    fig = plt.figure(figsize=(10 * n_cols, 4 * n_rows))
     from matplotlib.gridspec import GridSpec
-    gs = GridSpec(n_rows, n_cols, figure=fig, hspace=0.25, wspace=0.15)
-    map_axes = []
-
+    # Layout
+    n_cols = 3
+    n_rows = int(np.ceil(n_snapshots / n_cols))
     
+    fig = plt.figure(figsize=(35, 4 * n_rows))
+    gs = GridSpec(n_rows, n_cols * 2, figure=fig, width_ratios=[0.6, 6] * n_cols,
+              hspace=0.25, wspace=0.15)
+    
+    map_axes = []
+    profile_axes = []
     
     for i, t_idx in enumerate(snapshot_indices):
+        if i >= n_snapshots:
+            break
+        
         row, col = divmod(i, n_cols)
-        ax = fig.add_subplot(gs[row, col], projection=ccrs.PlateCarree(central_longitude=180))
+        ax = fig.add_subplot(gs[row, col * 2 + 1], projection=ccrs.PlateCarree(central_longitude=180))
+        ax_profile = fig.add_subplot(gs[row, col * 2])
+        
         map_axes.append(ax)
+        profile_axes.append(ax_profile)
+        
         data_slice = anomalies.isel(time=t_idx)
         time_val = pd.to_datetime(time_vals[t_idx])
         
@@ -140,11 +153,67 @@ onset_season_ndjfm: Optional[str] = None,
             if rolling_period is not None and rolling_period > 1:
                 _panel_label = f"Composite-Rolling-{int(_raw_t):02d}"
             else:
-                _panel_label = f"Composite-{int(_raw_t):02d}"
+                _panel_label = f"Composite-Month-{int(_raw_t):02d}"
         else:
             _panel_label = pd.to_datetime(_raw_t).strftime("%Y-%m")
         
         im = ax.contourf(lon_vals, lat_vals, data_slice.values, levels=levels, cmap=cmap_name, extend="both", transform=ccrs.PlateCarree())
+        ax.axhline(0, color="black", linestyle="-", lw=1)
+        
+        # Overlay zonal wind contours
+        if zonal_wind_da is not None:
+            try:
+                #import pdb; pdb.set_trace()
+                if isinstance(zonal_wind_da, xr.Dataset):
+                    wind_var = "ua" if "ua" in zonal_wind_da.data_vars else list(zonal_wind_da.data_vars)[0]
+                    wind_data = zonal_wind_da[wind_var]
+                else:
+                    wind_data = zonal_wind_da
+                
+                # Get wind data coordinates
+                wind_lat_dim = "latitude" if "latitude" in wind_data.dims else ("lat" if "lat" in wind_data.dims else None)
+                wind_lon_dim = "longitude" if "longitude" in wind_data.dims else ("lon" if "lon" in wind_data.dims else None)
+                if wind_lat_dim is None or wind_lon_dim is None:
+                    raise ValueError("zonal wind must have latitude and longitude dimensions")
+                wind_lat = wind_data[wind_lat_dim].values
+                wind_lon = wind_data[wind_lon_dim].values
+                
+                if "time" in wind_data.dims:
+                    wind_data = wind_data.isel(time=t_idx)
+                else:
+                    raise ValueError("zonal wind DataArray must have a time dimension for snapshot plotting")
+                
+                # Drop/resolve any other leftover dims so we can safely transpose to (lat, lon)
+                extra_dims = [d for d in wind_data.dims if d not in (wind_lon_dim, wind_lat_dim)]
+                for d in extra_dims:
+                    if wind_data.sizes.get(d, 0) == 1:
+                        wind_data = wind_data.isel({d: 0})
+                    else:
+                        raise ValueError(
+                            f"Unexpected extra wind dimension {d!r} with size {wind_data.sizes[d]}"
+                        )
+                
+                wind_vals = gaussian_filter(wind_data.values, sigma=1)  # shape: (lat, lon)
+                wind_contour_levels = np.arange(-60, 61, 10)  # adjust as needed
+                wind_contour_levels = wind_contour_levels[np.abs(wind_contour_levels) >= 30]  # Only show |u| >= 15 m/s
+                cs = ax.contour(wind_lon, wind_lat, wind_vals,
+                                    levels=wind_contour_levels, colors='C4', 
+                                    linewidths=1.5, alpha=1.0)
+                ax.clabel(cs, inline=True, fontsize=8, fmt='%d')
+            except Exception as e: 
+                raise ValueError("Failed to identify zonal wind variable and coordinates") from e
+        
+        if uv_latlev_profile is not None:
+            uv_vals = uv_latlev_profile.isel(time=t_idx).values
+            ax_profile.plot(uv_vals, lat_vals, color="C1", lw=2)
+            ax_profile.axhline(0, color="black", linestyle="-", lw=1)
+            ax_profile.set_xlabel("uv", fontsize=10)
+            ax_profile.set_ylabel("Latitude (°N)", fontsize=10)
+            ax_profile.tick_params(labelsize=10)
+            ax_profile.set_xlim(-300,300)
+            ax_profile.set_ylim(-60,60)
+            ax_profile.grid(True, linestyle="--", alpha=0.5)
+                
         if coastlines:
             ax.coastlines(resolution="110m", linewidth=0.5)
         if borders:
@@ -173,11 +242,11 @@ onset_season_ndjfm: Optional[str] = None,
             ax.plot(extreme_lon, extreme_lat, color="C2", marker="x", markersize=12, markeredgewidth=2, transform=ccrs.PlateCarree())
 
     # Colorbar
-    # Move colorbar lower and make it a bit taller
-    cbar_ax = fig.add_axes([0.25, 0.03, 0.5, 0.025])
+    # Make colorbar shorter in height and increase tick label font size
+    cbar_ax = fig.add_axes([0.15, 0.03, 0.7, 0.01])  # [left, bottom, width, height]
     
     variable = anomalies.attrs.get("long_name", anomalies.name if anomalies.name is not None else "Variable")
-    
+
     # Create discrete levels matching the contour levels
     levels = np.linspace(vmin, vmax, 13)
     norm = mcolors.BoundaryNorm(levels, ncolors=256)
@@ -188,17 +257,20 @@ onset_season_ndjfm: Optional[str] = None,
     # Set ticks at every other level boundary for clarity
     tick_indices = np.arange(0, 13, 2)
     cbar.set_ticks(list(levels[tick_indices]))
-    # Increase colorbar tick label size
-    cbar.ax.tick_params(labelsize=28)
+    # Increase colorbar tick label size and scientific notation font size
+    cbar.ax.tick_params(labelsize=32)
+    # Make scientific notation (e.g., 1e24) larger
+    cbar.ax.yaxis.get_offset_text().set_fontsize(32)
+    cbar.ax.xaxis.get_offset_text().set_fontsize(32)
 
     _suffix_str = f"  |  {title_suffix}" if title_suffix else ""
     fig.suptitle(
-        f'CMIP6 HadGEM3_GC31 {ensemble_member} vertically summed AAM anomaly: Latitude × Longitude Snapshots\n'
-        f'Climatology: {clim_start_yr}-{clim_end_yr}{_suffix_str}',
-        fontsize=suptitle_fontsize, y=0.99,
+        f'CMIP6 HadGEM3_GC31 {ensemble_member} vertically summed {pmin:.1f}-{pmax:.1f}hPa\n'
+        f'AAM anomaly: Latitude × Longitude Snapshots Climatology: {clim_start_yr}-{clim_end_yr}\n'
+        f'{_suffix_str}',
+        fontsize=suptitle_fontsize, y=0.98,
     )
-    plt.tight_layout(rect=[0, 0.04, 1, 0.99]) 
-
+    
     rolling_tag = ""
     if rolling_period is not None:
         rp = int(rolling_period)
@@ -224,6 +296,7 @@ onset_season_ndjfm: Optional[str] = None,
         f'{rolling_tag}{file_suffix}.png'
     )
     ensure_dir(Path(output_dir))
+    plt.tight_layout(rect=[0, 0.04, 1, 0.97])  # Leave space for colorbar at bottom and title at top
     plt.savefig(output_file, dpi=400, bbox_inches="tight")
     print(f"Lat-lon snapshot figure saved to: {output_file}")
     plt.close(fig)
@@ -485,8 +558,8 @@ def plot_latitude_level_snapshots_HadGEN3(
     
     # Create figure with GridSpec for paired subplots (contour + profile)
     from matplotlib.gridspec import GridSpec
-    fig = plt.figure(figsize=(22, 6*n_rows))
-    gs = GridSpec(n_rows * 2, n_cols, figure=fig, height_ratios=[6, 1] * n_rows, hspace=0.3, wspace=0.2)
+    fig = plt.figure(figsize=(18, 6*n_rows))
+    gs = GridSpec(n_rows * 2, n_cols, figure=fig, height_ratios=[6, 1] * n_rows, hspace=0.3, wspace=0.1)
     
     # Contour levels
     levels = np.linspace(vmin, vmax, 13)
@@ -724,7 +797,7 @@ def plot_latitude_level_snapshots_HadGEN3(
     sm = cm.ScalarMappable(cmap=cm.get_cmap('RdBu_r'), norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal', extend='both', spacing='proportional')
-    cbar.set_label(f'{variable} (kg m² s⁻¹)', fontsize=12)
+    cbar.set_label(f'{variable} (kg m² s⁻¹)', fontsize=15)
     # Set ticks at every other level boundary for clarity
     tick_indices = np.arange(0, 13, 2)
     cbar.set_ticks(list(levels[tick_indices]))
@@ -735,7 +808,7 @@ def plot_latitude_level_snapshots_HadGEN3(
         f'Climatology: {clim_start_yr}-{clim_end_yr}{_suffix_str}',
         fontsize=26, y=0.99,
     )
-    plt.tight_layout(rect=[0, 0.04, 1, 0.99])  # Leave space for colorbar at bottom and reduce top gap
+    plt.tight_layout(rect=[0, 0.08, 1, 0.95])  # Leave space for colorbar at bottom and reduce top gap
 
     rolling_tag = ""
     if rolling_period is not None:
