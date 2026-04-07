@@ -24,12 +24,16 @@ parser.add_argument('--member', type=str, default='1', help='Ensemble member to 
 args = parser.parse_args()
 
 base_dir = os.getcwd()
-AAM_data_path_base = f"{base_dir}/monthly_mean/AAM/"
+# AAM_data_path_base = f"{base_dir}/monthly_mean/AAM/"
 output_dir = f"{base_dir}/figures/"
 
-CMIP6_path_base = "/gws/nopw/j04/leader_epesc/CMIP6_SinglForcHistSimul"
-nino34_directory = f"{CMIP6_path_base}/ProcessedFlds/Omon/sst_indices/nino34/historical/HadGEM3-GC31-LL/"
-output_dir = f"{base_dir}/figures/"
+# CMIP6_path_base = "/gws/nopw/j04/leader_epesc/CMIP6_SinglForcHistSimul"
+# nino34_directory = f"{CMIP6_path_base}/ProcessedFlds/Omon/sst_indices/nino34/historical/HadGEM3-GC31-LL/"
+# output_dir = f"{base_dir}/figures/"
+
+CMIP6_path_base = "/work/scratch-nopw2/hhhn2"
+nino34_directory = f"{CMIP6_path_base}/HadGEM3-GC31-LL/ProcessedFlds/Omon/sst_indices/nino34/historical/"
+AAM_data_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/AAM/full/"
 
 ensemble_member = f"r{args.member}i1p1f3"
 

@@ -48,6 +48,8 @@ dec_onset_month: Optional[str] = None,
 onset_season_ndjfm: Optional[str] = None,
 pmin: Optional[float] = None,
 pmax: Optional[float] = None,
+nino_threshold: Optional[float] = None,
+region: str = "all",
 ) -> None:
     
     """Plot a grid of latitude × longitude anomaly snapshots for CMIP6 composites (HadGEM3 style)."""
@@ -67,9 +69,18 @@ pmax: Optional[float] = None,
     tick_fontsize = 35
     title_fontsize = 25
     suptitle_fontsize = 32
-    if not {"time", "latitude", "longitude"}.issubset(set(anomalies.dims)):
-        raise ValueError(f"anomalies must have dims (time, latitude, longitude), got {anomalies.dims}")
+    
+    # Detect and normalize dimension names
+    lat_dim = "latitude" if "latitude" in anomalies.dims else ("lat" if "lat" in anomalies.dims else None)
+    lon_dim = "longitude" if "longitude" in anomalies.dims else ("lon" if "lon" in anomalies.dims else None)
+    
+    if not {"time", lat_dim, lon_dim}.issubset(set(anomalies.dims)) or lat_dim is None or lon_dim is None:
+        raise ValueError(f"anomalies must have dims (time, latitude|lat, longitude|lon), got {anomalies.dims}")
 
+    # Normalize dimension names to standard forms for internal use
+    if lat_dim != "latitude" or lon_dim != "longitude":
+        anomalies = anomalies.rename({lat_dim: "latitude", lon_dim: "longitude"})
+        lat_dim, lon_dim = "latitude", "longitude"
 
     lat_vals = anomalies["latitude"].values
     lon_vals = anomalies["longitude"].values
@@ -110,13 +121,14 @@ pmax: Optional[float] = None,
     n_snapshots = min(n_snapshots, n_times)
     snapshot_indices = np.linspace(0, n_times - 1, n_snapshots, dtype=int)
 
-    # Color limits (symmetric)
-    # vmin = np.nanpercentile(anomalies.values, 100 - vpercentile)
-    # vmax = np.nanpercentile(anomalies.values, vpercentile)
-    vmax = 5e24
+    # Color limits (symmetric, data-driven) so weak but real anomalies remain visible.
+    vmax = float(np.nanpercentile(np.abs(anomalies.values), vpercentile))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = float(np.nanmax(np.abs(anomalies.values))) if np.size(anomalies.values) else 1.0
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+    vmax = 1e25
     vmin = -vmax
-    vlim = max(abs(vmin), abs(vmax))
-    vmin, vmax = -vlim, vlim
     levels = np.linspace(vmin, vmax, 21)
 
     from matplotlib.gridspec import GridSpec
@@ -131,12 +143,23 @@ pmax: Optional[float] = None,
     map_axes = []
     profile_axes = []
     
+    # Center map based on region: use dateline (180°) for Pacific and global (all); use Greenwich (0°) for others
+    region_central_lons = {
+        "pacific": 180,
+        "all": 180,
+        "indian": 75,      # Center Indian Ocean (50-100°E)
+        "atlantic": -30,   # Center Atlantic (-60-10°E)
+    }
+    central_lon = region_central_lons.get(region, 0)
+    map_crs = ccrs.PlateCarree(central_longitude=central_lon)
+    data_crs = ccrs.PlateCarree()
+
     for i, t_idx in enumerate(snapshot_indices):
         if i >= n_snapshots:
             break
         
         row, col = divmod(i, n_cols)
-        ax = fig.add_subplot(gs[row, col * 2 + 1], projection=ccrs.PlateCarree(central_longitude=180))
+        ax = fig.add_subplot(gs[row, col * 2 + 1], projection=map_crs)
         ax_profile = fig.add_subplot(gs[row, col * 2])
         
         map_axes.append(ax)
@@ -157,7 +180,7 @@ pmax: Optional[float] = None,
         else:
             _panel_label = pd.to_datetime(_raw_t).strftime("%Y-%m")
         
-        im = ax.contourf(lon_vals, lat_vals, data_slice.values, levels=levels, cmap=cmap_name, extend="both", transform=ccrs.PlateCarree())
+        im = ax.contourf(lon_vals, lat_vals, data_slice.values, levels=levels, cmap=cmap_name, extend="both", transform=data_crs)
         ax.axhline(0, color="black", linestyle="-", lw=1)
         
         # Overlay zonal wind contours
@@ -208,7 +231,11 @@ pmax: Optional[float] = None,
             ax_profile.plot(uv_vals, lat_vals, color="C1", lw=2)
             ax_profile.axhline(0, color="black", linestyle="-", lw=1)
             ax_profile.set_xlabel("uv", fontsize=10)
-            ax_profile.set_ylabel("Latitude (°N)", fontsize=10)
+            if i % n_cols == 0:
+                ax_profile.set_ylabel("Latitude (°N)", fontsize=10)
+            else: 
+                ax_profile.set_ylabel("")
+                ax_profile.tick_params(labelleft=False)
             ax_profile.tick_params(labelsize=10)
             ax_profile.set_xlim(-300,300)
             ax_profile.set_ylim(-60,60)
@@ -221,7 +248,17 @@ pmax: Optional[float] = None,
         gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5, linestyle="--")
         gl.top_labels = False
         gl.right_labels = False
-        ax.set_ylim(*lat_extent)
+        # Set geographic extent in data CRS so region slices are displayed in correct location.
+        if region == "indian":
+            ax.set_extent([50, 100, lat_extent[0], lat_extent[1]], crs=data_crs)
+        elif region == "atlantic":
+            ax.set_extent([-60, 10, lat_extent[0], lat_extent[1]], crs=data_crs)
+        elif region == "pacific":
+            # 125E to 110W (250E) across dateline.
+            ax.set_extent([125, 250, lat_extent[0], lat_extent[1]], crs=data_crs)
+        else:
+            lon_min, lon_max = float(np.nanmin(lon_vals)), float(np.nanmax(lon_vals))
+            ax.set_extent([lon_min, lon_max, lat_extent[0], lat_extent[1]], crs=data_crs)
         ax.set_xlabel("Longitude (°E)", fontsize=tick_fontsize)
         ax.set_ylabel("Latitude (°N)", fontsize=tick_fontsize)
         ax.set_title(_panel_label, fontsize=title_fontsize, pad=3)
@@ -239,11 +276,11 @@ pmax: Optional[float] = None,
                 extreme_idx = np.unravel_index(np.nanargmax(data_nh), data_nh.shape)
             extreme_lat = lat_nh[extreme_idx[0]]
             extreme_lon = lon_vals[extreme_idx[1]]
-            ax.plot(extreme_lon, extreme_lat, color="C2", marker="x", markersize=12, markeredgewidth=2, transform=ccrs.PlateCarree())
+            ax.plot(extreme_lon, extreme_lat, color="C2", marker="x", markersize=12, markeredgewidth=2, transform=data_crs)
 
     # Colorbar
     # Make colorbar shorter in height and increase tick label font size
-    cbar_ax = fig.add_axes([0.15, 0.03, 0.7, 0.01])  # [left, bottom, width, height]
+    cbar_ax = fig.add_axes([0.15, 0.06, 0.7, 0.01])  # [left, bottom, width, height]
     
     variable = anomalies.attrs.get("long_name", anomalies.name if anomalies.name is not None else "Variable")
 
@@ -268,7 +305,7 @@ pmax: Optional[float] = None,
         f'CMIP6 HadGEM3_GC31 {ensemble_member} vertically summed {pmin:.1f}-{pmax:.1f}hPa\n'
         f'AAM anomaly: Latitude × Longitude Snapshots Climatology: {clim_start_yr}-{clim_end_yr}\n'
         f'{_suffix_str}',
-        fontsize=suptitle_fontsize, y=0.98,
+        fontsize=suptitle_fontsize, y=0.96,
     )
     
     rolling_tag = ""
@@ -290,11 +327,11 @@ pmax: Optional[float] = None,
         file_suffix += "_onset_season_NDJFM"
     else:
         file_suffix += "_onset_season_all"
+        
+    nino_thres_tag = "nino_thres" + str(float(nino_threshold)) if nino_threshold is not None else ""
 
     output_file = (
-        f'{output_dir}AAM_anomalies_lat_lon_snapshots_{ensemble_member}_{start_year}-{end_year}'
-        f'{rolling_tag}{file_suffix}.png'
-    )
+        f'{output_dir}AAM_anomalies_lat_lon_snapshots_{ensemble_member}_{start_year}-{end_year}_{pmin:.1f}-{pmax:.1f}hPa_{region}{rolling_tag}_{nino_thres_tag}{file_suffix}.png')
     ensure_dir(Path(output_dir))
     plt.tight_layout(rect=[0, 0.04, 1, 0.97])  # Leave space for colorbar at bottom and title at top
     plt.savefig(output_file, dpi=400, bbox_inches="tight")
@@ -526,7 +563,10 @@ def plot_latitude_level_snapshots_HadGEN3(
     find_extremum: str = "max",
     title_suffix: str = "",
     rolling_period: int | None = None,
-    filename_suffix: str = "",) -> None:
+    filename_suffix: str = "",
+    dec_onset_month: Optional[str] = "",
+    onset_season_ndjfm: Optional[str] = "",
+    nino_threshold: Optional[float] = 0.5) -> None:
     """Plot a grid of latitude×level snapshots from anomalies.
 
     Expects anomalies with dims including ('time', 'level', 'latitude') and *no* longitude.
@@ -538,11 +578,12 @@ def plot_latitude_level_snapshots_HadGEN3(
     import pandas as pd
     
     # vmax = np.nanpercentile(np.abs(anomalies.values), vpercentile)
-    vmax = 1e23
+    # vmax = 1e23
+    vmax = 0.5e23
     vmin = -vmax
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax == 0:
         print(f"Warning: Invalid color limits (vmin={vmin}, vmax={vmax}), using fallback values")
-        vmax = 1e23
+        vmax = 2.5e23
         vmin = -vmax
         
     n_snapshots = min(24, len(anomalies.time))
@@ -558,7 +599,7 @@ def plot_latitude_level_snapshots_HadGEN3(
     
     # Create figure with GridSpec for paired subplots (contour + profile)
     from matplotlib.gridspec import GridSpec
-    fig = plt.figure(figsize=(18, 6*n_rows))
+    fig = plt.figure(figsize=(18, 4*n_rows))
     gs = GridSpec(n_rows * 2, n_cols, figure=fig, height_ratios=[6, 1] * n_rows, hspace=0.3, wspace=0.1)
     
     # Contour levels
@@ -599,19 +640,30 @@ def plot_latitude_level_snapshots_HadGEN3(
             contour_axes.append(fig.add_subplot(gs[row*2, col]))
             profile_axes.append(fig.add_subplot(gs[row*2 + 1, col]))
     
+    all_vertical_integral_maxima = []
+    
     for i, t_idx in enumerate(snapshot_indices):
         if i >= len(contour_axes):
             break
         
+        row = i // n_cols
+        col = i % n_cols
+        
+        if col == 0:
+            contour_axes[i].set_ylabel(vertical_label, fontsize=10)
+        else:
+            contour_axes[i].set_ylabel("")
+            contour_axes[i].tick_params(labelleft=False)  # also hide tick labels if you want
+                    
         _raw_t = anomalies_for_plot.time.values[t_idx]
         _is_composite_month = isinstance(_raw_t, (int, np.integer)) or (
             isinstance(_raw_t, float) and _raw_t == int(_raw_t) and 1 <= int(_raw_t) <= 36
         )
         if _is_composite_month:
             if rolling_period is not None and rolling_period > 1:
-                _panel_label = f"Composite-Rolling-{int(_raw_t):02d}"
+                _panel_label = f"Composite-Rolling-month-{int(_raw_t):02d}"
             else:
-                _panel_label = f"Composite-{int(_raw_t):02d}"
+                _panel_label = f"Composite-month-{int(_raw_t):02d}"
         else:
             _panel_label = pd.to_datetime(_raw_t).strftime("%Y-%m")
         
@@ -697,10 +749,16 @@ def plot_latitude_level_snapshots_HadGEN3(
             except Exception as e:
                 print(f"Warning: Could not overlay wind data for snapshot {i}: {e}")
         
+        # Set axis label only for the left column
+        if i % n_cols == 0:
+            contour_axes[i].set_ylabel(vertical_label, fontsize=10)
+        else:
+            contour_axes[i].set_ylabel("")
+            contour_axes[i].tick_params(labelleft=False)
+            
         contour_axes[i].set_xlabel('Latitude (°N)', fontsize=10)
         contour_axes[i].set_xlim(-60, 60)
-        contour_axes[i].set_ylabel(vertical_label, fontsize=10)
-        contour_axes[i].set_title(_panel_label, fontsize=11, pad=3)
+        contour_axes[i].set_title(_panel_label, fontsize=10, pad=3)
         # Pressure axis: decreasing upward, with sensible pressure ticks
         if vertical_label.lower().startswith("pressure") and np.all(np.isfinite(pressure_hpa)) and np.all(pressure_hpa > 0):
             pmin = float(np.nanmin(pressure_hpa))
@@ -741,7 +799,7 @@ def plot_latitude_level_snapshots_HadGEN3(
             contour_axes[i].axvline(extreme_lat, color='C2', linewidth=2, linestyle='-', alpha=0.8, zorder=10)
         
         # Add vertical line at equator
-        # contour_axes[i].axvline(0, color='black', linewidth=1, linestyle='-', alpha=0.9)
+        contour_axes[i].axvline(0, color='black', linewidth=1, linestyle='-', alpha=0.7)
         
         # Create vertical profile plot below
         # Vertically integrate AAM anomaly at each latitude
@@ -757,30 +815,38 @@ def plot_latitude_level_snapshots_HadGEN3(
                 vertical_integral[j] = float(np.trapz(col[m], x=pressure_pa[m]))
         vi_plot = vertical_integral.copy()
         vi_finite = np.isfinite(vi_plot)
+        
+        # choose vmax from actual data, not the mask
+        finite_vi = vertical_integral[np.isfinite(vertical_integral)]
+        if finite_vi.size > 0:
+            snapshot_max = np.nanmax(np.abs(finite_vi))
+            all_vertical_integral_maxima.append(snapshot_max)
+        else:
+            snapshot_max = 5e27
+            all_vertical_integral_maxima.append(snapshot_max)# or 0, depending on how you want to handle empty
+
         if np.count_nonzero(vi_finite) >= 2 and np.count_nonzero(~vi_finite) > 0:
             vi_plot[~vi_finite] = np.interp(lat_vals[~vi_finite], lat_vals[vi_finite], vi_plot[vi_finite])
-        
-        profile_axes[i].plot(lat_vals, vi_plot, 'C0-', linewidth=1.5)
-        profile_axes[i].axhline(0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
-        profile_axes[i].axvline(0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
-        profile_axes[i].set_xlim(-60, 60)
-        finite_vi = vertical_integral[np.isfinite(vertical_integral)]
-        if finite_vi.size >= 2:
-            y0 = float(np.nanmin(finite_vi))
-            y1 = float(np.nanmax(finite_vi))
-            if not np.isfinite(y0) or not np.isfinite(y1):
-                profile_axes[i].set_ylim(-1e25, 1e25)
-            elif y0 == y1:
-                pad = max(abs(y0) * 0.05, 1.0)
-                profile_axes[i].set_ylim(y0 - pad, y1 + pad)
-            else:
-                profile_axes[i].set_ylim(y0, y1)
+        profile_axes[i].plot(lat_vals, vi_plot, color="C0", lw=2)
+        if i % n_cols == 0:
+            profile_axes[i].set_ylabel('Total', fontsize=9)
         else:
-            # All-NaN/Inf (or single finite value) -> avoid matplotlib ValueError
-            profile_axes[i].set_ylim(-1e25, 1e25)
-        profile_axes[i].set_ylabel('Total', fontsize=9)
+            contour_axes[i].set_ylabel("")
+            contour_axes[i].tick_params(labelleft=False)
+        profile_axes[i].set_xlim(-60, 60)
         profile_axes[i].grid(True, alpha=0.3)
     
+    # Compute global vmax from all snapshots
+    finite_maxima = np.array([x for x in all_vertical_integral_maxima if np.isfinite(x)])
+    if finite_maxima.size > 0:
+        vmax_global = np.nanmax(finite_maxima)
+    else:
+        vmax_global = 5e27
+    
+    # Apply same limits to all profile axes
+    for ax in profile_axes[:len(snapshot_indices)]:
+        ax.set_ylim(-vmax_global, vmax_global)
+        
     # Hide unused subplots
     for j in range(len(snapshot_indices), len(contour_axes)):
         contour_axes[j].axis('off')
@@ -804,11 +870,12 @@ def plot_latitude_level_snapshots_HadGEN3(
     
     _suffix_str = f"  |  {title_suffix}" if title_suffix else ""
     fig.suptitle(
-        f'CMIP6 HadGEM3_GC31 {ensemble_member} zonally integrated AAM Anomaly: Latitude × Level Snapshots\n'
-        f'Climatology: {clim_start_yr}-{clim_end_yr}{_suffix_str}',
-        fontsize=26, y=0.99,
+        f'CMIP6 HadGEM3_GC31 {ensemble_member} zonally integrated AAM Anomaly\n'
+        f'Latitude × Level Snapshots Climatology: {clim_start_yr}-{clim_end_yr}\n'
+        f'{_suffix_str}',
+        fontsize=20, y=0.95,
     )
-    plt.tight_layout(rect=[0, 0.08, 1, 0.95])  # Leave space for colorbar at bottom and reduce top gap
+    plt.tight_layout(rect=[0.00, 0.1, 0.98, 0.96])  # Leave space for colorbar at bottom and reduce top gap
 
     rolling_tag = ""
     if rolling_period is not None:
@@ -819,15 +886,25 @@ def plot_latitude_level_snapshots_HadGEN3(
     file_suffix = ""
     if filename_suffix:
         file_suffix = f"_{str(filename_suffix).strip('_')}"
+        
+    if dec_onset_month == "onset":
+        pass
+    elif dec_onset_month == "december_onset_year":
+        file_suffix += "_december_onset_year"
+    
+    if onset_season_ndjfm == "ndjfm":
+        file_suffix += "_onset_season_NDJFM"
+    else:
+        file_suffix += "_onset_season_all"
+        
+    nino_thres_tag = "nino_thres" + str(float(nino_threshold)) if nino_threshold is not None else ""
 
     output_file = (
-        f'{output_dir}AAM_anomalies_lat_level_snapshots_{ensemble_member}_{start_year}-{end_year}'
-        f'{rolling_tag}{file_suffix}.png'
+        f'{output_dir}AAM_anomalies_lat_level_snapshots_{ensemble_member}_{start_year}-{end_year}{rolling_tag}_{nino_thres_tag}{file_suffix}.png'
     )
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     print(f"Snapshot figure saved to: {output_file}")
     plt.close()
-    
 
 def plot_latitude_level_movie_HadGEM3(
     anomalies: xr.DataArray,
@@ -838,7 +915,7 @@ def plot_latitude_level_movie_HadGEM3(
     end_year: int,
     clim_start_yr: int,
     clim_end_yr: int,
-    vpercentile: float = 95.0,
+    vpercentile: float = 99.0,
     cmap_name: str = "RdBu_r",
     output_dir: str | Path = "output/",
     find_extremum: str = "max",
@@ -1066,6 +1143,464 @@ def plot_latitude_level_movie_HadGEM3(
     print(f"Movie saved to: {output_file}")
 
 
+def plot_lat_level_postage_stamp_5x12(
+    member_composites: list,
+    *,
+    output_dir: str | Path = "output/",
+    start_year: int = 1850,
+    end_year: int = 2010,
+    clim_start_yr: int = 1980,
+    clim_end_yr: int = 2000,
+    region: str = "all",
+    enso_state: str = "el_nino",
+    nino_threshold: float = 0.5,
+    title_suffix: str = "",
+) -> None:
+    """Create a postage stamp grid of lat×level composites for all ensemble members.
+    
+    5 columns × 12 rows = 60 subplots (one per ensemble member).
+    
+    Parameters
+    ----------
+    member_composites : list of tuples (member_name, composite_da)
+        Each composite_da has dims (lat, level) or (level, lat)
+    output_dir : str | Path
+        Directory to save the figure
+    region : str
+        Region label for filename
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    import matplotlib.cm as cm
+    from matplotlib.gridspec import GridSpec
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    n_members = len(member_composites)
+    n_cols = 5
+    n_rows = int(np.ceil(n_members / n_cols))
+    
+    # Collect all composites (time-averaged) to determine global color limits
+    all_values = []
+    for _, comp in member_composites:
+        # Average over time dimension if present
+        if "time" in comp.dims:
+            comp_avg = comp.mean("time")
+        elif "month" in comp.dims:
+            comp_avg = comp.mean("month")
+        else:
+            comp_avg = comp
+        all_values.append(comp_avg.values)
+    all_values = np.concatenate([v.flatten() for v in all_values])
+    all_values = all_values[np.isfinite(all_values)]
+    
+    if all_values.size > 0:
+        vmax = float(np.nanpercentile(np.abs(all_values), 99))
+        vmax = vmax if vmax > 0 else 1.0
+    else:
+        vmax = 1.0
+    vmin = -vmax
+    levels = np.linspace(vmin, vmax, 21)
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4*n_rows))
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = axes.reshape(1, -1)
+    elif n_cols == 1:
+        axes = axes.reshape(-1, 1)
+    
+    # Normalize dimension names
+    for idx, (member_name, comp) in enumerate(member_composites):
+        # Average over time dimension if present to get single representative image
+        if "time" in comp.dims:
+            comp = comp.mean("time")
+        elif "month" in comp.dims:
+            comp = comp.mean("month")
+        
+        row = idx // n_cols
+        col = idx % n_cols
+        ax = axes[row, col]
+        
+        # Ensure standard dimension names
+        if "latitude" in comp.dims and "lat" not in comp.dims:
+            comp = comp.rename({"latitude": "lat"})
+        if "level" in comp.dims or "plev" in comp.dims:
+            lev_dim = "level" if "level" in comp.dims else "plev"
+        else:
+            lev_dim = None
+        
+        lat_dim = "lat" if "lat" in comp.dims else ("latitude" if "latitude" in comp.dims else None)
+        
+        if lat_dim is None or lev_dim is None:
+            ax.text(0.5, 0.5, f"Missing dims\n{comp.dims}", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(member_name, fontsize=8)
+            continue
+        
+        lat_vals = comp[lat_dim].values
+        lev_vals = comp[lev_dim].values
+        
+        # Transpose to (lat, level)
+        data_vals = comp.values
+        if comp.dims[0] == lev_dim:
+            data_vals = data_vals.T
+        
+        cf = ax.contourf(lat_vals, lev_vals, data_vals, levels=levels, cmap="RdBu_r", extend="both")
+        ax.set_ylabel("Level (hPa)", fontsize=8)
+        ax.set_xlabel("Latitude (°N)", fontsize=8)
+        ax.set_title(member_name, fontsize=9, fontweight="bold")
+        ax.tick_params(labelsize=7)
+        ax.invert_yaxis()
+    
+    # Hide empty subplots
+    for idx in range(n_members, n_rows * n_cols):
+        row = idx // n_cols
+        col = idx % n_cols
+        axes[row, col].axis("off")
+    
+    # Add single colorbar
+    cbar_ax = fig.add_axes([0.15, 0.02, 0.7, 0.01])
+    norm = mcolors.BoundaryNorm(levels, ncolors=256)
+    sm = cm.ScalarMappable(cmap=cm.get_cmap('RdBu_r'), norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal', extend='both')
+    cbar.set_label('AAM anomaly (kg m² s⁻¹)', fontsize=10)
+    cbar.ax.tick_params(labelsize=9)
+    
+    region_label = region.upper() if region != 'all' else 'GLOBAL'
+    fig.suptitle(
+        f'HadGEM3_GC31 {n_members} Ensemble Members - Latitude×Level Composites\n'
+        f'{region_label} | {enso_state} (Nino3.4{">=" if enso_state=="el_nino" else "<="}{nino_threshold})\n'
+        f'{title_suffix}',
+        fontsize=12, fontweight="bold"
+    )
+    fig.tight_layout(rect=[0, 0.05, 1, 0.95])
+    
+    out_path = output_dir / f"postage_stamp_lat_level_ensemble_{enso_state}_{region_label.lower()}_{n_members}members.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Postage stamp (lat×level) saved to {out_path}")
+
+
+def plot_lat_level_monthly_stamps_10col(
+    member_composites: list,
+    *,
+    output_dir: str | Path = "output/",
+    region: str = "all",
+    enso_state: str = "el_nino",
+    nino_threshold: float = 0.5,
+    title_suffix: str = "",
+) -> None:
+    """Create monthly postage stamp figures for lat×level composites (10 columns per figure).
+    
+    For each month in the composite, creates a separate figure with 10 columns × 6 rows = 60 members.
+    
+    Parameters
+    ----------
+    member_composites : list of tuples (member_name, composite_da)
+        Each composite_da has dims (lat, level, month) or permutation thereof
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    import matplotlib.cm as cm
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    n_members = len(member_composites)
+    if n_members == 0:
+        print("No member composites to plot")
+        return
+    
+    # Get number of months and collect all values for color scaling
+    first_comp = member_composites[0][1]
+    
+    # Find time/month dimension
+    time_dim = None
+    for dim in first_comp.dims:
+        if dim in ("time", "month"):
+            time_dim = dim
+            break
+    
+    if time_dim is None:
+        print("No time/month dimension found in composites")
+        return
+    
+    n_months = first_comp.sizes[time_dim]
+    
+    # Collect all values for global color scaling
+    all_values = []
+    for _, comp in member_composites:
+        all_values.append(comp.values)
+    all_values = np.concatenate([v.flatten() for v in all_values])
+    all_values = all_values[np.isfinite(all_values)]
+    
+    if all_values.size > 0:
+        vmax = float(np.nanpercentile(np.abs(all_values), 99))
+        vmax = vmax if vmax > 0 else 1.0
+    else:
+        vmax = 1.0
+    vmin = -vmax
+    levels = np.linspace(vmin, vmax, 21)
+    
+    # Process each month
+    for month_idx in range(n_months):
+        n_cols = 10
+        n_rows = int(np.ceil(n_members / n_cols))
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(24, 3*n_rows))
+        if n_rows == 1 and n_cols == 1:
+            axes = np.array([[axes]])
+        elif n_rows == 1:
+            axes = axes.reshape(1, -1)
+        elif n_cols == 1:
+            axes = axes.reshape(-1, 1)
+        
+        for member_idx, (member_name, comp) in enumerate(member_composites):
+            # Normalize dimension names
+            if "latitude" in comp.dims and "lat" not in comp.dims:
+                comp = comp.rename({"latitude": "lat"})
+            if "level" in comp.dims or "plev" in comp.dims:
+                lev_dim = "level" if "level" in comp.dims else "plev"
+            else:
+                lev_dim = None
+            
+            lat_dim = "lat" if "lat" in comp.dims else ("latitude" if "latitude" in comp.dims else None)
+            
+            row = member_idx // n_cols
+            col = member_idx % n_cols
+            ax = axes[row, col]
+            
+            if lat_dim is None or lev_dim is None:
+                ax.text(0.5, 0.5, f"Missing dims", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title(member_name, fontsize=7)
+                continue
+            
+            # Ensure time_dim is present in comp
+            if time_dim not in comp.dims:
+                ax.text(0.5, 0.5, f"No {time_dim} dim\n({comp.dims})", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title(member_name, fontsize=7)
+                continue
+            
+            # Extract this month's data
+            comp_month = comp.isel({time_dim: month_idx})
+            
+            lat_vals = comp_month[lat_dim].values
+            lev_vals = comp_month[lev_dim].values
+            
+            data_vals = comp_month.values
+            if comp_month.dims[0] == lev_dim:
+                data_vals = data_vals.T
+            
+            cf = ax.contourf(lat_vals, lev_vals, data_vals, levels=levels, cmap="RdBu_r", extend="both")
+            ax.set_ylabel("Level", fontsize=6)
+            ax.set_xlabel("Lat", fontsize=6)
+            ax.set_title(member_name, fontsize=7)
+            ax.tick_params(labelsize=5)
+            ax.invert_yaxis()
+        
+        # Hide empty subplots
+        for idx in range(n_members, n_rows * n_cols):
+            row = idx // n_cols
+            col = idx % n_cols
+            axes[row, col].axis("off")
+        
+        # Colorbar
+        cbar_ax = fig.add_axes([0.15, 0.02, 0.7, 0.01])
+        norm = mcolors.BoundaryNorm(levels, ncolors=256)
+        sm = cm.ScalarMappable(cmap=cm.get_cmap('RdBu_r'), norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal', extend='both')
+        cbar.set_label('AAM anomaly (kg m² s⁻¹)', fontsize=9)
+        cbar.ax.tick_params(labelsize=8)
+        
+        region_label = region.upper() if region != 'all' else 'GLOBAL'
+        fig.suptitle(
+            f'HadGEM3_GC31 Lat×Level - Month {month_idx+1:02d} | {region_label} {enso_state}\n{title_suffix}',
+            fontsize=11, fontweight="bold"
+        )
+        fig.tight_layout(rect=[0, 0.05, 1, 0.95])
+        
+        out_path = output_dir / f"postage_stamp_lat_level_month{month_idx+1:02d}_{region_label.lower()}_{enso_state}.png"
+        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Month {month_idx+1:02d} lat×level stamps saved to {out_path}")
+
+
+def plot_lat_lon_monthly_stamps_10col(
+    member_composites: list,
+    *,
+    output_dir: str | Path = "output/",
+    region: str = "all",
+    enso_state: str = "el_nino",
+    nino_threshold: float = 0.5,
+    title_suffix: str = "",
+) -> None:
+    """Create monthly postage stamp figures for lat×lon composites (10 columns per figure).
+    
+    For each month in the composite, creates a separate figure with 10 columns × 6 rows = 60 members.
+    
+    Parameters
+    ----------
+    member_composites : list of tuples (member_name, composite_da)
+        Each composite_da has dims (lat, lon, month) or permutation thereof
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    import matplotlib.cm as cm
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    n_members = len(member_composites)
+    if n_members == 0:
+        print("No member composites to plot")
+        return
+    
+    # Get number of months and collect all values for color scaling
+    first_comp = member_composites[0][1]
+    
+    # Find time/month dimension
+    time_dim = None
+    for dim in first_comp.dims:
+        if dim in ("time", "month"):
+            time_dim = dim
+            break
+    
+    if time_dim is None:
+        print("No time/month dimension found in composites")
+        return
+    
+    n_months = first_comp.sizes[time_dim]
+    
+    # Collect all values for global color scaling (average over time first)
+    all_values = []
+    for _, comp in member_composites:
+        if "time" in comp.dims:
+            comp_avg = comp.mean("time")
+        elif "month" in comp.dims:
+            comp_avg = comp.mean("month")
+        else:
+            comp_avg = comp
+        all_values.append(comp_avg.values)
+    all_values = np.concatenate([v.flatten() for v in all_values])
+    all_values = all_values[np.isfinite(all_values)]
+    
+    if all_values.size > 0:
+        vmax = float(np.nanpercentile(np.abs(all_values), 99))
+        vmax = vmax if vmax > 0 else 1.0
+    else:
+        vmax = 1.0
+    vmin = -vmax
+    levels = np.linspace(vmin, vmax, 21)
+    
+    # Use PlateCarree projection (region-aware): center at dateline for Pacific and global
+    region_central_lons = {
+        "pacific": 180,
+        "all": 180,
+        "indian": 75,      # Center Indian Ocean (50-100°E)
+        "atlantic": -30,   # Center Atlantic (-60-10°E)
+    }
+    central_lon = region_central_lons.get(region, 0)
+    map_crs = ccrs.PlateCarree(central_longitude=central_lon)
+    data_crs = ccrs.PlateCarree()
+    
+    # Process each month
+    for month_idx in range(n_months):
+        n_cols = 10
+        n_rows = int(np.ceil(n_members / n_cols))
+        
+        fig = plt.figure(figsize=(24, 2.5*n_rows))
+        gs = GridSpec(n_rows, n_cols, figure=fig, hspace=0.3, wspace=0.2)
+        
+        for member_idx, (member_name, comp) in enumerate(member_composites):
+            # Normalize dimension names
+            if "latitude" in comp.dims and "lat" not in comp.dims:
+                comp = comp.rename({"latitude": "lat"})
+            if "longitude" in comp.dims and "lon" not in comp.dims:
+                comp = comp.rename({"longitude": "lon"})
+            
+            lat_dim = "lat" if "lat" in comp.dims else ("latitude" if "latitude" in comp.dims else None)
+            lon_dim = "lon" if "lon" in comp.dims else ("longitude" if "longitude" in comp.dims else None)
+            
+            row = member_idx // n_cols
+            col = member_idx % n_cols
+            ax = fig.add_subplot(gs[row, col], projection=map_crs)
+            
+            if lat_dim is None or lon_dim is None:
+                ax.text(0.5, 0.5, f"Missing dims", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title(member_name, fontsize=7)
+                continue
+            
+            # Ensure time_dim is present in comp
+            if time_dim not in comp.dims:
+                ax.text(0.5, 0.5, f"No {time_dim} dim\n({comp.dims})", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title(member_name, fontsize=7)
+                continue
+            
+            # Extract this month's data
+            comp_month = comp.isel({time_dim: month_idx})
+            
+            lat_vals = comp_month[lat_dim].values
+            lon_vals = comp_month[lon_dim].values
+            
+            data_vals = comp_month.values
+            # Ensure (lat, lon)
+            if comp_month.dims[0] == lon_dim:
+                data_vals = data_vals.T
+            
+            cf = ax.contourf(lon_vals, lat_vals, data_vals, levels=levels, cmap="RdBu_r", 
+                            extend="both", transform=data_crs)
+            ax.coastlines(resolution="110m", linewidth=0.3)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.2)
+            
+            # Set geographic extent based on region
+            lat_extent = (-60, 60)
+            if region == "indian":
+                ax.set_extent([50, 100, lat_extent[0], lat_extent[1]], crs=data_crs)
+            elif region == "atlantic":
+                ax.set_extent([-60, 10, lat_extent[0], lat_extent[1]], crs=data_crs)
+            elif region == "pacific":
+                ax.set_extent([125, 250, lat_extent[0], lat_extent[1]], crs=data_crs)
+            else:
+                lon_min, lon_max = float(np.nanmin(lon_vals)), float(np.nanmax(lon_vals))
+                ax.set_extent([lon_min, lon_max, lat_extent[0], lat_extent[1]], crs=data_crs)
+            
+            ax.set_title(member_name, fontsize=7)
+            ax.tick_params(labelsize=5)
+        
+        # Hide empty subplots
+        for idx in range(n_members, n_rows * n_cols):
+            row = idx // n_cols
+            col = idx % n_cols
+            ax = fig.add_subplot(gs[row, col])
+            ax.axis("off")
+        
+        # Colorbar
+        cbar_ax = fig.add_axes([0.15, 0.02, 0.7, 0.01])
+        norm = mcolors.BoundaryNorm(levels, ncolors=256)
+        sm = cm.ScalarMappable(cmap=cm.get_cmap('RdBu_r'), norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal', extend='both')
+        cbar.set_label('AAM anomaly (kg m² s⁻¹)', fontsize=9)
+        cbar.ax.tick_params(labelsize=8)
+        
+        region_label = region.upper() if region != 'all' else 'GLOBAL'
+        fig.suptitle(
+            f'HadGEM3_GC31 Lat×Lon - Month {month_idx+1:02d} | {region_label} {enso_state}\n{title_suffix}',
+            fontsize=11, fontweight="bold"
+        )
+        fig.tight_layout(rect=[0, 0.05, 1, 0.95])
+        
+        out_path = output_dir / f"postage_stamp_lat_lon_month{month_idx+1:02d}_{region_label.lower()}_{enso_state}.png"
+        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Month {month_idx+1:02d} lat×lon stamps saved to {out_path}")
+
+
 __all__ = [
     "ClimatologyCacheSpec",
     "compute_monthly_climatology",
@@ -1074,4 +1609,7 @@ __all__ = [
     "plot_anomalies_3d_slices",
     "plot_latitude_level_movie_HadGEM3",
     "plot_latitude_level_snapshots_HadGEN3",
+    "plot_lat_level_postage_stamp_5x12",
+    "plot_lat_level_monthly_stamps_10col",
+    "plot_lat_lon_monthly_stamps_10col",
 ]

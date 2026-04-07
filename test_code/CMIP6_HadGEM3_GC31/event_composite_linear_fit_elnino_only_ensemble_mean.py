@@ -20,7 +20,9 @@ https://doi.org/10.1038/s41612-025-01283-7
 """
 import xarray as xr
 import numpy as np
+import pandas as pd
 import json
+import traceback
 # Allow importing shared utilities from AAM/test_code
 import sys
 import os
@@ -32,14 +34,21 @@ from plotting_utils import plot_latitude_level_snapshots_HadGEN3, plot_lat_lon_s
 import tqdm
 from scipy import stats as _stats
 from matplotlib import pyplot as plt
-from scipy.ndimage import gaussian_filter
+
+try:
+    from joblib import Parallel, delayed
+    JOBLIB_AVAILABLE = True
+except ImportError:
+    JOBLIB_AVAILABLE = False
+    print("Note: joblib not installed. For CPU-bound parallelization, install: pip install joblib")
+    sys.exit(1)
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Plot CMIP6 AAM anomalies integrated over specified pressure levels')
 parser.add_argument('--p-min', type=float, default=150.0, help='Minimum pressure level (hPa) to include (default: 0 hPa)')
 parser.add_argument('--p-max', type=float, default=700, help='Maximum pressure level (hPa) to include (default: 1020 hPa)')
-parser.add_argument('--start-year', type=int, default=1980, help='Start year to plot (default: 1980)')
-parser.add_argument('--end-year', type=int, default=2000, help='End year to plot (default: 2000)')
+parser.add_argument('--start-year', type=int, default=1850, help='Start year to plot (default: 1850)')
+parser.add_argument('--end-year', type=int, default=2010, help='End year to plot (default: 2010)')
 parser.add_argument('--enso-state', type=str, default='el_nino', choices=['el_nino', 'la_nina'], help='ENSO state to detect (default: el_nino)')
 parser.add_argument('--nino-threshold', type=float, default=0.5, help='Nino3.4 threshold for El Nino state detection (default: 0.5)')
 parser.add_argument('--min-elnino-months', type=int, default=3, help='Minimum consecutive months above threshold to define El Nino state (default: 3)')
@@ -50,7 +59,74 @@ parser.add_argument('--composite-start', type=str, default='onset', choices=['on
                     help='Composite window start mode: onset month, or December of onset year (default: onset)')
 parser.add_argument('--onset-season', type=str, default='all', choices=['all', 'ndjfm'],
                     help='Only composite events whose onset month falls in the given season (default: all; ndjfm = Nov–Mar only)')
+parser.add_argument(
+    '--region',
+    type=str,
+    default='all',
+    choices=['all', 'pacific', 'indian', 'atlantic'],
+    help='Geographic region to analyze (default: all). Pacific: 125–(-110)°, Indian: 50–100°, Atlantic: -60–10°',
+)
 args = parser.parse_args()
+
+n_cpus_to_use = 20
+# Define region longitude bounds (degrees East; negative = West)
+REGION_BOUNDS = {
+    'all': None,  # no filtering
+    'pacific': (125, -110),      # 125°E to 110°W
+    'indian': (50, 100),         # 50°E to 100°E
+    'atlantic': (-60, 10),       # 60°W to 10°E
+}
+
+def _select_region(da, region):
+    """Select a geographic region from a DataArray by longitude bounds.
+    
+    Parameters
+    ----------
+    da : xr.DataArray
+        Input data with a longitude dimension
+    region : str
+        Region name ('all', 'pacific', 'indian', 'atlantic')
+    
+    Returns
+    -------
+    xr.DataArray
+        Subset of da containing only the selected region's longitudes
+    """
+    if region == 'all':
+        return da
+    
+    # Normalize dimension names
+    da_renamed = da.copy()
+    if 'longitude' in da_renamed.dims and 'lon' not in da_renamed.dims:
+        da_renamed = da_renamed.rename({'longitude': 'lon'})
+    if 'latitude' in da_renamed.dims and 'lat' not in da_renamed.dims:
+        da_renamed = da_renamed.rename({'latitude': 'lat'})
+    
+    lon_min, lon_max = REGION_BOUNDS[region]
+    
+    if 'lon' not in da_renamed.dims:
+        # No longitude dimension, return as-is
+        return da_renamed
+    
+    lon_vals = da_renamed['lon'].values
+    orig_lon_range = (float(lon_vals.min()), float(lon_vals.max()))
+    
+    # Handle wrapping: if lon_min > lon_max and crosses dateline (Pacific case)
+    if lon_min > lon_max:
+        # Select lon >= lon_min OR lon <= lon_max (crosses dateline)
+        mask = (lon_vals >= lon_min) | (lon_vals <= lon_max)
+    else:
+        # Standard case: lon_min < lon_max
+        mask = (lon_vals >= lon_min) & (lon_vals <= lon_max)
+    
+    result = da_renamed.isel({'lon': mask})
+    new_lon_range = (float(result['lon'].values.min()), float(result['lon'].values.max())) if result.sizes['lon'] > 0 else (None, None)
+    
+    # Debug output
+    if result.sizes['lon'] > 0:
+        print(f"[SELECT_REGION] {region}: original lon {orig_lon_range}, target [{lon_min}, {lon_max}], selected {result.sizes['lon']} lons in range {new_lon_range}")
+    
+    return result
 
 base_dir = os.getcwd()
 # AAM_data_path_base = f"{base_dir}/monthly_mean/AAM/"
@@ -62,14 +138,20 @@ base_dir = os.getcwd()
 # output_dir = f"{base_dir}/figures/composites/non_tracking_algorithm/"
 
 # Use scratch space and new directory structure due to workspace migration
-CMIP6_path_base = "/work/scratch-nopw2/hhhn2/"
+CMIP6_path_base = "/work/scratch-nopw2/hhhn2"
 nino34_directory = f"{CMIP6_path_base}/HadGEM3-GC31-LL/ProcessedFlds/Omon/sst_indices/nino34/historical/"
-output_dir = f"{base_dir}/figures/composites/non_tracking_algorithm/"
+output_dir = f"{base_dir}/figures/composites/non_tracking_algorithm/with_wind_overlay/strong_events/"
 climatology_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/AAM/climatology/"
 AAM_data_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/AAM/full/"
 u_data_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/Amon/ua/historical"
 uv_data_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/Amon/uv/historical"
+ensemble_mean_output_path = f"{CMIP6_path_base}/HadGEM3-GC31-LL/AAM/ensemble_mean_composite/" 
 u_level_to_plot = 250.0  # hPa
+save_ensemble_mean_netcdf = True  # Save region-specific netCDF files for each run
+replot = False  # If True, skip composite calculation and just replot from saved ensemble mean NetCDF
+
+if replot:
+    save_ensemble_mean_netcdf = False
 
 def detect_enso_state_windows(
     *,
@@ -256,6 +338,341 @@ def compute_composite_field(field, date_list, args) -> xr.DataArray:
 
     return stack.mean("event", skipna=True)
 
+def _process_single_ensemble_member(
+    ensemble_member,
+    clim_start_yr,
+    clim_end_yr,
+    args,
+    AAM_data_path_base,
+    climatology_path_base,
+    u_data_path_base,
+    uv_data_path_base,
+    u_level_to_plot,
+):
+    """Process a single ensemble member and return results as a dictionary.
+    
+    Returns dict with keys: 'composite', 'lat_lev_composite', 'lat_lon_composite',
+    'u_latlon', 'u_latlev', 'uv_vi', 'onset_dates', 'onset_members', 'peak_amplitudes'
+    """
+    results = {
+        'composite': None,
+        'lat_lev_composite': None,
+        'lat_lon_composite': None,
+        'u_latlon': None,
+        'u_latlev': None,
+        'uv_vi': None,
+        'onset_dates': [],
+        'onset_members': [],
+        'peak_amplitudes': [],
+    }
+    
+    try:
+        # Load AAM
+        AAM_da = xr.open_dataset(f"{AAM_data_path_base}AAM_CMIP6_HadGEM3_GC31_{ensemble_member}_1850-01_2014-12.nc")['AAM']
+        
+        # Normalize dimension names immediately after loading
+        if 'latitude' in AAM_da.dims and 'lat' not in AAM_da.dims:
+            AAM_da = AAM_da.rename({'latitude': 'lat'})
+        if 'longitude' in AAM_da.dims and 'lon' not in AAM_da.dims:
+            AAM_da = AAM_da.rename({'longitude': 'lon'})
+        
+        # DEBUG: Print what region is requested
+        if ensemble_member == "r1i1p1f3":
+            print(f"\n[ENSEMBLE MEMBER DEBUG] Processing {ensemble_member}")
+            print(f"  Region requested: {args.region}")
+            print(f"  Full AAM data shape before selection: {AAM_da.shape}")
+            lon_coord = 'lon' if 'lon' in AAM_da.dims else 'longitude'
+            print(f"  Full AAM lon range: [{float(AAM_da[lon_coord].values.min()):.1f}, {float(AAM_da[lon_coord].values.max()):.1f}]")
+        
+        # Apply region selection BEFORE zonal integration so ensemble mean is also region-specific
+        AAM_da = _select_region(AAM_da, args.region)
+        
+        if "longitude" in AAM_da.dims or "lon" in AAM_da.dims:
+            AAM_da = _to_per_latitude_band(AAM_da)
+            
+        u_da = xr.open_dataset(f"{u_data_path_base}/ua_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc")['ua']
+        # Normalize dimension names
+        if 'latitude' in u_da.dims and 'lat' not in u_da.dims:
+            u_da = u_da.rename({'latitude': 'lat'})
+        if 'longitude' in u_da.dims and 'lon' not in u_da.dims:
+            u_da = u_da.rename({'longitude': 'lon'})
+        
+        uv_da = xr.open_dataset(f"{uv_data_path_base}/uv_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc")['uv']
+        # Normalize dimension names
+        if 'latitude' in uv_da.dims and 'lat' not in uv_da.dims:
+            uv_da = uv_da.rename({'latitude': 'lat'})
+        if 'longitude' in uv_da.dims and 'lon' not in uv_da.dims:
+            uv_da = uv_da.rename({'longitude': 'lon'})
+
+        # Climatology
+        clim_da = xr.open_dataset(
+            f"{climatology_path_base}AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_{clim_start_yr}-{clim_end_yr}.nc")
+        
+        # Normalize dimension names immediately after loading
+        if 'latitude' in clim_da.dims and 'lat' not in clim_da.dims:
+            clim_da = clim_da.rename({'latitude': 'lat'})
+        if 'longitude' in clim_da.dims and 'lon' not in clim_da.dims:
+            clim_da = clim_da.rename({'longitude': 'lon'})
+
+        # Select region before zonal mean so that zonal mean is computed over regional lons only
+        u_da_regional = _select_region(u_da, args.region)
+        u_da_zonal_band = u_da_regional.mean(dim="longitude", skipna=True) if "longitude" in u_da_regional.dims else u_da_regional
+        
+        # Use the per-latitude-band + zonal-integral climatology
+        # CRITICAL: Apply region selection to climatology BEFORE zonal integration to match main AAM data
+        clim_aam_data = clim_da['AAM']
+        clim_aam_data = _select_region(clim_aam_data, args.region)
+        if 'longitude' in clim_aam_data.dims or 'lon' in clim_aam_data.dims:
+            clim_da = _to_per_latitude_band(clim_aam_data)
+        else:
+            clim_da = clim_aam_data
+        
+        # Detect ENSO state windows from Nino3.4
+        _onset_months_map = {"all": None, "ndjfm": {11, 12, 1, 2, 3}}
+        onset_months_filter = _onset_months_map[args.onset_season]
+        date_list = detect_enso_state_windows(
+            start_yr=int(args.start_year),
+            end_yr=int(args.end_year),
+            ensemble_member=ensemble_member,
+            enso_state=str(args.enso_state),
+            threshold=float(args.nino_threshold),
+            min_consecutive_months=int(args.min_elnino_months),
+            onset_months=onset_months_filter,
+        )
+        
+        if not date_list:
+            return results
+            
+        # Collect onset dates for histogram
+        for _onset, _end in date_list:
+            onset_str = _onset if isinstance(_onset, str) else _time_value_to_ymd_string(_onset)
+            results['onset_dates'].append(onset_str)
+            results['onset_members'].append(ensemble_member)
+        
+        # Record event peak Nino3.4 amplitudes
+        try:
+            enso_times_all, enso_vals_all = get_ENSO_index(int(args.start_year), int(args.end_year) - 1, ensemble_member=ensemble_member)
+            if enso_times_all is not None and enso_vals_all is not None:
+                enso_index = pd.to_datetime(enso_times_all)
+                enso_series = pd.Series(np.asarray(enso_vals_all, dtype=float), index=enso_index.to_period('M'))
+                for _onset, _end in date_list:
+                    onset_str = _onset if isinstance(_onset, str) else _time_value_to_ymd_string(_onset)
+                    window_start, window_end = _compute_composite_window_from_onset(
+                        onset_str,
+                        composite_months=int(args.composite_months),
+                        composite_start=str(args.composite_start),
+                    )
+                    start_period = pd.Period(window_start, freq='M')
+                    end_period = pd.Period(window_end, freq='M')
+                    ev_vals = enso_series.loc[start_period:end_period].values
+                    if ev_vals.size == 0:
+                        continue
+                    if args.enso_state == 'el_nino':
+                        peak = float(np.nanmax(ev_vals))
+                    else:
+                        peak = float(abs(np.nanmin(ev_vals)))
+                    results['peak_amplitudes'].append(peak)
+        except Exception:
+            pass
+        
+        # Process fields
+        p_selected, _ = pressure_range_in_coord_units(u_da.plev, p_min_hpa=u_level_to_plot, p_max_hpa=float(args.p_max))
+        u_level = u_da.sel(plev=p_selected, method="nearest")
+        u_zm = u_da_zonal_band
+        
+        aam_latlon = vertical_sum_over_pressure_range(AAM_da, p_min_hpa=float(args.p_min), p_max_hpa=float(args.p_max), level_dim="level")
+        aam_latlev = AAM_da.sum(dim="longitude", skipna=True) if "longitude" in AAM_da.dims else AAM_da
+        uv_vi = vertical_sum_over_pressure_range(uv_da, p_min_hpa=float(args.p_min), p_max_hpa=float(args.p_max), level_dim="plev")
+        
+        u_latlon_comp = compute_composite_field(u_level, date_list=date_list, args=args)
+        u_latlvl_zm_comp = compute_composite_field(u_zm, date_list=date_list, args=args)
+        uv_latlev_comp = compute_composite_field(uv_vi, date_list, args)
+        
+        if u_latlon_comp is not None:
+            results['u_latlon'] = u_latlon_comp.expand_dims({"ensemble": [ensemble_member]})
+        if u_latlvl_zm_comp is not None:
+            results['u_latlev'] = u_latlvl_zm_comp.expand_dims({"ensemble": [ensemble_member]})
+        if uv_latlev_comp is not None:
+            results['uv_vi'] = uv_latlev_comp.expand_dims({"ensemble": [ensemble_member]})
+        
+        # Step 4: Composite AAM anomaly
+        comp = composite_propagating_years_no_plot(
+            AAM_da,
+            wind_da=None,
+            date_list=date_list,
+            clim_da=clim_da,
+            clim_start_yr=clim_start_yr,
+            clim_end_yr=clim_end_yr,
+            p_min_hpa=float(args.p_min),
+            p_max_hpa=float(args.p_max),
+            enso_state=str(args.enso_state),
+            rolling_period=int(args.rolling_period),
+            composite_months=int(args.composite_months),
+            composite_start=str(args.composite_start),
+            onset_season=str(args.onset_season),
+        )
+        if comp is not None:
+            results['composite'] = comp.expand_dims({"ensemble": [ensemble_member]})
+        
+        # Step 5: Latitude×level composite
+        aam_full = AAM_da["AAM"] if isinstance(AAM_da, xr.Dataset) and "AAM" in AAM_da else AAM_da
+        aam_full = _select_region(aam_full, args.region)
+        if "longitude" in aam_full.dims or "lon" in aam_full.dims:
+            aam_full = _to_per_latitude_band(aam_full)
+        
+        clim_full = clim_da["AAM"] if isinstance(clim_da, xr.Dataset) and "AAM" in clim_da else clim_da
+        # Normalize dimensions
+        if 'latitude' in clim_full.dims and 'lat' not in clim_full.dims:
+            clim_full = clim_full.rename({'latitude': 'lat'})
+        if 'longitude' in clim_full.dims and 'lon' not in clim_full.dims:
+            clim_full = clim_full.rename({'longitude': 'lon'})
+        
+        aam_full_reindexed, clim_on_time_full = _reindex_to_climatology_dims(aam_full, clim_full)
+        anom_full = aam_full_reindexed - clim_on_time_full
+        
+        stacked_full = []
+        seen_ev = set()
+        for onset_str, _ in date_list:
+            if not isinstance(onset_str, str):
+                onset_str = _time_value_to_ymd_string(onset_str)
+            ym = onset_str[:7]
+            if ym in seen_ev:
+                continue
+            seen_ev.add(ym)
+            window_start, window_end = _compute_composite_window_from_onset(
+                onset_str,
+                composite_months=int(args.composite_months),
+                composite_start=str(args.composite_start),
+            )
+            evt = anom_full.sel(time=slice(window_start, window_end))
+            if int(evt.sizes["time"]) < int(args.composite_months):
+                continue
+            evt = evt.isel(time=slice(0, int(args.composite_months)))
+            evt = evt.assign_coords(time=np.arange(1, int(args.composite_months) + 1, dtype=int))
+            if "month" in evt.coords:
+                evt = evt.drop_vars("month")
+            evt = evt.rename({"time": "month"})
+            stacked_full.append(evt)
+        
+        if stacked_full:
+            full_stack = xr.concat(stacked_full, dim="event")
+            rp = int(args.rolling_period)
+            if rp > 1:
+                n_month = int(full_stack.sizes["month"])
+                if rp <= n_month:
+                    left = rp // 2
+                    right = rp - left - 1
+                    _rolled = [full_stack.roll(month=-offset, roll_coords=False) for offset in range(-left, right + 1)]
+                    full_stack = xr.concat(_rolled, dim="_roll").mean("_roll", skipna=True)
+            
+            composite_full = full_stack.mean("event", skipna=True)
+            composite_full = composite_full.rename({"month": "time"})
+            
+            # Normalize dimension names before storing in results
+            if 'latitude' in composite_full.dims and 'lat' not in composite_full.dims:
+                composite_full = composite_full.rename({'latitude': 'lat'})
+            
+            results['lat_lev_composite'] = composite_full.expand_dims({"ensemble": [ensemble_member]})
+        
+        # Step 6: LAT×LON composite
+        aam_full_latlon = xr.open_dataset(f"{AAM_data_path_base}AAM_CMIP6_HadGEM3_GC31_{ensemble_member}_1850-01_2014-12.nc")['AAM']
+        # Normalize dimension names immediately after loading
+        if 'latitude' in aam_full_latlon.dims and 'lat' not in aam_full_latlon.dims:
+            aam_full_latlon = aam_full_latlon.rename({'latitude': 'lat'})
+        if 'longitude' in aam_full_latlon.dims and 'lon' not in aam_full_latlon.dims:
+            aam_full_latlon = aam_full_latlon.rename({'longitude': 'lon'})
+        
+        clim_full_latlon = xr.open_dataset(f"{climatology_path_base}AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_{clim_start_yr}-{clim_end_yr}.nc")
+        # Normalize dimension names immediately after loading
+        if 'latitude' in clim_full_latlon.dims and 'lat' not in clim_full_latlon.dims:
+            clim_full_latlon = clim_full_latlon.rename({'latitude': 'lat'})
+        if 'longitude' in clim_full_latlon.dims and 'lon' not in clim_full_latlon.dims:
+            clim_full_latlon = clim_full_latlon.rename({'longitude': 'lon'})
+        
+        if ensemble_member == "r1i1p1f3":
+            print(f"\n[LAT×LON DEBUG] Processing lat×lon composite for {ensemble_member}")
+            lon_coord = 'lon' if 'lon' in aam_full_latlon.dims else 'longitude'
+            print(f"  aam_full_latlon BEFORE region selection: shape={aam_full_latlon.shape}, lon range=[{float(aam_full_latlon[lon_coord].values.min()):.1f}, {float(aam_full_latlon[lon_coord].values.max()):.1f}]")
+        
+        aam_full_latlon = _select_region(aam_full_latlon, args.region)
+        
+        if ensemble_member == "r1i1p1f3":
+            lon_coord = 'lon' if 'lon' in aam_full_latlon.dims else 'longitude'
+            print(f"  aam_full_latlon AFTER region selection: shape={aam_full_latlon.shape}, lon range=[{float(aam_full_latlon[lon_coord].values.min()):.1f}, {float(aam_full_latlon[lon_coord].values.max()):.1f}]")
+        aam_vs = vertical_sum_over_pressure_range(aam_full_latlon, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
+        
+        # CRITICAL: Apply region selection to climatology BEFORE vertical sum to match main data
+        clim_full_data = clim_full_latlon["AAM"] if isinstance(clim_full_latlon, xr.Dataset) and "AAM" in clim_full_latlon else clim_full_latlon
+        clim_full_data = _select_region(clim_full_data, args.region)
+        clim_vs = vertical_sum_over_pressure_range(clim_full_data, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
+        
+        # Normalize dimensions to match main data
+        if 'latitude' in aam_vs.dims and 'lat' not in aam_vs.dims:
+            aam_vs = aam_vs.rename({'latitude': 'lat'})
+        if 'longitude' in aam_vs.dims and 'lon' not in aam_vs.dims:
+            aam_vs = aam_vs.rename({'longitude': 'lon'})
+        if 'latitude' in clim_vs.dims and 'lat' not in clim_vs.dims:
+            clim_vs = clim_vs.rename({'latitude': 'lat'})
+        if 'longitude' in clim_vs.dims and 'lon' not in clim_vs.dims:
+            clim_vs = clim_vs.rename({'longitude': 'lon'})
+        
+        aam_full_latlon_r, clim_on_time = _reindex_to_climatology_dims(aam_vs, clim_vs)
+        anom_full_latlon = aam_full_latlon_r - clim_on_time
+        
+        stacked_full = []
+        seen_ev = set()
+        for onset_str, _ in date_list:
+            if not isinstance(onset_str, str):
+                onset_str = _time_value_to_ymd_string(onset_str)
+            ym = onset_str[:7]
+            if ym in seen_ev:
+                continue
+            seen_ev.add(ym)
+            window_start, window_end = _compute_composite_window_from_onset(
+                onset_str,
+                composite_months=int(args.composite_months),
+                composite_start=str(args.composite_start),
+            )
+            evt = anom_full_latlon.sel(time=slice(window_start, window_end))
+            if int(evt.sizes["time"]) < int(args.composite_months):
+                continue
+            evt = evt.isel(time=slice(0, int(args.composite_months)))
+            evt = evt.assign_coords(time=np.arange(1, int(args.composite_months) + 1, dtype=int))
+            if "month" in evt.coords:
+                evt = evt.drop_vars("month")
+            evt = evt.rename({"time": "month"})
+            stacked_full.append(evt)
+        
+        if stacked_full:
+            full_stack = xr.concat(stacked_full, dim="event")
+            rp = int(args.rolling_period)
+            if rp > 1:
+                n_month = int(full_stack.sizes["month"])
+                if rp <= n_month:
+                    left = rp // 2
+                    right = rp - left - 1
+                    _rolled = [full_stack.roll(month=-offset, roll_coords=False) for offset in range(-left, right + 1)]
+                    full_stack = xr.concat(_rolled, dim="_roll").mean("_roll", skipna=True)
+            
+            composite_full = full_stack.mean("event", skipna=True)
+            composite_full = composite_full.rename({"month": "time"})
+            
+            # Normalize dimension names before storing in results
+            if 'latitude' in composite_full.dims and 'lat' not in composite_full.dims:
+                composite_full = composite_full.rename({'latitude': 'lat'})
+            if 'longitude' in composite_full.dims and 'lon' not in composite_full.dims:
+                composite_full = composite_full.rename({'longitude': 'lon'})
+            
+            results['lat_lon_composite'] = composite_full.expand_dims({"ensemble": [ensemble_member]})
+        
+    except Exception as e:
+        print(f"Error processing ensemble member {ensemble_member}: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return results
+
+
 def composite_propagating_years_no_plot(
     AAM_da,
     wind_da,
@@ -306,12 +723,24 @@ def composite_propagating_years_no_plot(
     AAM_field = AAM_da["AAM"] if isinstance(AAM_da, xr.Dataset) and "AAM" in AAM_da else AAM_da
     if isinstance(AAM_field, xr.Dataset):
         AAM_field = next(iter(AAM_field.data_vars.values()))
+    
+    # --- Normalize dimension names to ensure consistency ---
+    if 'latitude' in AAM_field.dims and 'lat' not in AAM_field.dims:
+        AAM_field = AAM_field.rename({'latitude': 'lat'})
+    if 'longitude' in AAM_field.dims and 'lon' not in AAM_field.dims:
+        AAM_field = AAM_field.rename({'longitude': 'lon'})
 
     wind_field = None
     if wind_da is not None:
         wind_field = wind_da["ua"] if isinstance(wind_da, xr.Dataset) and "ua" in wind_da else wind_da
         if isinstance(wind_field, xr.Dataset):
             wind_field = next(iter(wind_field.data_vars.values()))
+        
+        # --- Normalize wind field dimension names ---
+        if 'latitude' in wind_field.dims and 'lat' not in wind_field.dims:
+            wind_field = wind_field.rename({'latitude': 'lat'})
+        if 'longitude' in wind_field.dims and 'lon' not in wind_field.dims:
+            wind_field = wind_field.rename({'longitude': 'lon'})
 
     # --- Zonal integral for AAM per latitude band
     # and zonal mean for wind (intensive quantity) ---
@@ -385,6 +814,11 @@ def composite_propagating_years_no_plot(
         if "month" in aam_event.coords:
             aam_event = aam_event.drop_vars("month")
         aam_event = aam_event.rename({"time": "month"})
+        
+        # Normalize latitude dimension name for consistency
+        if 'latitude' in aam_event.dims and 'lat' not in aam_event.dims:
+            aam_event = aam_event.rename({'latitude': 'lat'})
+        
         stacked_AAM.append(aam_event)
 
         if wind_field is not None:
@@ -398,6 +832,11 @@ def composite_propagating_years_no_plot(
             if "month" in wind_event.coords:
                 wind_event = wind_event.drop_vars("month")
             wind_event = wind_event.rename({"time": "month"})
+            
+            # Normalize latitude dimension name for consistency
+            if 'latitude' in wind_event.dims and 'lat' not in wind_event.dims:
+                wind_event = wind_event.rename({'latitude': 'lat'})
+            
             stacked_wind.append(wind_event)
 
     n_events = len(stacked_AAM)
@@ -417,7 +856,9 @@ def composite_propagating_years_no_plot(
         wind_stack = _circular_rolling_mean(wind_stack, dim="month", window=rolling_period)
         composite_wind = wind_stack.mean("event", skipna=True)
 
-    lat_dim = "latitude" if "latitude" in composite_AAM.dims else "lat"
+    lat_dim = "lat" if "lat" in composite_AAM.dims else ("latitude" if "latitude" in composite_AAM.dims else None)
+    if lat_dim is None:
+        raise ValueError(f"No latitude dimension found in composite data with dims {composite_AAM.dims}")
 
     aam_vals = composite_AAM.values  # (month, lat) or (lat, month)
     # ensure shape is (lat, month)
@@ -447,311 +888,176 @@ if __name__ == '__main__':
     ensemble_u_latlev = []
     ensemble_uv_vi_lat = []
     available_members = []
+    # Collect onset dates across ensemble members for histogram plotting
+    onset_dates = []
+    onset_members = []
+    # Collect per-event peak Nino3.4 amplitudes (positive values)
+    event_peak_amplitudes = []
     
-    for ensemble_member in [f"r{i}i1p1f3" for i in range(1, 3)]:
-    # Use OS to see whether the nc file exists before trying to open with xarray, to avoid long error messages from xarray when files are missing.
-        AAM_exist = os.path.exists(os.path.join(AAM_data_path_base, f"AAM_CMIP6_HadGEM3_GC31_{ensemble_member}_1850-01_2014-12.nc"))
-        clim_exist = os.path.exists(os.path.join(climatology_path_base, f"AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_{clim_start_yr}-{clim_end_yr}.nc"))
-        u_exist = os.path.exists(os.path.join(u_data_path_base, f"ua_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc"))
-        uv_exist = os.path.exists(os.path.join(uv_data_path_base, f"uv_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc"))
-        if not AAM_exist or not clim_exist or not u_exist or not uv_exist:
-            print(f"Skipping member {ensemble_member} because AAM file not found.")
-            continue
-        else:
-            available_members.append(ensemble_member)
-            print(f"Processing ensemble member: {ensemble_member}")
-    
-    for ensemble_member in tqdm.tqdm(available_members):
-        # Load AAM
-        AAM_da = xr.open_dataset(f"{AAM_data_path_base}AAM_CMIP6_HadGEM3_GC31_{ensemble_member}_1850-01_2014-12.nc")['AAM']
-        if "longitude" in AAM_da.dims or "lon" in AAM_da.dims:
-            AAM_da = _to_per_latitude_band(AAM_da)
+    if not replot:
+        
+        for ensemble_member in [f"r{i}i1p1f3" for i in range(1, 61)]:
+        # Use OS to see whether the nc file exists before trying to open with xarray, to avoid long error messages from xarray when files are missing.
+            AAM_path = os.path.join(AAM_data_path_base, f"AAM_CMIP6_HadGEM3_GC31_{ensemble_member}_1850-01_2014-12.nc")
+            AAM_exist = os.path.exists(AAM_path)
+            clim_path = os.path.join(climatology_path_base, f"AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_{clim_start_yr}-{clim_end_yr}.nc")
+            clim_exist = os.path.exists(clim_path)
+            u_path = os.path.join(u_data_path_base, f"ua_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc")
+            u_exist = os.path.exists(u_path)
+            uv_path = os.path.join(uv_data_path_base, f"uv_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc")
+            uv_exist = os.path.exists(uv_path)
             
-        u_da = xr.open_dataset(f"{u_data_path_base}/ua_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc")['ua']
+            if not AAM_exist or not clim_exist or not u_exist or not uv_exist:
+                if ensemble_member in ["r1i1p1f3"]:  # Only print for first member to avoid spam
+                    print(f"DEBUG: First member file check: AAM={AAM_exist}, clim={clim_exist}, u={u_exist}, uv={uv_exist}")
+                    print(f"  AAM_data_path_base: {AAM_data_path_base}")
+                print(f"Skipping member {ensemble_member} because files not found.")
+                continue
+            else:
+                available_members.append(ensemble_member)
+                print(f"Processing ensemble member: {ensemble_member}")
         
-        uv_da = xr.open_dataset(f"{uv_data_path_base}/uv_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc")['uv']
-        # uv data is already collapsed in longitude, only vertical levels and latitude remain
-
-        # Climatology
-        clim_da = xr.open_dataset(
-            f"{climatology_path_base}AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_{clim_start_yr}-{clim_end_yr}.nc")  #dims: month, level, latitude, longitude 
-
-        # u_da_zonal_band = _to_per_latitude_band(u_da) INCORRECT! DON'T DO THIS BECAUSE U IS NOT AREA WEIGHTED
-        u_da_zonal_band = u_da.mean(dim="longitude", skipna=True) if "longitude" in u_da.dims else u_da
+        # Parallelize ensemble member processing using joblib
+        n_jobs = int(n_cpus_to_use) if n_cpus_to_use != -1 else -1
+        print(f"Running ensemble processing with {n_jobs} worker(s)...")
         
-        # IMPORTANT: use the per-latitude-band + zonal-integral climatology (matches _to_per_latitude_band convention)
-        if 'longitude' in clim_da['AAM'].dims or 'lon' in clim_da['AAM'].dims:
-            clim_da = _to_per_latitude_band(clim_da['AAM'])
-        else:
-            clim_da = clim_da['AAM']
-        
-        # --- Step 1: Detect ENSO state windows from Nino3.4 ---
-        _onset_months_map: dict = {"all": None, "ndjfm": {11, 12, 1, 2, 3}}
-        onset_months_filter = _onset_months_map[args.onset_season]
-        date_list = detect_enso_state_windows(
-            start_yr=int(args.start_year),
-            end_yr=int(args.end_year),
-            ensemble_member=ensemble_member,
-            enso_state=str(args.enso_state),
-            threshold=float(args.nino_threshold),
-            min_consecutive_months=int(args.min_elnino_months),
-            onset_months=onset_months_filter,
-        )
-        if not date_list:
-            continue
-        
-        state_pretty = "El Nino" if args.enso_state == "el_nino" else "La Nina"
-
-        # # --- Step 2: Write JSON ---
-        # json_out = f"AAM_event_metrics_{args.start_year}_{args.end_year}.json"
-        # results_json = {
-        #     "config": {
-        #         "ensemble_member": ensemble_member,
-        #         "start_year": int(args.start_year),
-        #         "end_year": int(args.end_year),
-        #         "p_min_hpa": float(args.p_min),
-        #         "p_max_hpa": float(args.p_max),
-        #         "enso_state": str(args.enso_state),
-        #         "nino_threshold": float(args.nino_threshold),
-        #         "min_elnino_months": int(args.min_elnino_months),
-        #         "rolling_period": int(args.rolling_period),
-        #         "onset_season": str(args.onset_season),
-        #         "composite_months": int(args.composite_months),
-        #         "composite_start": str(args.composite_start),
-        #     },
-        #     "events": [
-        #         {
-        #             "event_id": int(i + 1),
-        #             "onset": onset,
-        #             "end": end,
-        #             "composite_window_start": _compute_composite_window_from_onset(
-        #                 onset,
-        #                 composite_months=int(args.composite_months),
-        #                 composite_start=str(args.composite_start),
-        #             )[0],
-        #             "composite_window_end": _compute_composite_window_from_onset(
-        #                 onset,
-        #                 composite_months=int(args.composite_months),
-        #                 composite_start=str(args.composite_start),
-        #             )[1],
-        #         }
-        #         for i, (onset, end) in enumerate(date_list)
-        #     ],
-        # }
-        # with open(json_out, "w", encoding="utf-8") as _f:
-        #     json.dump(results_json, _f, indent=2, sort_keys=False)
-        # print(f"Detected {len(date_list)} {state_pretty}-state onset event(s)")
-        # print(f"Wrote event JSON: {json_out}")
-        
-        p_selected,_ = pressure_range_in_coord_units(u_da.plev, p_min_hpa=u_level_to_plot, p_max_hpa=float(args.p_max))
-        u_level = u_da.sel(plev=p_selected, method="nearest") 
-        
-        u_zm = u_da_zonal_band
-        
-        aam_latlon = vertical_sum_over_pressure_range(AAM_da, p_min_hpa=float(args.p_min), p_max_hpa=float(args.p_max), level_dim="level")
-        
-        aam_latlev = AAM_da.sum(dim="longitude", skipna=True) if "longitude" in AAM_da.dims else AAM_da
-        
-        uv_vi = vertical_sum_over_pressure_range(uv_da, p_min_hpa=float(args.p_min), p_max_hpa=float(args.p_max), level_dim="plev")
-        
-        u_latlon_comp = compute_composite_field(u_level, date_list=date_list, args=args)
-        u_latlvl_zm_comp = compute_composite_field(u_zm, date_list=date_list, args=args)
-        uv_latlev_comp = compute_composite_field(uv_vi, date_list, args)
-        
-        u_latlon_comp = u_latlon_comp.expand_dims({"ensemble": [ensemble_member]})
-        u_latlev_comp = u_latlvl_zm_comp.expand_dims({"ensemble": [ensemble_member]})
-        uv_latlev_comp = uv_latlev_comp.expand_dims({"ensemble": [ensemble_member]})
-        
-        ensemble_u_latlon.append(u_latlon_comp)
-        ensemble_u_latlev.append(u_latlev_comp)
-        ensemble_uv_vi_lat.append(uv_latlev_comp)
-        
-        #--- Step 4: Composite AAM anomaly from ENSO onset windows ---
-        if date_list:
-            comp = composite_propagating_years_no_plot(
-                AAM_da,
-                wind_da=None,
-                date_list=date_list,
-                clim_da=clim_da,
-                clim_start_yr=clim_start_yr,
-                clim_end_yr=clim_end_yr,
-                p_min_hpa=float(args.p_min),
-                p_max_hpa=float(args.p_max),
-                enso_state=str(args.enso_state),
-                rolling_period=int(args.rolling_period),
-                composite_months=int(args.composite_months),
-                composite_start=str(args.composite_start),
-                onset_season=str(args.onset_season),
+        if JOBLIB_AVAILABLE and n_jobs != 1:
+            # Use parallel processing
+            results_list = Parallel(n_jobs=n_jobs)(
+                delayed(_process_single_ensemble_member)(
+                    member,
+                    clim_start_yr,
+                    clim_end_yr,
+                    args,
+                    AAM_data_path_base,
+                    climatology_path_base,
+                    u_data_path_base,
+                    uv_data_path_base,
+                    u_level_to_plot,
+                )
+                for member in tqdm.tqdm(available_members)
             )
-            if comp is not None:
-                comp = comp.expand_dims({"ensemble": [ensemble_member]})
-                ensemble_composites.append(comp)
-                
-        #--- Step 5: Latitude×level composite ---
-        #Re-uses the full multi-level AAM_da (all levels, all lats) but zonally integrates
-        #(removes longitude) before compositing. No vertical integration here — the snapshot
-        #function shows the full lat×level cross-section.
-        if date_list:
-            # Zonal integral only (keeps all pressure levels) → (time, level, latitude)
-            aam_full = AAM_da["AAM"] if isinstance(AAM_da, xr.Dataset) and "AAM" in AAM_da else AAM_da
-            if "longitude" in aam_full.dims or "lon" in aam_full.dims:
-                aam_full = _to_per_latitude_band(aam_full)
-
-            # Anomaly vs climatology (same pipeline as the rest of the script)
-            clim_full = clim_da["AAM"] if isinstance(clim_da, xr.Dataset) and "AAM" in clim_da else clim_da
-            aam_full, clim_on_time_full = _reindex_to_climatology_dims(aam_full, clim_full)
-            anom_full = aam_full - clim_on_time_full  # (time, level, latitude)
-
-            # Composite over events aligned to relative month 1..N
-            stacked_full = []
-            seen_ev: set = set()
-            for onset_str, _ in date_list:
-                if not isinstance(onset_str, str):
-                    onset_str = _time_value_to_ymd_string(onset_str)
-                ym = onset_str[:7]
-                if ym in seen_ev:
-                    continue
-                seen_ev.add(ym)
-                window_start, window_end = _compute_composite_window_from_onset(
-                    onset_str,
-                    composite_months=int(args.composite_months),
-                    composite_start=str(args.composite_start),
+        else:
+            # Sequential processing
+            results_list = []
+            for member in tqdm.tqdm(available_members):
+                result = _process_single_ensemble_member(
+                    member,
+                    clim_start_yr,
+                    clim_end_yr,
+                    args,
+                    AAM_data_path_base,
+                    climatology_path_base,
+                    u_data_path_base,
+                    uv_data_path_base,
+                    u_level_to_plot,
                 )
-                evt = anom_full.sel(time=slice(window_start, window_end))
-                if int(evt.sizes["time"]) < int(args.composite_months):
-                    print(f"  snapshot composite: onset {ym} window incomplete, skipping.")
-                    continue
-                evt = evt.isel(time=slice(0, int(args.composite_months)))
-                evt = evt.assign_coords(time=np.arange(1, int(args.composite_months) + 1, dtype=int))
-                if "month" in evt.coords:
-                    evt = evt.drop_vars("month")
-                evt = evt.rename({"time": "month"})
-                stacked_full.append(evt)
-
-            if stacked_full:
-                n_ev = len(stacked_full)
-                full_stack = xr.concat(stacked_full, dim="event")
-
-                # Apply circular rolling over relative-month bins before averaging events.
-                # This wraps across year-end, so NDJ uses Nov-Dec-Jan and DJF uses Dec-Jan-Feb.
-                rp = int(args.rolling_period)
-                if rp > 1:
-                    n_month = int(full_stack.sizes["month"])
-                    if rp > n_month:
-                        raise ValueError(
-                            f"rolling_period ({rp}) cannot exceed number of month bins ({n_month})"
-                        )
-                    left = rp // 2
-                    right = rp - left - 1
-                    _rolled = [
-                        full_stack.roll(month=-offset, roll_coords=False)
-                        for offset in range(-left, right + 1)
-                    ]
-                    full_stack = xr.concat(_rolled, dim="_roll").mean("_roll", skipna=True)
-
-                composite_full = full_stack.mean("event", skipna=True)
-                # Rename month → time so plot_latitude_level_snapshots_HadGEN3 sees a 'time' dim
-                composite_full = composite_full.rename({"month": "time"})
-                composite_full.attrs["long_name"] = "AAM anomaly"
-                _cmp = ">" if args.enso_state == "el_nino" else "<"
-                _snap_season_label = "  |  NDJFM onsets only" if args.onset_season == "ndjfm" else ""
-                _snap_suffix = (
-                    f"{state_pretty} state: Nino3.4{_cmp}{float(args.nino_threshold):.2f} "
-                    f"for >= {int(args.min_elnino_months)} months"
-                    f" | {int(args.composite_months)}-month composite from "
-                    f"{'Dec of onset year' if args.composite_start == 'december_onset_year' else 'onset month'}"
-                    f"{_snap_season_label}"
-                )
-                _snap_file_season = f"_{args.onset_season}" if args.onset_season != "all" else ""
-                composite_full = composite_full.expand_dims({"ensemble": [ensemble_member]})
-                ensemble_lat_lev_composites.append(composite_full)
+                results_list.append(result)
+        
+        # Combine results from all ensemble members
+        for result in results_list:
+            if result['composite'] is not None:
+                ensemble_composites.append(result['composite'])
+            if result['lat_lev_composite'] is not None:
+                ensemble_lat_lev_composites.append(result['lat_lev_composite'])
+            if result['lat_lon_composite'] is not None:
+                ensemble_lat_lon_composites.append(result['lat_lon_composite'])
+            if result['u_latlon'] is not None:
+                ensemble_u_latlon.append(result['u_latlon'])
+            if result['u_latlev'] is not None:
+                ensemble_u_latlev.append(result['u_latlev'])
+            if result['uv_vi'] is not None:
+                ensemble_uv_vi_lat.append(result['uv_vi'])
+            
+            onset_dates.extend(result['onset_dates'])
+            onset_members.extend(result['onset_members'])
+            event_peak_amplitudes.extend(result['peak_amplitudes'])
+        
+        number_of_available_members = len(available_members)
     
-        # Step 6: LAT*Lon composite snapshots plots
-        # IMPORTANT: Here we require different kind of Climatology not the latband version
-        aam_full = xr.open_dataset(f"{AAM_data_path_base}AAM_CMIP6_HadGEM3_GC31_{ensemble_member}_1850-01_2014-12.nc")['AAM']
-        clim_full = clim_da = xr.open_dataset(
-            f"{climatology_path_base}AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_{clim_start_yr}-{clim_end_yr}.nc"
-        )  # dims: month, level, latitude
+    else:
+        # replot=True: Load pre-computed ensemble mean composites from netCDF files
+        print("replot=True: Loading pre-computed ensemble mean composites from netCDF files...")
         
-        # Similar to Step 5 but without zonal integration, so the full lat×lon×level structure is retained.
-        if date_list:
-            # Vertical integral only (keeps all longitudes) → (time, latitude, longitude)
-            aam_vs = vertical_sum_over_pressure_range(aam_full, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
-            #import pdb; pdb.set_trace()
-            clim_full = clim_da["AAM"] if isinstance(clim_da, xr.Dataset) and "AAM" in clim_da else clim_da
-            clim_vs = vertical_sum_over_pressure_range(clim_full, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
-            # Anomaly vs climatology (same pipeline as the rest of the script)
-            clim_vs = clim_vs["AAM"] if isinstance(clim_vs, xr.Dataset) and "AAM" in clim_vs else clim_vs
-            aam_full, clim_on_time = _reindex_to_climatology_dims(aam_vs, clim_vs)
-            anom_full = aam_full - clim_on_time  # (time, latitude, longitude)
-            
-            #import pdb; pdb.set_trace()
-            
-            # Composite over events aligned to relative month 1..N
-            stacked_full = []
-            seen_ev: set = set()
-            for onset_str, _ in date_list:
-                if not isinstance(onset_str, str):
-                    onset_str = _time_value_to_ymd_string(onset_str)
-                ym = onset_str[:7]
-                if ym in seen_ev:
-                    continue
-                seen_ev.add(ym)
-                window_start, window_end = _compute_composite_window_from_onset(
-                    onset_str,
-                    composite_months=int(args.composite_months),
-                    composite_start=str(args.composite_start),
-                )
-                evt = anom_full.sel(time=slice(window_start, window_end))
-                if int(evt.sizes["time"]) < int(args.composite_months):
-                    continue
-                evt = evt.isel(time=slice(0, int(args.composite_months)))
-                evt = evt.assign_coords(time=np.arange(1, int(args.composite_months) + 1, dtype=int))
-                if "month" in evt.coords:
-                    evt = evt.drop_vars("month")
-                evt = evt.rename({"time": "month"})
-                stacked_full.append(evt)
-
-            if stacked_full:
-                n_ev = len(stacked_full)
-                full_stack = xr.concat(stacked_full, dim="event")
-
-                # Apply circular rolling over relative-month bins before averaging events.
-                # This wraps across year-end, so NDJ uses Nov-Dec-Jan and DJF uses Dec-Jan-Feb.
-                rp = int(args.rolling_period)
-                if rp > 1:
-                    n_month = int(full_stack.sizes["month"])
-                    if rp > n_month:
-                        raise ValueError(
-                            f"rolling_period ({rp}) cannot exceed number of month bins ({n_month})"
-                        )
-                    left = rp // 2
-                    right = rp - left - 1
-                    _rolled = [
-                        full_stack.roll(month=-offset, roll_coords=False)
-                        for offset in range(-left, right + 1)
-                    ]
-                    full_stack = xr.concat(_rolled, dim="_roll").mean("_roll", skipna=True)
-
-                composite_full = full_stack.mean("event", skipna=True)
-                # Rename month → time so plot_latitude_level_snapshots_HadGEN3 sees a 'time' dim
-                composite_full = composite_full.rename({"month": "time"})
-                composite_full.attrs["long_name"] = "AAM anomaly"
-                _cmp = ">" if args.enso_state == "el_nino" else "<"
-                _snap_season_label = "  |  NDJFM onsets only" if args.onset_season == "ndjfm" else ""
-                _snap_suffix = (
-                    f"{state_pretty} state: Nino3.4{_cmp}{float(args.nino_threshold):.2f} "
-                    f"for >= {int(args.min_elnino_months)} months"
-                    f" | {int(args.composite_months)}-month composite from "
-                    f"{'Dec of onset year' if args.composite_start == 'december_onset_year' else 'onset month'}"
-                    f"{_snap_season_label}"
-                )
-                _snap_file_season = f"_{args.onset_season}" if args.onset_season != "all" else ""
-
-                composite_full = composite_full.expand_dims({"ensemble": [ensemble_member]})
-                ensemble_lat_lon_composites.append(composite_full)
+        # Construct filenames based on command-line args
+        region_label = args.region.upper() if args.region != 'all' else 'GLOBAL'
         
-    number_of_available_members = len(available_members)
+        # Load main composite
+        main_nc_path = os.path.join(
+            ensemble_mean_output_path,
+            f"AAM_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{region_label}_{args.onset_season}_start_{args.composite_start}_ninothres{float(args.nino_threshold)}.nc",
+        )
+        if os.path.exists(main_nc_path):
+            print(f"  Loading main composite from {os.path.basename(main_nc_path)}")
+            ens_mean_main = xr.open_dataset(main_nc_path)["AAMA"]
+            ensemble_composites.append(ens_mean_main)
+        else:
+            print(f"  WARNING: Main composite file not found at {main_nc_path}")
+        
+        # Load lat×level composite
+        latlev_nc_path = os.path.join(
+            ensemble_mean_output_path,
+            f"AAM_lat_lev_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_{region_label.lower()}_ninothres{float(args.nino_threshold)}.nc",
+        )
+        if os.path.exists(latlev_nc_path):
+            print(f"  Loading lat×level composite from {os.path.basename(latlev_nc_path)}")
+            ens_mean_latlev = xr.open_dataset(latlev_nc_path)["AAMA"]
+            ensemble_lat_lev_composites.append(ens_mean_latlev)
+            
+            # Also load zonal wind for lat×level
+            u_latlev_path = os.path.join(
+                ensemble_mean_output_path,
+                f"U_lat_lev_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_{region_label.lower()}_ninothres{float(args.nino_threshold)}.nc",
+            )
+            if os.path.exists(u_latlev_path):
+                ens_mean_u_latlev_file = xr.open_dataset(u_latlev_path)["u"]
+                ensemble_u_latlev.append(ens_mean_u_latlev_file)
+        else:
+            print(f"  WARNING: Lat×level composite file not found at {latlev_nc_path}")
+        
+        # Load lat×lon composite
+        latlon_nc_path = os.path.join(
+            ensemble_mean_output_path,
+            f"AAM_lat_lon_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_{region_label.lower()}_ninothres{float(args.nino_threshold)}.nc",
+        )
+        if os.path.exists(latlon_nc_path):
+            print(f"  Loading lat×lon composite from {os.path.basename(latlon_nc_path)}")
+            ens_mean_latlon = xr.open_dataset(latlon_nc_path)["AAMA"]
+            ensemble_lat_lon_composites.append(ens_mean_latlon)
+            
+            # Also load wind fields for lat×lon
+            u_latlon_path = os.path.join(
+                ensemble_mean_output_path,
+                f"U_lat_lon_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_{region_label.lower()}_ninothres{float(args.nino_threshold)}.nc",
+            )
+            if os.path.exists(u_latlon_path):
+                ens_mean_u_latlon_file = xr.open_dataset(u_latlon_path)["u"]
+                ensemble_u_latlon.append(ens_mean_u_latlon_file)
+            
+            uv_latlon_path = os.path.join(
+                ensemble_mean_output_path,
+                f"UV_lat_lon_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_{region_label.lower()}_ninothres{float(args.nino_threshold)}.nc",
+            )
+            if os.path.exists(uv_latlon_path):
+                ens_mean_uv_latlev_file = xr.open_dataset(uv_latlon_path)["uv"]
+                ensemble_uv_vi_lat.append(ens_mean_uv_latlev_file)
+        else:
+            print(f"  WARNING: Lat×lon composite file not found at {latlon_nc_path}")
+        
+        number_of_available_members = 0  # placeholder for loaded replot mode
+    
+    _cmp = ">" if args.enso_state == "el_nino" else "<"
+    _snap_season_label = "  |  NDJFM onsets only" if args.onset_season == "ndjfm" else ""
+    _snap_suffix = (
+                        f"{args.enso_state} state: Nino3.4{_cmp}{float(args.nino_threshold):.2f} "
+                        f"for >= {int(args.min_elnino_months)} months"
+                        f" | {int(args.composite_months)}-month composite from "
+                        f"{'Dec of onset year' if args.composite_start == 'december_onset_year' else 'onset month'}"
+                        f"{_snap_season_label}"
+                    )
+    
+    # Determine region label for filenames (used in all composite plots)
+    region_label = args.region.upper() if args.region != 'all' else 'GLOBAL'
     
     if ensemble_composites:
         try:
@@ -815,7 +1121,8 @@ if __name__ == '__main__':
             # -------------------------------
             fig, ax = plt.subplots(figsize=(10, 6))
             fig.subplots_adjust(bottom=0.18)
-
+            
+            #vmax = 5e24
             vmax = float(np.nanpercentile(np.abs(aam_vals), 98))
             vmax = vmax if vmax > 0 else 1.0
             vmin = -vmax
@@ -897,17 +1204,30 @@ if __name__ == '__main__':
 
             out_path = os.path.join(
                 output_dir,
-                f"AAM_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}.png",
+                f"AAM_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{region_label}_{args.onset_season}_start_{args.composite_start}_ninothres{float(args.nino_threshold)}.png",
             )
 
             fig.savefig(out_path, dpi=300, bbox_inches="tight")
             plt.close(fig)
 
             print(f"Ensemble mean composite plot saved to {out_path}")
-
+            
+            if save_ensemble_mean_netcdf:
+                # Output the ensemble mean composite data as netCDF for future analysis
+                out_nc_path = os.path.join(
+                    ensemble_mean_output_path,
+                    f"AAM_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{region_label}_{args.onset_season}_start_{args.composite_start}_ninothres{float(args.nino_threshold)}.nc",
+                )
+                ens_mean.name = "AAMA"
+                ens_mean.attrs["n_ensemble_members"] = int(ens_stack.sizes["ensemble"])
+                ens_mean.to_netcdf(out_nc_path)
+                print(f"Ensemble mean composite data saved to {out_nc_path}")
         except Exception as e:
             print(f"Error plotting ensemble mean composite: {e}")
             import pdb; pdb.set_trace()
+    
+    if not ensemble_lat_lev_composites:
+        print(f"WARNING: No ensemble lat×level composites computed for region '{args.region}'. Skipping lat×level plots.")
     
     if ensemble_lat_lev_composites:
         try:
@@ -917,7 +1237,8 @@ if __name__ == '__main__':
             ens_stack = xr.concat(ensemble_u_latlev, dim="ensemble")
             ens_mean_u_latlev = ens_stack.mean("ensemble", skipna=True)
             # Rename month dimension to time for compatibility with plotting function
-            ens_mean_u_latlev = ens_mean_u_latlev.rename({"month": "time"})
+            if "month" in ens_mean_u_latlev.coords and "time" not in ens_mean_u_latlev.coords:
+                ens_mean_u_latlev = ens_mean_u_latlev.rename({"month": "time"})
 
             print(f"Plotting ENSEMBLE MEAN lat×level composite from {ens_stack.sizes['ensemble']} members...")
 
@@ -930,30 +1251,105 @@ if __name__ == '__main__':
                 clim_start_yr=clim_start_yr,
                 clim_end_yr=clim_end_yr,
                 output_dir=output_dir,
-                title_suffix= f"{number_of_available_members} Ensemble Mean " + _snap_suffix,
+                title_suffix= f"{number_of_available_members} Ensemble Mean {region_label} | " + _snap_suffix,
                 rolling_period=int(args.rolling_period),
-                filename_suffix=f"_ensemble_mean_{args.enso_state}",
+                filename_suffix=f"_ensemble_mean_{args.enso_state}_{region_label.lower()}",
+                dec_onset_month=args.composite_start,
+                onset_season_ndjfm=args.onset_season,
+                nino_threshold=float(args.nino_threshold),
             )
+            
+            if save_ensemble_mean_netcdf:
+                # Output the ensemble mean composite data as netCDF for future analysis
+                out_nc_path = os.path.join(
+                    ensemble_mean_output_path,
+                    f"AAM_lat_lev_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_{region_label.lower()}_ninothres{float(args.nino_threshold)}.nc",
+                )
+                ens_mean.name = "AAMA"
+                ens_mean.attrs["n_ensemble_members"] = int(ens_stack.sizes["ensemble"])
+                ens_mean.to_netcdf(out_nc_path)
+                print(f"Ensemble mean composite data saved to {out_nc_path}")
+
+                out_nc_path = os.path.join(
+                    ensemble_mean_output_path,
+                    f"U_lat_lev_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_{region_label.lower()}_ninothres{float(args.nino_threshold)}.nc",
+                )
+                ens_mean_u_latlev.name = "u"
+                ens_mean_u_latlev.attrs["n_ensemble_members"] = int(ens_stack.sizes["ensemble"])
+                ens_mean_u_latlev.to_netcdf(out_nc_path)
+                print(f"Ensemble mean zonal wind composite data saved to {out_nc_path}")
+                
         except Exception as e:
             print(f"Error plotting ensemble mean lat×level composite: {e}")
             import pdb; pdb.set_trace()
+    
+    if not ensemble_lat_lon_composites:
+        print(f"WARNING: No ensemble lat×lon composites computed for region '{args.region}'. Skipping lat×lon plots.")
         
+    
     if ensemble_lat_lon_composites:
         try:
             ens_stack = xr.concat(ensemble_lat_lon_composites, dim="ensemble")
             ens_mean = ens_stack.mean("ensemble", skipna=True)
             
+            print(f"\n[ENSEMBLE MEAN DEBUG]")
+            print(f"  ens_stack shape: {ens_stack.shape}")
+            print(f"  ens_stack lon range: [{float(ens_stack['lon'].values.min()):.1f}, {float(ens_stack['lon'].values.max()):.1f}]")
+            print(f"  ens_mean shape: {ens_mean.shape}")
+            print(f"  ens_mean lon range BEFORE safety check: [{float(ens_mean['lon'].values.min()):.1f}, {float(ens_mean['lon'].values.max()):.1f}]")
+            
             ens_stack = xr.concat(ensemble_u_latlon, dim="ensemble")
             ens_mean_u_latlon = ens_stack.mean("ensemble", skipna=True)
             # Rename month dimension to time for compatibility with plotting function
-            ens_mean_u_latlon = ens_mean_u_latlon.rename({"month": "time"})
-
+            if "month" in ens_mean_u_latlon.dims and "time" not in ens_mean_u_latlon.dims:
+                ens_mean_u_latlon = ens_mean_u_latlon.rename({"month": "time"})
+                
             ens_stack = xr.concat(ensemble_uv_vi_lat, dim="ensemble")
             ens_mean_uv_latlev = ens_stack.mean("ensemble", skipna=True)
-            ens_mean_uv_latlev = ens_mean_uv_latlev.rename({"month": "time"})
+            if "month" in ens_mean_uv_latlev.dims and "time" not in ens_mean_uv_latlev.dims:
+                ens_mean_uv_latlev = ens_mean_uv_latlev.rename({"month": "time"})
+            
+            # Normalize dimension names (region selection was already applied in _process_single_ensemble_member)
+            # Rename longitude → lon
+            if 'longitude' in ens_mean.dims:
+                ens_mean = ens_mean.rename({'longitude': 'lon'})
+            if 'longitude' in ens_mean_u_latlon.dims:
+                ens_mean_u_latlon = ens_mean_u_latlon.rename({'longitude': 'lon'})
+            if 'longitude' in ens_mean_uv_latlev.dims:
+                ens_mean_uv_latlev = ens_mean_uv_latlev.rename({'longitude': 'lon'})
+            
+            # Rename latitude → lat
+            if 'latitude' in ens_mean.dims:
+                ens_mean = ens_mean.rename({'latitude': 'lat'})
+            if 'latitude' in ens_mean_u_latlon.dims:
+                ens_mean_u_latlon = ens_mean_u_latlon.rename({'latitude': 'lat'})
+            if 'latitude' in ens_mean_uv_latlev.dims:
+                ens_mean_uv_latlev = ens_mean_uv_latlev.rename({'latitude': 'lat'})
+            
+            # Force region selection immediately before plotting to guarantee slice correctness.
+            if args.region != 'all' and 'lon' in ens_mean.dims:
+                ens_mean = _select_region(ens_mean, args.region)
+                if 'lon' in ens_mean_u_latlon.dims:
+                    ens_mean_u_latlon = _select_region(ens_mean_u_latlon, args.region)
+                if 'lon' in ens_mean_uv_latlev.dims:
+                    ens_mean_uv_latlev = _select_region(ens_mean_uv_latlev, args.region)
+
+                lon_actual_min = float(ens_mean['lon'].values.min())
+                lon_actual_max = float(ens_mean['lon'].values.max())
+                n_lon_actual = int(ens_mean.sizes['lon'])
+                print(f"\n[REGION DEBUG] Region requested: {args.region}")
+                print(f"[REGION DEBUG] Final plot slice lon range [{lon_actual_min:.1f}, {lon_actual_max:.1f}], n_lon={n_lon_actual}")
+
+            print(f"\n[PRE-PLOT CHECK] About to plot lat×lon composite:")
+            print(f"  ens_mean shape: {ens_mean.shape}")
+            print(f"  ens_mean lon range: [{float(ens_mean['lon'].values.min()):.1f}, {float(ens_mean['lon'].values.max()):.1f}]")
+            print(f"  ens_mean lat range: [{float(ens_mean['lat'].values.min()):.1f}, {float(ens_mean['lat'].values.max()):.1f}]")
+            print(f"  ens_mean_u_latlon shape: {ens_mean_u_latlon.shape}")
+            print(f"  ens_mean_uv_latlev shape: {ens_mean_uv_latlev.shape}")
+            print(f"  Passing region='{args.region}' to plot_lat_lon_snapshots()")
 
             print(f"Plotting ENSEMBLE MEAN lat×lon composite from {ens_stack.sizes['ensemble']} members...")
-
+            
             plot_lat_lon_snapshots(
                 ens_mean,
                 zonal_wind_da=ens_mean_u_latlon,
@@ -963,14 +1359,110 @@ if __name__ == '__main__':
                 end_year=args.end_year,
                 clim_start_yr=clim_start_yr,
                 clim_end_yr=clim_end_yr,
-                title_suffix=f"{number_of_available_members} Ensemble Mean " + _snap_suffix,
+                title_suffix=f"{number_of_available_members} Ensemble Mean {region_label} | " + _snap_suffix,
                 rolling_period=int(args.rolling_period),
-                filename_suffix=f"_ensemble_mean_{args.enso_state}",
+                filename_suffix=f"_ensemble_mean_{args.enso_state}_{region_label.lower()}",
                 uv_latlev_profile=ens_mean_uv_latlev,
                 pmin=float(args.p_min),
                 pmax=float(args.p_max),
+                nino_threshold=float(args.nino_threshold),
+                region=args.region,
             )
+            
+            if save_ensemble_mean_netcdf:
+                out_nc_path = os.path.join(
+                ensemble_mean_output_path,
+                f"AAM_lat_lon_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_{region_label.lower()}_ninothres{float(args.nino_threshold)}.nc",
+                )
+                ens_mean.name = "AAMA"
+                ens_mean.attrs["n_ensemble_members"] = int(ens_stack.sizes["ensemble"])
+                ens_mean.to_netcdf(out_nc_path)
+                print(f"Ensemble mean composite data saved to {out_nc_path}")
+
+                out_nc_path = os.path.join(
+                    ensemble_mean_output_path,
+                    f"U_lat_lon_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_{region_label.lower()}_ninothres{float(args.nino_threshold)}.nc",
+                )
+                ens_mean_u_latlon.name = "u"
+                ens_mean_u_latlon.attrs["n_ensemble_members"] = int(ens_stack.sizes["ensemble"])
+                ens_mean_u_latlon.to_netcdf(out_nc_path)
+                print(f"Ensemble mean zonal wind composite data saved to {out_nc_path}")
+                
+                out_nc_path = os.path.join(
+                    ensemble_mean_output_path,
+                    f"UV_lat_lon_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_{region_label.lower()}_ninothres{float(args.nino_threshold)}.nc",
+                )
+                ens_mean_uv_latlev.name = "uv"
+                ens_mean_uv_latlev.attrs["n_ensemble_members"] = int(ens_stack.sizes["ensemble"])
+                ens_mean_uv_latlev.to_netcdf(out_nc_path)
+                print(f"Ensemble mean UV composite data saved to {out_nc_path}")
+                
         except Exception as e:
             print(f"Error plotting ensemble mean lat×lon composite: {e}")
             import pdb; pdb.set_trace()
+    
+    # =============================================================================
+    # Plot histogram of ENSO onset months across ensemble members and years
+    if 'onset_dates' in locals() and onset_dates:
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            onset_pd = pd.to_datetime(onset_dates)
+            months = onset_pd.month
+
+            # Counts per calendar month (1=Jan .. 12=Dec)
+            counts = months.value_counts().sort_index()
+            month_idx = list(range(1, 13))
+            counts_list = [int(counts.get(m, 0)) for m in month_idx]
+            month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+            fig, ax = plt.subplots(figsize=(10, 4))
+            x = np.arange(len(month_names))
+            ax.bar(x, counts_list, width=1.0, align='center', color='C1', edgecolor='black', linewidth=0.5)
+            ax.set_xticks(x)
+            ax.set_xticklabels(month_names)
+            ax.set_xlim(-0.5, len(month_names) - 0.5)
+            ax.set_xlabel('Onset month')
+            ax.set_ylabel(f'Event count (across ensemble members and years)')
+            ax.set_title(f'ENSO onset month histogram ({args.enso_state}) {number_of_available_members} members {args.start_year}-{args.end_year}')
+
+            out_hist_path = os.path.join(
+                output_dir,
+                f"ENSO_onset_months_histogram_{args.enso_state}_{args.start_year}-{args.end_year}_ninothres{float(args.nino_threshold)}.png",
+            )
+            fig.savefig(out_hist_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+            print(f"Saved onset months histogram to {out_hist_path}")
+        except Exception as e:
+            print(f"Error generating onset month histogram: {e}")
+            import traceback; traceback.print_exc()
+        # Plot histogram of per-event peak Nino3.4 amplitudes (0.5 bins starting at 0.5)
+        if event_peak_amplitudes:
+            try:
+                peaks = np.asarray(event_peak_amplitudes, dtype=float)
+                if peaks.size > 0:
+                    bin_width = 0.5
+                    max_peak = float(np.nanmax(peaks))
+                    # ensure at least one bin centered at 0.5
+                    max_center = max(bin_width, np.ceil(max_peak / bin_width) * bin_width)
+                    bin_centers = np.arange(bin_width, max_center + bin_width / 2, bin_width)
+                    bin_edges = np.concatenate(([bin_centers[0] - bin_width / 2], bin_centers + bin_width / 2))
+                    counts, _ = np.histogram(peaks, bins=bin_edges)
+
+                    fig, ax = plt.subplots(figsize=(8, 4))
+                    ax.bar(bin_centers, counts, width=bin_width, align='center', color='C2', edgecolor='black', linewidth=0.5)
+                    ax.set_xticks(bin_centers)
+                    ax.set_xlabel('Event peak Nino3.4 (|°C|)')
+                    ax.set_ylabel('Event count (across ensemble members and years)')
+                    ax.set_title(f'ENSO event peak Nino3.4 histogram ({args.enso_state}) {number_of_available_members} members {args.start_year}-{args.end_year}')
+
+                    out_hist_peaks = os.path.join(
+                        output_dir,
+                        f"ENSO_event_peak_nino34_histogram_{args.enso_state}_{args.start_year}-{args.end_year}_bin{bin_width}_ninothres{float(args.nino_threshold)}.png",
+                    )
+                    fig.savefig(out_hist_peaks, dpi=300, bbox_inches='tight')
+                    plt.close(fig)
+                    print(f"Saved event peak Nino3.4 histogram to {out_hist_peaks}")
+            except Exception as e:
+                print(f"Error generating event-peak Nino3.4 histogram: {e}")
+                import traceback; traceback.print_exc()
         

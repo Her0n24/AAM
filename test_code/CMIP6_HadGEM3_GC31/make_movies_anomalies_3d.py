@@ -19,15 +19,26 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from plotting_utils import ensure_dir, plot_latitude_level_movie_HadGEM3  # noqa: E402
+from utilities import vertical_sum_over_pressure_range, _reindex_to_climatology_dims, pressure_range_in_coord_units
+
+# Vertical integration range for lat-lon movie (hPa)
+P_MIN_HPA = 150.0
+P_MAX_HPA = 700.0
+MOVIE_FPS = 4
 
 
 base_dir = os.getcwd()
-AAM_data_path_base = f"{base_dir}/monthly_mean/AAM/"
-climatology_path_base = f"{base_dir}/climatology/"
+# AAM_data_path_base = f"{base_dir}/monthly_mean/AAM/"
+# climatology_path_base = f"{base_dir}/climatology/"
 
-CMIP6_path_base = "/gws/nopw/j04/leader_epesc/CMIP6_SinglForcHistSimul"
-u_directory = f"{CMIP6_path_base}/InterpolatedFlds/Amon/ua/historical/HadGEM3-GC31-LL/"
-output_dir = f"{base_dir}/figures/"
+# CMIP6_path_base = "/gws/nopw/j04/leader_epesc/CMIP6_SinglForcHistSimul"
+# u_directory = f"{CMIP6_path_base}/InterpolatedFlds/Amon/ua/historical/HadGEM3-GC31-LL/"
+output_dir = f"{base_dir}/animation/"
+
+CMIP6_path_base = "/work/scratch-nopw2/hhhn2"
+u_directory = f"{CMIP6_path_base}/HadGEM3-GC31-LL/Amon/ua/historical/"
+climatology_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/AAM/climatology/"
+AAM_data_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/AAM/full/"
 
 # Create output directory if it doesn't exist
 ensure_dir(output_dir)
@@ -86,7 +97,7 @@ def calculate_climatology(aam_file, clim_start_yr, clim_end_yr, ensemble_member,
     Returns the climatology DataArray.
     """
     # IMPORTANT: keep cache filename distinct from older zonal-mean climatologies.
-    clim_kind = "latband_lonint"
+    clim_kind = ''
     clim_file = (
         f"{climatology_path_base}AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_"
         f"{clim_start_yr}-{clim_end_yr}_{clim_kind}.nc"
@@ -94,7 +105,7 @@ def calculate_climatology(aam_file, clim_start_yr, clim_end_yr, ensemble_member,
     
     if os.path.exists(clim_file):
         print(f"Loading existing climatology from: {clim_file}")
-        ds_climatology = xr.open_dataset(clim_file)
+        ds_climatology = _safe_open_dataset(clim_file)
         try:
             if component not in ds_climatology.data_vars:
                 raise KeyError(f"variable '{component}' not found in climatology file")
@@ -106,9 +117,38 @@ def calculate_climatology(aam_file, clim_start_yr, clim_end_yr, ensemble_member,
             kind = str(da.attrs.get('climatology_kind', ''))
             if (zr, ls, kind) != ('integral_radians', 'dphi_radians', clim_kind):
                 print(
-                    "Cached climatology exists but does not match per-lat-band convention; recomputing. "
+                    "Cached climatology exists but does not match per-lat-band convention; attempting conversion. "
                     f"(zonal_reduction={zr!r}, lat_scaling={ls!r}, kind={kind!r})"
                 )
+
+                # If the cached climatology is full-field (contains longitude), try to convert it
+                lon_dim = 'longitude' if 'longitude' in da.dims else ('lon' if 'lon' in da.dims else None)
+                if lon_dim is not None:
+                    try:
+                        # If climatology uses 'time' instead of 'month', aggregate into months
+                        if 'month' not in da.dims and 'time' in da.dims:
+                            try:
+                                da_monthly = da.groupby('time.month').mean(dim='time')
+                            except Exception:
+                                da_monthly = da
+                        else:
+                            da_monthly = da
+
+                        da_band = _to_per_latitude_band(da_monthly)
+                        da_band.attrs = dict(da.attrs)
+                        da_band.attrs['zonal_reduction'] = 'integral_radians'
+                        da_band.attrs['lat_scaling'] = 'dphi_radians'
+                        da_band.attrs['climatology_kind'] = clim_kind
+
+                        # Save converted climatology (overwrite)
+                        encoding = {component: {'zlib': True, 'complevel': 4, 'dtype': 'float32'}}
+                        da_band.to_dataset(name=component).to_netcdf(clim_file, encoding=encoding)
+                        print(f"Converted full-field climatology saved to: {clim_file}")
+                        return da_band
+                    except Exception as exc:
+                        print(f"Failed to convert cached full-field climatology: {exc}; will recompute from full-field AAM.")
+                else:
+                    print("Cached climatology is missing longitude dimension; will recompute from full-field AAM.")
             else:
                 return da
         finally:
@@ -117,7 +157,7 @@ def calculate_climatology(aam_file, clim_start_yr, clim_end_yr, ensemble_member,
     print(f"Calculating climatology for AAM from {clim_start_yr} to {clim_end_yr}")
     
     # Load full field data
-    ds = xr.open_dataset(aam_file)
+    ds = _safe_open_dataset(aam_file)
     try:
         if component not in ds.data_vars:
             raise KeyError(f"variable '{component}' not found in dataset")
@@ -156,6 +196,55 @@ def calculate_climatology(aam_file, clim_start_yr, clim_end_yr, ensemble_member,
         return da_climatology
     finally:
         ds.close()
+def _safe_open_dataset(path, **kwargs):
+    """
+    Robustly open a dataset using xarray. Attempts:
+      - glob pattern -> open_mfdataset
+      - xr.open_dataset (default)
+      - explicit engines: netcdf4, h5netcdf, scipy
+    Raises FileNotFoundError if path not found.
+    """
+    if path is None:
+        raise ValueError("No path provided to open")
+
+    # Expand glob patterns
+    matches = sorted(glob.glob(path))
+    # include the literal path if it exists but wasn't matched by glob
+    if os.path.exists(path) and os.path.isfile(path) and path not in matches:
+        matches = [path]
+
+    # If multiple files matched, try open_mfdataset
+    if len(matches) > 1:
+        try:
+            return xr.open_mfdataset(matches, combine='by_coords', **kwargs)
+        except Exception:
+            # fall back to trying to open single file
+            pass
+
+    # Determine file to open
+    file_to_open = matches[0] if len(matches) == 1 else path
+    if not os.path.exists(file_to_open):
+        raise FileNotFoundError(f"Input file not found: {file_to_open!r}")
+
+    last_exc = None
+    # Try default open first
+    try:
+        return xr.open_dataset(file_to_open, **kwargs)
+    except Exception as exc:
+        last_exc = exc
+
+    # Try some common engines explicitly
+    for engine in ('netcdf4', 'h5netcdf', 'scipy'):
+        try:
+            return xr.open_dataset(file_to_open, engine=engine, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+
+    raise ValueError(
+        f"Failed to open dataset {file_to_open!r} with xarray; tried engines netcdf4/h5netcdf/scipy. "
+        f"Original error: {last_exc}"
+    )
+
 
 
 def plot_anomalies_3d(
@@ -192,7 +281,7 @@ def plot_anomalies_3d(
     da_climatology = calculate_climatology(aam_file, clim_start_yr, clim_end_yr, ensemble_member)
     
     # Load time series data
-    ds = xr.open_dataset(aam_file)
+    ds = _safe_open_dataset(aam_file)
     aam_full = ds['AAM']
     
     # Make missing values NaN explicitly to prevent artefacts
@@ -350,10 +439,157 @@ def plot_anomalies_3d(
         end_year=end_year,
         clim_start_yr=clim_start_yr,
         clim_end_yr=clim_end_yr,
-        vpercentile=95.0,
+        vpercentile=99.0,
         cmap_name='RdBu_r',
         find_extremum=find_extremum,
     )
+
+    # === LAT-LON MOVIE ===
+    def render_latlon_movie(aam_period, u_dataset, pmin_hpa=P_MIN_HPA, pmax_hpa=P_MAX_HPA, fps=MOVIE_FPS):
+        """Render a lat×lon MP4 movie of vertical-summed AAM anomalies.
+
+        Parameters
+        ----------
+        aam_period : xr.DataArray
+            Full-field AAM DataArray limited to the selected time period (time, level, lat, lon)
+        u_dataset : xr.Dataset or xr.DataArray | None
+            Zonal wind dataset (same time range) used for optional overlay.
+        """
+        import matplotlib.animation as animation
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+
+        # Vertical sum to produce lat×lon field (time, lat, lon)
+        try:
+            aam_vs = vertical_sum_over_pressure_range(aam_period, p_min_hpa=pmin_hpa, p_max_hpa=pmax_hpa, level_dim='level')
+        except Exception as e:
+            print(f"Could not compute vertical sum for lat-lon movie: {e}")
+            return
+
+        # Monthly climatology and anomaly
+        try:
+            clim_vs = aam_vs.groupby('time.month').mean('time')
+            aam_vs, clim_on_time_vs = _reindex_to_climatology_dims(aam_vs, clim_vs)
+            anom_vs = aam_vs - clim_on_time_vs
+        except Exception as e:
+            print(f"Could not compute lat-lon anomalies: {e}")
+            return
+
+        # Ensure time coords are pandas Timestamps (match earlier conversion)
+        try:
+            anom_vs = anom_vs.assign_coords(time=aam_band.time)
+        except Exception:
+            pass
+
+        lat_vals = anom_vs['latitude'].values
+        lon_vals = anom_vs['longitude'].values
+        n_times = int(anom_vs.sizes['time'])
+
+        # Patch longitudes if needed (add +180 column for seamless plotting)
+        lon_step = np.round(np.diff(lon_vals).mean(), 6) if len(lon_vals) > 1 else None
+        if lon_step is not None and np.isclose(lon_vals[0], -180) and not np.isclose(lon_vals[-1], 180):
+            new_lon_vals = np.append(lon_vals, 180.0)
+            arr = anom_vs.values
+            arr_patched = np.concatenate([arr, arr[..., 0:1]], axis=-1)
+            anom_vs = xr.DataArray(arr_patched, dims=anom_vs.dims, coords={**anom_vs.coords, 'longitude': new_lon_vals}, attrs=anom_vs.attrs)
+            lon_vals = new_lon_vals
+
+        # Prepare wind overlay at a single pressure level if possible
+        wind_field_for_overlay = None
+        if u_dataset is not None:
+            try:
+                wind_var = 'ua' if 'ua' in u_dataset.data_vars else list(u_dataset.data_vars)[0]
+                u_full = u_dataset[wind_var]
+                # select the same time slice as aam_period if possible
+                try:
+                    u_sel = u_full.sel(time=anom_vs.time)
+                except Exception:
+                    n = min(u_full.sizes.get('time', 0), anom_vs.sizes.get('time', 0))
+                    u_sel = u_full.isel(time=slice(0, n)) if n > 0 else u_full
+                # pick a representative level (nearest 250 hPa)
+                try:
+                    p_sel, _ = pressure_range_in_coord_units(u_sel[u_sel.dims[-1]] if 'plev' not in u_sel.dims else u_sel.plev, p_min_hpa=250.0, p_max_hpa=250.0)
+                except Exception:
+                    p_sel = None
+                if p_sel is not None and 'plev' in u_sel.dims:
+                    wind_field_for_overlay = u_sel.sel(plev=p_sel, method='nearest')
+                else:
+                    # if no plev, just try to use the first level/time-sliced array
+                    wind_field_for_overlay = u_sel
+            except Exception:
+                wind_field_for_overlay = None
+
+        # Build figure with explicit dpi and canvas attachment for headless rendering
+        # Switch to Agg backend explicitly for headless environments
+        import matplotlib
+        matplotlib.use('Agg')
+        
+        fig = plt.figure(figsize=(12, 6), dpi=200)
+        
+        # Attach Agg canvas immediately (before adding axes) to ensure dpi is accessible to writer
+        try:
+            from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+            canvas = FigureCanvas(fig)
+            fig.canvas = canvas
+            # Force draw to initialize the canvas properly
+            fig.canvas.draw()
+        except Exception as e:
+            print(f"Warning: Could not attach/draw FigureCanvas: {e}")
+        
+        ax = fig.add_subplot(111, projection=ccrs.PlateCarree(central_longitude=180))
+
+        # Color limits
+        vpercentile = 99.0
+        vmin = -np.nanpercentile(np.abs(anom_vs.values), vpercentile)
+        vmax = np.nanpercentile(np.abs(anom_vs.values), vpercentile)
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax == 0:
+            vmax = 1.0
+            vmin = -1.0
+
+        levels = np.linspace(vmin, vmax, 21)
+
+        output_file = Path(output_dir) / f"AAM_anomalies_lat_lon_movie_{ensemble_member}_{start_year}-{end_year}_{int(pmin_hpa)}-{int(pmax_hpa)}hPa.mp4"
+        ensure_dir(output_file.parent)
+
+        writer = animation.FFMpegWriter(fps=fps, bitrate=3000)
+        with writer.saving(fig, str(output_file), dpi=200):
+            for t_idx in range(n_times):
+                ax.cla()
+                time_val = pd.to_datetime(anom_vs.time.values[t_idx])
+                data_slice = anom_vs.isel(time=t_idx).values
+                im = ax.contourf(lon_vals, lat_vals, data_slice, levels=levels, cmap='RdBu_r', extend='both', transform=ccrs.PlateCarree())
+                ax.coastlines(resolution='110m', linewidth=0.5)
+                ax.add_feature(cfeature.BORDERS, linewidth=0.3)
+                gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5, linestyle='--')
+                gl.top_labels = False
+                gl.right_labels = False
+                ax.set_title(time_val.strftime('%Y-%m'))
+
+                # wind overlay
+                if wind_field_for_overlay is not None:
+                    try:
+                        w = wind_field_for_overlay.isel(time=t_idx) if 'time' in wind_field_for_overlay.dims else wind_field_for_overlay
+                        # collapse extra dims if present
+                        for d in [d for d in w.dims if d not in ('latitude', 'lat', 'longitude', 'lon')]:
+                            if w.sizes.get(d, 0) == 1:
+                                w = w.isel({d: 0})
+                        wind_lat_dim = 'latitude' if 'latitude' in w.dims else ('lat' if 'lat' in w.dims else None)
+                        wind_lon_dim = 'longitude' if 'longitude' in w.dims else ('lon' if 'lon' in w.dims else None)
+                        if wind_lat_dim is not None and wind_lon_dim is not None:
+                            wvals = w.transpose(wind_lat_dim, wind_lon_dim).values
+                            ax.contour(w[w_lon_dim if False else wind_lon_dim].values, w[w_lat_dim if False else wind_lat_dim].values, wvals, levels=np.arange(-60,61,10), colors='k', linewidths=0.6, transform=ccrs.PlateCarree())
+                    except Exception:
+                        pass
+
+                writer.grab_frame()
+        plt.close(fig)
+        print(f"Lat-lon movie saved to: {output_file}")
+
+    # call to render lat-lon movie (produces an MP4)
+    try:
+        render_latlon_movie(aam_period=aam_period, u_dataset=ds_u, pmin_hpa=P_MIN_HPA, pmax_hpa=P_MAX_HPA, fps=MOVIE_FPS)
+    except Exception as e:
+        print(f"Failed to render lat-lon movie: {e}")
 
     ds_u.close()
 
