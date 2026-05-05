@@ -127,7 +127,6 @@ region: str = "all",
         vmax = float(np.nanmax(np.abs(anomalies.values))) if np.size(anomalies.values) else 1.0
     if not np.isfinite(vmax) or vmax <= 0:
         vmax = 1.0
-    vmax = 1e25
     vmin = -vmax
     levels = np.linspace(vmin, vmax, 21)
 
@@ -1241,14 +1240,12 @@ def plot_lat_level_postage_stamp_5x12(
         lat_vals = comp[lat_dim].values
         lev_vals = comp[lev_dim].values
         
-        # Transpose to (lat, level)
-        data_vals = comp.values
-        if comp.dims[0] == lev_dim:
-            data_vals = data_vals.T
+        # Ensure data has shape (lat, level) for contourf with swapped axes
+        data_vals = comp.transpose(lat_dim, lev_dim).values
         
-        cf = ax.contourf(lat_vals, lev_vals, data_vals, levels=levels, cmap="RdBu_r", extend="both")
-        ax.set_ylabel("Level (hPa)", fontsize=8)
-        ax.set_xlabel("Latitude (°N)", fontsize=8)
+        cf = ax.contourf(lev_vals, lat_vals, data_vals, levels=levels, cmap="RdBu_r", extend="both")
+        ax.set_ylabel("Latitude (°N)", fontsize=8)
+        ax.set_xlabel("Level (hPa)", fontsize=8)
         ax.set_title(member_name, fontsize=9, fontweight="bold")
         ax.tick_params(labelsize=7)
         ax.invert_yaxis()
@@ -1341,6 +1338,7 @@ def plot_lat_level_monthly_stamps_10col(
         vmax = vmax if vmax > 0 else 1.0
     else:
         vmax = 1.0
+    vmax = 5e23
     vmin = -vmax
     levels = np.linspace(vmin, vmax, 21)
     
@@ -1389,9 +1387,8 @@ def plot_lat_level_monthly_stamps_10col(
             lat_vals = comp_month[lat_dim].values
             lev_vals = comp_month[lev_dim].values
             
-            data_vals = comp_month.values
-            if comp_month.dims[0] == lev_dim:
-                data_vals = data_vals.T
+            # Ensure data has shape (level, lat) for contourf
+            data_vals = comp_month.transpose(lev_dim, lat_dim).values
             
             cf = ax.contourf(lat_vals, lev_vals, data_vals, levels=levels, cmap="RdBu_r", extend="both")
             ax.set_ylabel("Level", fontsize=6)
@@ -1428,6 +1425,154 @@ def plot_lat_level_monthly_stamps_10col(
         print(f"Month {month_idx+1:02d} lat×level stamps saved to {out_path}")
 
 
+def plot_lat_time_postage_stamp_all_members(
+    member_composites: list,
+    *,
+    output_dir: str | Path = "output/",
+    region: str = "all",
+    enso_state: str = "el_nino",
+    nino_threshold: float = 0.5,
+    title_suffix: str = "",
+) -> None:
+    """Create a postage stamp grid of lat×time composites for all ensemble members.
+    
+    Parameters
+    ----------
+    member_composites : list of tuples (member_name, composite_da)
+        Each composite_da has dims (lat, time/month) or (time/month, lat)
+    output_dir : str | Path
+        Directory to save the figure
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    import matplotlib.cm as cm
+    import matplotlib.ticker as mticker
+    import numpy as np
+    from pathlib import Path
+    import math
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    n_members = len(member_composites)
+    if n_members == 0:
+        return
+        
+    n_cols = 5
+    n_rows = int(np.ceil(n_members / n_cols))
+    
+    # Collect all values to determine global color limits
+    all_values = []
+    for _, comp in member_composites:
+        all_values.append(comp.values.flatten())
+    all_values = np.concatenate(all_values)
+    all_values = all_values[np.isfinite(all_values)]
+    
+    if all_values.size > 0:
+        vmax = float(np.nanpercentile(np.abs(all_values), 99))
+        vmax = vmax if vmax > 0 else 1.0
+    else:
+        vmax = 1.0
+    vmin = -vmax
+    levels = np.linspace(vmin, vmax, 13)
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 3*n_rows))
+    fig.subplots_adjust(hspace=0.4, wspace=0.15)
+    
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = axes.reshape(1, -1)
+    elif n_cols == 1:
+        axes = axes.reshape(-1, 1)
+    
+    # Generate subplots
+    for idx, (member_name, comp) in enumerate(member_composites):
+        row = idx // n_cols
+        col = idx % n_cols
+        ax = axes[row, col]
+        
+        # Normalize dimension names
+        if "latitude" in comp.dims and "lat" not in comp.dims:
+            comp = comp.rename({"latitude": "lat"})
+        
+        time_dim = next((d for d in comp.dims if d in ("time", "month")), None)
+        lat_dim = "lat" if "lat" in comp.dims else ("latitude" if "latitude" in comp.dims else None)
+        
+        if time_dim is None or lat_dim is None:
+            ax.text(0.5, 0.5, f"Missing dims", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(member_name, fontsize=8)
+            continue
+            
+        lat_vals = comp[lat_dim].values
+        time_vals = comp[time_dim].values
+        n_times = len(time_vals)
+        
+        # Ensure (lat, time) ordering
+        data_vals = comp.values
+        if comp.dims[0] == time_dim:
+            data_vals = data_vals.T
+            
+        cf = ax.contourf(time_vals, lat_vals, data_vals, levels=levels, cmap="RdBu_r", extend="both")
+        ax.set_ylabel("Latitude (°N)", fontsize=8)
+        
+        if row == n_rows - 1 or idx >= n_members - n_cols:
+            ax.set_xlabel("Month since onset", fontsize=8)
+            
+        ax.set_xlim(1, len(time_vals))
+        ax.set_ylim(-60, 60)
+        
+        # Consistent ticks and grid
+        ax.xaxis.set_major_locator(mticker.MultipleLocator(1)) # Every 1 month like normal plot
+        ax.yaxis.set_major_locator(mticker.MultipleLocator(30)) # -60, -30, 0, 30, 60
+        
+        # Grid and equator
+        ax.grid(axis='x', alpha=0.3, linestyle='--')
+        ax.axhline(0, color='black', lw=0.8, ls='--', alpha=0.6)
+        
+        ax.set_title(member_name, fontsize=9, fontweight="bold")
+        ax.tick_params(labelsize=8)
+
+    # Hide empty subplots
+    for idx in range(n_members, n_rows * n_cols):
+        row = idx // n_cols
+        col = idx % n_cols
+        axes[row, col].axis("off")
+        
+    # Add identical style single colorbar
+    _abs = max(abs(vmin), abs(vmax))
+    order = int(np.floor(np.log10(_abs))) if _abs > 0 else 0
+    factor = 10 ** order
+    
+    cbar_ax = fig.add_axes([0.15, 0.02, 0.7, 0.01])
+    cbar = fig.colorbar(cf, cax=cbar_ax, orientation='horizontal', extend='both')
+    
+    _sup = str.maketrans("0123456789-", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207b")
+    _order_sup = str(order).translate(_sup)
+    
+    cbar.set_label(f"AAM anomaly (×10{_order_sup})", fontsize=12)
+    
+    _tick_levels = cf.levels[::2]
+    cbar.set_ticks(_tick_levels)
+    cbar.set_ticklabels([f"{v / factor:.1f}" for v in _tick_levels])
+    cbar.ax.tick_params(labelsize=10)
+    
+    region_label = region.upper() if region != 'all' else 'GLOBAL'
+    fig.suptitle(
+        f'HadGEM3_GC31 {n_members} Ensemble Members - Lat×Time Evolution Composites\n'
+        f'{region_label} | {enso_state} (Nino3.4{">=" if enso_state=="el_nino" else "<="}{nino_threshold})\n'
+        f'{title_suffix}',
+        fontsize=14, fontweight="bold", y=0.98
+    )
+    
+    fig.tight_layout(rect=[0, 0.05, 1, 0.94])
+    
+    out_path = output_dir / f"postage_stamp_lat_time_ensemble_{enso_state}_{region_label.lower()}_{n_members}members.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Lat×time evolution postage stamp saved to {out_path}")
+
+
 def plot_lat_lon_monthly_stamps_10col(
     member_composites: list,
     *,
@@ -1449,6 +1594,7 @@ def plot_lat_lon_monthly_stamps_10col(
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
     import matplotlib.cm as cm
+    from matplotlib.gridspec import GridSpec
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
     
@@ -1494,6 +1640,7 @@ def plot_lat_lon_monthly_stamps_10col(
         vmax = vmax if vmax > 0 else 1.0
     else:
         vmax = 1.0
+    vmax = 1e25
     vmin = -vmax
     levels = np.linspace(vmin, vmax, 21)
     
