@@ -1087,11 +1087,33 @@ if __name__ == '__main__':
             if ens_mean.dims[0] == "month":
                 aam_vals = aam_vals.T
 
-            # -------------------------------
-            # FIXED t-test (CRITICAL)
-            # -------------------------------
+            # Calculate standard deviation across the entire basin (all latitudes and months)
+            # This represents the overall variability in the composite region
+            std_basin = np.nanstd(aam_vals)  # Single scalar value
+            # Avoid division by zero
+            std_basin = std_basin if std_basin > 0 else 1.0
+            
+            # Normalize to sigma (standard deviation) units using basin-wide variability
+            # This shows anomalies as standard deviations from the overall basin variability
+            aam_vals = aam_vals / std_basin  # Now in sigma units
+
+            # For consistency, also normalize the ensemble stack for t-test on sigma values
+            # Normalize each ensemble member's composite by the same basin-wide std
+            ens_stack_sigma = ens_stack.copy(deep=True)
+            for i_ens in range(ens_stack.sizes['ensemble']):
+                member_vals = ens_stack.isel(ensemble=i_ens).values
+                # Ensure (lat, month) for normalization
+                if ens_stack.dims[0] == "ensemble" and ens_stack.dims[1] == "month":
+                    member_vals = member_vals.T  # (month, lat) -> (lat, month)
+                # Normalize using the same basin-wide std
+                member_vals = member_vals / std_basin
+                # Restore original orientation if needed
+                if ens_stack.dims[0] == "ensemble" and ens_stack.dims[1] == "month":
+                    member_vals = member_vals.T
+                ens_stack_sigma.values[i_ens] = member_vals
+            
             # Ensure dimension order: (ensemble, lat, month)
-            combined = ens_stack.transpose("ensemble", lat_dim, "month")
+            combined = ens_stack_sigma.transpose("ensemble", lat_dim, "month")
 
             # Now t-test across ensemble axis
             _, p_vals = _stats.ttest_1samp(
@@ -1123,8 +1145,9 @@ if __name__ == '__main__':
             fig.subplots_adjust(bottom=0.18)
             
             #vmax = 5e24
-            vmax = float(np.nanpercentile(np.abs(aam_vals), 98))
-            vmax = vmax if vmax > 0 else 1.0
+            # vmax = float(np.nanpercentile(np.abs(aam_vals), 98))
+            # vmax = vmax if vmax > 0 else 1.0
+            vmax = 5
             vmin = -vmax
 
             levels = np.linspace(vmin, vmax, 13)
@@ -1140,22 +1163,11 @@ if __name__ == '__main__':
 
             # -------------------------------
             # Colorbar
-            # -------------------------------
-            _abs = max(abs(vmin), abs(vmax))
-            order = int(np.floor(np.log10(_abs))) if _abs > 0 else 0
-            factor = 10 ** order
-
+            # Simple linear colorbar for sigma (standard deviation) units
             cax = fig.add_axes([0.125, 0.06, 0.775, 0.015])
             cbar = fig.colorbar(cf, cax=cax, orientation="horizontal", extend="both")
 
-            _sup = str.maketrans("0123456789-", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207b")
-            _order_sup = str(order).translate(_sup)
-
-            cbar.set_label(f"AAM anomaly (×10{_order_sup})", size=12)
-
-            _tick_levels = cf.levels[::2]
-            cbar.set_ticks(_tick_levels)
-            cbar.set_ticklabels([f"{v / factor:.1f}" for v in _tick_levels])
+            cbar.set_label(f"AAM anomaly (σ, standard deviations)", size=12)
             cbar.ax.tick_params(labelsize=11)
 
             # -------------------------------

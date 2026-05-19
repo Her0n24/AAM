@@ -1,4 +1,5 @@
 """
+Bootstrapping test of the AAM composite signal
 Usage
 - Run from AAM/test_code/ with:
 python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --rolling-period 3
@@ -70,7 +71,7 @@ parser.add_argument(
     choices=['all', 'pacific', 'indian', 'atlantic'],
     help='Geographic region to analyze (default: all). Pacific: 125–(-110)°, Indian: 50–100°, Atlantic: -60–10°',
 )
-replot = True  # If True, skip composite calculation and just replot from saved ensemble mean NetCDF
+replot = False  # If True, skip composite calculation and just replot from saved ensemble mean NetCDF
 
 if "ipykernel" in sys.modules:
     args = parser.parse_args([
@@ -2207,6 +2208,7 @@ if __name__ == '__main__':
                 # 2. CREATE THE MASK MANUALLY (Since the function doesn't return it)
                 # True where significant (p <= 0.05), False where NOT significant
                 sig_mask_latlon = np.where(p_vals_latlon <= 0.05, True, False)
+                sig_mask_latlon = sig_mask_latlon.T
             else:
                 p_vals_latlon = None
                 sig_mask_latlon = significance_mask_latlon if 'significance_mask_latlon' in locals() else None

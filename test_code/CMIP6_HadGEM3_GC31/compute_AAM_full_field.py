@@ -36,7 +36,7 @@ output_dir = f"{CMIP6_path_base}/AAM/full/"
 # u_directory = f"{CMIP6_path_base}/InterpolatedFlds/Amon/ua/historical/HadGEM3-GC31-LL/"
 # ps_directory = f"{CMIP6_path_base}/InterpolatedFlds/Amon/ps/historical/HadGEM3-GC31-LL/"
 
-ensemble_members = [f'r{i}i1p1f3' for i in range(6, 12)]
+ensemble_members = [f'r{i}i1p1f3' for i in range(1, 61)]
 
 save_path = output_dir
 

@@ -31,6 +31,8 @@ def plot_lat_lon_snapshots(
 anomalies: xr.DataArray,
 zonal_wind_da: Optional["xr.DataArray | xr.Dataset"] = None,
 uv_latlev_profile: Optional[xr.DataArray] = None,
+p_values: Optional[np.ndarray] = None,
+significance_mask: Optional[np.ndarray] = None,
 *,
 ensemble_member: str,
 start_year: int,
@@ -52,7 +54,17 @@ nino_threshold: Optional[float] = None,
 region: str = "all",
 ) -> None:
     
-    """Plot a grid of latitude × longitude anomaly snapshots for CMIP6 composites (HadGEM3 style)."""
+    """Plot a grid of latitude × longitude anomaly snapshots for CMIP6 composites (HadGEM3 style).
+    
+    Parameters
+    ----------
+    anomalies : xr.DataArray
+        Data with dims (time, latitude, longitude)
+    p_values : np.ndarray, optional
+        P-values with shape (time, latitude, longitude). Where p > 0.05, regions will be hatched.
+    significance_mask : np.ndarray, optional
+        Boolean mask with shape (time, latitude, longitude). Where True, regions will be hatched.
+    """
     import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
@@ -179,8 +191,83 @@ region: str = "all",
         else:
             _panel_label = pd.to_datetime(_raw_t).strftime("%Y-%m")
         
-        im = ax.contourf(lon_vals, lat_vals, data_slice.values, levels=levels, cmap=cmap_name, extend="both", transform=data_crs)
-        ax.axhline(0, color="black", linestyle="-", lw=1)
+        data_values = data_slice.values
+        if data_values.shape != (len(lat_vals), len(lon_vals)) and data_values.T.shape == (len(lat_vals), len(lon_vals)):
+            data_values = data_values.T
+
+        im = ax.contourf(lon_vals, lat_vals, data_values, levels=levels, cmap=cmap_name, extend="both", transform=data_crs)
+        
+        # -------------------------------
+        # SIGNIFICANCE HATCHING (IPCC STYLE)
+        # -------------------------------
+        hatch_mask = None
+
+        # Case 1: Using Precomputed Boolean Mask (True = Significant)
+        if significance_mask is not None and significance_mask.shape[0] > t_idx:
+            sig_slice = significance_mask[t_idx, :, :]
+            
+            # 1. Handle Transpose
+            if sig_slice.shape != data_values.shape:
+                if sig_slice.T.shape == data_values.shape:
+                    sig_slice = sig_slice.T
+
+            # 2. Handle Longitude Wrap-around patching
+            if sig_slice.shape[1] != data_values.shape[1]:
+                sig_slice = np.concatenate([sig_slice, sig_slice[:, 0:1]], axis=1)
+
+            # 3. Create Hatch Mask: 1.0 where NOT significant (sig_slice is False)
+            # We want to hatch where sig_slice is False.
+            hatch_mask = np.where(sig_slice == False, 1.0, 0.0)
+
+        # Case 2: Fallback to Raw P-Values (Float)
+        elif p_values is not None and p_values.shape[0] > t_idx:
+            p_slice = p_values[t_idx, :, :]
+            
+            # 1. Handle Transpose
+            if p_slice.shape != data_values.shape:
+                if p_slice.T.shape == data_values.shape:
+                    p_slice = p_slice.T
+            
+            # 2. Handle Longitude Wrap-around patching
+            if p_slice.shape[1] != data_values.shape[1]:
+                p_slice = np.concatenate([p_slice, p_slice[:, 0:1]], axis=1)
+            
+            # 3. Create Hatch Mask: 1.0 where p > 0.05 OR p is NaN
+            hatch_mask = np.where((p_slice > 0.05) | np.isnan(p_slice), 1.0, 0.0)
+
+        def _align_hatch_mask(mask: np.ndarray, target_shape: tuple[int, int], label: str) -> Optional[np.ndarray]:
+            mask = np.asarray(mask)
+            if mask.shape == target_shape:
+                return mask
+            if mask.T.shape == target_shape:
+                return mask.T
+            if mask.shape[0] == target_shape[0] and mask.shape[1] > target_shape[1]:
+                return mask[:, : target_shape[1]]
+            if mask.shape[1] == target_shape[1] and mask.shape[0] > target_shape[0]:
+                return mask[: target_shape[0], :]
+            print(f"Skipping {label} hatch overlay due to shape mismatch: mask {mask.shape}, data {target_shape}")
+            return None
+
+        if hatch_mask is not None:
+            hatch_mask = _align_hatch_mask(hatch_mask, data_values.shape, "significance")
+
+        # Draw the hatches if a mask was created
+        if hatch_mask is not None:
+            hatches = ax.contourf(
+                lon_vals, lat_vals, hatch_mask,
+                levels=[0.5, 1.5],  # Only fill where values are ~1.0
+                colors='none',
+                hatches=['/'],
+                transform=data_crs,
+                zorder=10,
+            )
+            # Formatting the hatch lines
+            for collection in hatches.collections:
+                collection.set_facecolor('none')
+                collection.set_edgecolor((0.5, 0.5, 0.5, 0.7)) # Subtle gray
+                collection.set_linewidth(0.4) 
+                # This is the "magic" line to reduce the border effect:
+                collection.set_antialiased(False)
         
         # Overlay zonal wind contours
         if zonal_wind_da is not None:
@@ -550,6 +637,8 @@ def plot_anomalies_3d_slices(
 def plot_latitude_level_snapshots_HadGEN3(
     anomalies: xr.DataArray,
     zonal_wind_da: Optional["xr.DataArray | xr.Dataset"] = None,
+    p_values: Optional[np.ndarray] = None,
+    significance_mask: Optional[np.ndarray] = None,
     *,
     ensemble_member: str,
     start_year: int,
@@ -568,7 +657,14 @@ def plot_latitude_level_snapshots_HadGEN3(
     nino_threshold: Optional[float] = 0.5) -> None:
     """Plot a grid of latitude×level snapshots from anomalies.
 
-    Expects anomalies with dims including ('time', 'level', 'latitude') and *no* longitude.
+    Parameters
+    ----------
+    anomalies : xr.DataArray
+        Data with dims (time, level, latitude)
+    zonal_wind_da : xr.DataArray or xr.Dataset, optional
+        Zonal wind for overlay
+    p_values : np.ndarray, optional
+        P-values with shape (time, level, latitude). Where p > 0.05, regions will be hatched.
     """
     import matplotlib.cm as cm
     import matplotlib.colors as mcolors
@@ -578,7 +674,7 @@ def plot_latitude_level_snapshots_HadGEN3(
     
     # vmax = np.nanpercentile(np.abs(anomalies.values), vpercentile)
     # vmax = 1e23
-    vmax = 0.5e23
+    vmax = 1e23
     vmin = -vmax
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax == 0:
         print(f"Warning: Invalid color limits (vmin={vmin}, vmax={vmax}), using fallback values")
@@ -667,11 +763,56 @@ def plot_latitude_level_snapshots_HadGEN3(
             _panel_label = pd.to_datetime(_raw_t).strftime("%Y-%m")
         
         data_slice = anomalies_for_plot.isel(time=t_idx).transpose(level_dim, lat_dim)
+        data_values = data_slice.values
         
         # Use explicit levels array to ensure consistent colorbar
         levels = np.linspace(vmin, vmax, 13)
-        im = contour_axes[i].contourf(lat_vals, pressure_hpa, data_slice.values,
+        im = contour_axes[i].contourf(lat_vals, pressure_hpa, data_values,
                              levels=levels, cmap='RdBu_r', extend='both')
+        
+        hatch_mask = None
+        
+        # Case A: We have a precomputed boolean mask (True = significant)
+        if significance_mask is not None and significance_mask.shape[0] > t_idx:
+            sig_slice = significance_mask[t_idx, :, :]
+            # Check shape/transpose logic
+            if sig_slice.shape != data_values.shape:
+                if sig_slice.T.shape == data_values.shape:
+                    sig_slice = sig_slice.T
+            
+            # IPCC: Hatch where NOT significant. 
+            # Since sig_mask is True for significant, we hatch where it is False.
+            hatch_mask = np.where(sig_slice == False, 1.0, 0.0)
+
+        # Case B: We have raw p-values (Float)
+        elif p_values is not None and p_values.shape[0] > t_idx:
+            p_slice = p_values[t_idx, :, :]
+            if p_slice.shape != data_values.shape:
+                if p_slice.T.shape == data_values.shape:
+                    p_slice = p_slice.T
+            
+            # Hatch where p > 0.05 or NaN (insignificant)
+            hatch_mask = np.where((p_slice > 0.05) | np.isnan(p_slice), 1.0, 0.0)
+        
+        # Create a masked version of your lat/lon grid for the pcolor
+        # We only want to 'plot' the grid cells where significance is False (hatch = 1)
+        hatch_data = np.ma.masked_where(hatch_mask != 1, hatch_mask)
+        if hatch_data.shape != data_values.shape and hatch_data.T.shape == data_values.shape:
+            hatch_data = hatch_data.T
+        
+        
+        # Use pcolor which allows more granular control over edges
+        from matplotlib.pyplot import pcolor
+        h_plot = contour_axes[i].pcolor(lat_vals, pressure_hpa, hatch_data, 
+                        hatch='/', 
+                        alpha=0,        # Make the 'fill' completely transparent
+                        zorder=10)
+        
+        for patch in h_plot.get_children():
+            # In pcolor, setting edgecolor to a color BUT linewidth to a value
+            # allows the hatches to show up while the cell borders remain faint/invisible
+            h_plot.set_edgecolor((0.5, 0.5, 0.5, 0.7)) 
+            h_plot.set_linewidth(0.5)
         
         # Overlay zonal wind contours
         if zonal_wind_da is not None:
