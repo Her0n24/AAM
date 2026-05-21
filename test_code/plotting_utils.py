@@ -251,23 +251,31 @@ region: str = "all",
         if hatch_mask is not None:
             hatch_mask = _align_hatch_mask(hatch_mask, data_values.shape, "significance")
 
-        # Draw the hatches if a mask was created
+        # Draw the hatches only where the mask marks insignificant cells.
+        # pcolor applies the hatch to every rendered patch, so we mask out the
+        # significant cells first and let Matplotlib draw only the remaining ones.
         if hatch_mask is not None:
-            hatches = ax.contourf(
-                lon_vals, lat_vals, hatch_mask,
-                levels=[0.5, 1.5],  # Only fill where values are ~1.0
-                colors='none',
-                hatches=['/'],
-                transform=data_crs,
+            hatch_data = np.ma.masked_where(hatch_mask != 1, hatch_mask)
+            if hatch_data.shape != data_values.shape and hatch_data.T.shape == data_values.shape:
+                hatch_data = hatch_data.T
+
+            # Use contourf to target only the '1.0' (insignificant) values
+            # levels=[0.5, 1.5] ensures we only hatch the insignificant regions
+            h_plot = ax.contourf(
+                lon_vals, 
+                lat_vals, 
+                hatch_data,
+                levels=[0.5, 1.5], 
+                hatches=['/'],  # Dense hatches
+                colors='none',     # No background fill
                 zorder=10,
+                transform=ccrs.PlateCarree() # Ensure transform is included for Cartopy
             )
-            # Formatting the hatch lines
-            for collection in hatches.collections:
-                collection.set_facecolor('none')
-                collection.set_edgecolor((0.5, 0.5, 0.5, 0.7)) # Subtle gray
-                collection.set_linewidth(0.4) 
-                # This is the "magic" line to reduce the border effect:
-                collection.set_antialiased(False)
+
+            # Style the hatches and remove the contour boundaries
+            for collection in h_plot.collections:
+                collection.set_edgecolor((0.4, 0.4, 0.4, 0.6)) # Gray hatches
+                collection.set_linewidth(0.0) # Removes the boundary of the hatched area
         
         # Overlay zonal wind contours
         if zonal_wind_da is not None:

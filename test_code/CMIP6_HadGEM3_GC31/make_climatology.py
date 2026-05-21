@@ -50,12 +50,12 @@ def make_fullfield_climatology(start_year, end_year, member):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Make full-field AAM climatology for a member over a year range")
     parser.add_argument("--member", default=None, help="ensemble member (e.g. r1i1p1f3)")
-    parser.add_argument("--start", "-s", type=int, default=1980, help="start year (default: 1980)")
-    parser.add_argument("--end", "-e", type=int, default=2000, help="end year (default: 2000)")
+    parser.add_argument("--start", "-s", type=int, default=1981, help="start year (default: 1981)")
+    parser.add_argument("--end", "-e", type=int, default=2010, help="end year (default: 2010)")
     args = parser.parse_args()
     
     if args.member is None:
-        for ensemble_member in tqdm.tqdm(np.arange(6,61), desc="Processing ensemble members"):
+        for ensemble_member in tqdm.tqdm(np.arange(1,61), desc="Processing ensemble members"):
             member_str = f"r{ensemble_member}i1p1f3"
             try:
                 make_fullfield_climatology(args.start, args.end, member_str)

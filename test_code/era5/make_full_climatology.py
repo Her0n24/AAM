@@ -21,8 +21,9 @@ output_dir = f"{scratch_path}/ERA5/climatology/"
 # Create output directory if it doesn't exist
 os.makedirs(output_dir, exist_ok=True)
 
-start_yr = 1980
-end_yr = 2000
+# Standardised Climatology Period across scripts
+start_yr = 1981
+end_yr = 2010
 
 def make_full_climatology(start_year, end_year, variable, vertically_integrated=False):
     """

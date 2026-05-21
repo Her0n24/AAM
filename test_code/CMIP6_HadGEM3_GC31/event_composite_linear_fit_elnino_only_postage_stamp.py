@@ -673,8 +673,8 @@ def composite_propagating_years_no_plot(
     date_list,
     clim_da=None,
     *,
-    clim_start_yr: int = 1980,
-    clim_end_yr: int = 2000,
+    clim_start_yr: int = 1981,
+    clim_end_yr: int = 2010,
     p_min_hpa: float = 150.0,
     p_max_hpa: float = 700.0,
     enso_state: str = "el_nino",
@@ -860,8 +860,8 @@ def composite_propagating_years_no_plot(
 
 if __name__ == '__main__':
 
-    clim_start_yr = 1980
-    clim_end_yr = 2000
+    clim_start_yr = 1981
+    clim_end_yr = 2010
 
     ensemble_composites = []
     ensemble_lat_lev_composites = []
