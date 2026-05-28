@@ -27,6 +27,381 @@ from typing import Callable, Iterable, Optional
 import numpy as np
 import xarray as xr
 
+
+class TaylorDiagram(object):
+    """Taylor diagram for normalized standard deviation and correlation."""
+
+    def __init__(
+        self,
+        refstd,
+        fig=None,
+        rect=111,
+        label="_",
+        min_corr=0.8,
+        min_std=0.8,
+        max_std=1.25,
+    ):
+        import matplotlib.pyplot as plt
+        from matplotlib.projections import PolarAxes
+        import mpl_toolkits.axisartist.floating_axes as FA
+        import mpl_toolkits.axisartist.grid_finder as GF
+
+        max_angle = np.arccos(min_corr)
+
+        self.refstd = refstd
+        self.min_std = min_std
+        self.max_std = max_std
+        self.max_angle = max_angle
+
+        tr = PolarAxes.PolarTransform()
+        rlocs = np.linspace(min_std, max_std, 5)
+        corr_ticks = np.array([-0.5, 0, 0.2, 0.4, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0])
+        corr_ticks = corr_ticks[corr_ticks >= min_corr]
+        tlocs = np.arccos(corr_ticks)
+        tlocs = tlocs[tlocs <= max_angle]
+        gl1 = GF.FixedLocator(tlocs)
+        tf1 = GF.DictFormatter(dict(zip(tlocs, [f"{np.cos(t):.2f}" for t in tlocs])))
+        gl2 = GF.FixedLocator(rlocs)
+        tf2 = GF.DictFormatter(dict(zip(rlocs, [f"{val:.2f}" for val in rlocs])))
+
+        ghelper = FA.GridHelperCurveLinear(
+            tr,
+            extremes=(0, max_angle, min_std, max_std),
+            grid_locator1=gl1,
+            tick_formatter1=tf1,
+            grid_locator2=gl2,
+            tick_formatter2=tf2,
+        )
+        if fig is None:
+            fig = plt.figure()
+        ax = FA.FloatingSubplot(fig, rect, grid_helper=ghelper)
+        fig.add_subplot(ax)
+
+        ax.axis["top"].set_axis_direction("bottom")
+        ax.axis["top"].toggle(ticklabels=True, label=True)
+        ax.axis["top"].major_ticklabels.set_axis_direction("top")
+        ax.axis["top"].label.set_text("Correlation")
+        ax.axis["top"].label.set_axis_direction("top")
+        ax.axis["top"].label.set_fontsize(16)
+
+        ax.axis["left"].set_axis_direction("bottom")
+        ax.axis["left"].label.set_text("Standard deviation")
+        ax.axis["left"].label.set_fontsize(16)
+
+        ax.axis["right"].set_axis_direction("top")
+        ax.axis["right"].toggle(ticklabels=True)
+        ax.axis["right"].major_ticklabels.set_axis_direction("left")
+        ax.axis["left"].major_ticklabels.set_fontsize(12)
+        ax.axis["top"].major_ticklabels.set_fontsize(12)
+        ax.axis["right"].major_ticklabels.set_fontsize(12)
+        ax.axis["bottom"].set_visible(False)
+
+        self._ax = ax
+        self.ax = ax.get_aux_axes(tr)
+
+        self.ax.plot([0], self.refstd, "k*", ls="", ms=10, label=label)
+        t = np.linspace(0, max_angle)
+        self.ax.plot(t, np.zeros_like(t) + self.refstd, "k--", label="_")
+
+    def add_sample(self, stddev, corrcoef, *args, **kwargs):
+        return self.ax.plot(np.arccos(np.clip(corrcoef, -1.0, 1.0)), stddev, *args, **kwargs)
+
+
+def compute_taylor_stats_against_reference(
+    ref_da: xr.DataArray,
+    sample_da: xr.DataArray,
+    *,
+    sample_dim: str = "iteration",
+) -> "object":
+    """Return a DataFrame with per-sample normalized std and correlation to ref_da."""
+    import pandas as pd
+
+    if sample_dim not in sample_da.dims:
+        raise ValueError(f"sample_da must contain {sample_dim!r}; got dims {sample_da.dims}")
+
+    ref_flat = np.asarray(ref_da.values, dtype=float).ravel()
+    ref_mask = np.isfinite(ref_flat)
+    ref_flat = ref_flat[ref_mask]
+    if ref_flat.size == 0:
+        return pd.DataFrame(columns=[sample_dim, "std", "corr"])
+
+    ref_mean = float(np.mean(ref_flat))
+    ref_scale = float(np.std(ref_flat))
+    if not np.isfinite(ref_scale) or ref_scale <= 0:
+        return pd.DataFrame(columns=[sample_dim, "std", "corr"])
+
+    ref_norm = (ref_flat - ref_mean) / ref_scale
+    rows = []
+    for sample_idx in range(int(sample_da.sizes[sample_dim])):
+        sample_flat = np.asarray(sample_da.isel({sample_dim: sample_idx}).values, dtype=float).ravel()
+        if sample_flat.size != ref_mask.size:
+            continue
+        sample_flat = sample_flat[ref_mask]
+        valid = np.isfinite(sample_flat) & np.isfinite(ref_norm)
+        if np.count_nonzero(valid) < 3:
+            continue
+        sample_norm = (sample_flat[valid] - ref_mean) / ref_scale
+        corr = float(np.corrcoef(ref_norm[valid], sample_norm)[0, 1])
+        std = float(np.std(sample_norm))
+        if np.isfinite(corr) and np.isfinite(std):
+            rows.append({sample_dim: int(sample_idx), "std": std, "corr": corr})
+
+    return pd.DataFrame(rows)
+
+
+def plot_taylor_diagram_from_stats(
+    stats_df,
+    *,
+    output_path: str | Path,
+    stats_csv_path: str | Path | None = None,
+    percentiles_csv_path: str | Path | None = None,
+    title: str,
+    reference_label: str = "Reference",
+    sample_label: str = "Bootstrap samples",
+    min_corr: float = 0.8,
+    min_std: float = 0.8,
+    max_std: float = 1.2,
+    sample_color: str = "0.35",
+    sample_alpha: float = 0.18,
+    sample_ms: float = 2.5,
+    draw_percentiles: bool = True,
+) -> bool:
+    """Plot a Taylor diagram from a stats DataFrame containing std and corr columns."""
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    required_cols = {"std", "corr"}
+    if not required_cols.issubset(stats_df.columns):
+        print(f"Taylor stats missing required columns {required_cols}; skipping {output_path}")
+        return False
+
+    df = stats_df.copy()
+    df = df[np.isfinite(df["std"]) & np.isfinite(df["corr"])]
+    df = df[(df["corr"] >= -1.0) & (df["corr"] <= 1.0)]
+    if df.empty:
+        print(f"Taylor stats are empty after filtering; skipping {output_path}")
+        return False
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if stats_csv_path is not None:
+        stats_csv_path = Path(stats_csv_path)
+        stats_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(stats_csv_path, index=False)
+        print(f"Saved Taylor statistics ({len(df)} samples) to {stats_csv_path}")
+
+    corr_pct = np.nanpercentile(df["corr"].values, [5, 50, 95])
+    std_pct = np.nanpercentile(df["std"].values, [5, 50, 95])
+
+    fig = plt.figure(figsize=(10, 8))
+    dia = TaylorDiagram(
+        1.0,
+        fig=fig,
+        label=reference_label,
+        min_corr=min_corr,
+        min_std=min_std,
+        max_std=max_std,
+    )
+    dia.ax.plot(
+        np.arccos(np.clip(df["corr"].values, -1.0, 1.0)),
+        df["std"].values,
+        marker="o",
+        color=sample_color,
+        alpha=sample_alpha,
+        ms=sample_ms,
+        ls="",
+        label="_nolegend_",
+    )
+
+    if draw_percentiles:
+        percentile_specs = [
+            ("5th", "royalblue", corr_pct[0], std_pct[0]),
+            ("median", "seagreen", corr_pct[1], std_pct[1]),
+            ("95th", "firebrick", corr_pct[2], std_pct[2]),
+        ]
+        theta_grid = np.linspace(0, dia.max_angle, 240)
+
+        radial_span = max(float(dia.max_std - dia.min_std), 1e-6)
+        corr_label_rs = np.linspace(
+            dia.max_std - 0.12 * radial_span,
+            dia.max_std - 0.30 * radial_span,
+            len(percentile_specs),
+        )
+        std_label_thetas = np.linspace(
+            0.05 * dia.max_angle,
+            0.17 * dia.max_angle,
+            len(percentile_specs),
+        )
+
+        for idx, (pct_label, color, corr_val, std_val) in enumerate(percentile_specs):
+            theta = float(np.arccos(np.clip(corr_val, -1.0, 1.0)))
+            dia.ax.plot(
+                [theta, theta],
+                [dia.min_std, dia.max_std],
+                color=color,
+                linewidth=2.0,
+                alpha=0.9,
+                label="_nolegend_",
+            )
+            dia.ax.plot(
+                theta_grid,
+                np.full_like(theta_grid, float(std_val)),
+                color=color,
+                linestyle="--",
+                linewidth=2.0,
+                alpha=0.9,
+                label="_nolegend_",
+            )
+
+            corr_label_theta = min(theta + 0.015 * dia.max_angle, dia.max_angle)
+            dia.ax.text(
+                corr_label_theta,
+                float(corr_label_rs[idx]+0.04),
+                f"r={float(corr_val):.3f}",
+                ha="left",
+                va="center",
+                color=color,
+                fontsize=14,
+                clip_on=False,
+            )
+
+            std_label_r = float(np.clip(std_val, dia.min_std + 0.03 * radial_span, dia.max_std - 0.03 * radial_span))
+            dia.ax.text(
+                float(std_label_thetas[idx]),
+                std_label_r,
+                f"{float(std_val):.3f}",
+                ha="left",
+                va="center",
+                color=color,
+                fontsize=14,
+                clip_on=False,
+            )
+
+        if percentiles_csv_path is not None:
+            percentiles_csv_path = Path(percentiles_csv_path)
+            percentiles_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                {
+                    "percentile": [5, 50, 95],
+                    "correlation": corr_pct,
+                    "standard_deviation": std_pct,
+                }
+            ).to_csv(percentiles_csv_path, index=False)
+            print(f"Saved Taylor percentiles to {percentiles_csv_path}")
+
+    handles, labels = dia.ax.get_legend_handles_labels()
+    visible = [(handle, label) for handle, label in zip(handles, labels) if label and not label.startswith("_")]
+    if visible:
+        legend_handles, legend_labels = zip(*visible)
+        plt.legend(legend_handles, legend_labels, loc="upper left", bbox_to_anchor=(0.98, 1.02), fontsize=12, frameon=False)
+
+    fig.suptitle(title, fontsize=18, fontweight="bold", y=0.98)
+    fig.subplots_adjust(top=0.84, right=0.82, left=0.08, bottom=0.08)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved Taylor diagram to {output_path}")
+    return True
+
+
+def add_active_month_percent_labels(
+    ax,
+    month_vals,
+    active_month_percent,
+    *,
+    label_text: str = "ENSO active (%)",
+    label_x: float = -0.06,
+    label_y: float = -0.155,
+    text_y: float = -0.19,
+    label_fontsize: int = 14,
+    text_fontsize: int = 10,
+    every_n: int = 2,
+    label_colors: tuple[str, ...] = ("#7c7b66", "#9e833b", "#f39c34", "#e85d3a", "#bd491f"),
+) -> None:
+    """Draw colored ENSO-active percentage labels under a monthly axis."""
+    if active_month_percent is None:
+        return
+
+    import matplotlib.colors as mcolors
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+
+    pct_cmap = LinearSegmentedColormap.from_list("enso_active_pct", list(label_colors))
+    pct_norm = Normalize(vmin=0, vmax=100)
+
+    ax.text(
+        label_x,
+        label_y,
+        label_text,
+        transform=ax.transAxes,
+        ha="right",
+        va="center",
+        rotation=90,
+        fontsize=label_fontsize,
+    )
+
+    for month_idx, (month_val, pct_val) in enumerate(zip(month_vals, active_month_percent)):
+        if every_n > 1 and month_idx % every_n != 0:
+            continue
+        color = pct_cmap(pct_norm(int(pct_val)))
+        if isinstance(color, np.ndarray):
+            color = mcolors.to_rgba(color)
+        ax.text(
+            month_val,
+            text_y,
+            f"{int(pct_val)}%",
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=text_fontsize,
+            fontweight="bold",
+            color=color,
+            clip_on=False,
+        )
+
+
+def compute_active_month_percent(
+    nino34,
+    event_labels,
+    *,
+    composite_months: int,
+    composite_start: str,
+    enso_state: str,
+    threshold: Optional[float] = None,
+) -> np.ndarray:
+    """Compute the percentage of ENSO-active months across event windows."""
+    import pandas as pd
+
+    if threshold is None:
+        threshold = 0.5 if enso_state == "el_nino" else -0.5
+
+    total = np.zeros(int(composite_months), dtype=int)
+    n_valid = 0
+
+    for onset_ym in event_labels:
+        onset_ts = pd.Timestamp(f"{onset_ym}-01")
+        if composite_start == "december_onset_year":
+            window_start = pd.Timestamp(f"{onset_ts.year}-12-01")
+        else:
+            window_start = pd.Timestamp(f"{onset_ts.year}-{onset_ts.month:02d}-01")
+        window_end = window_start + pd.DateOffset(months=int(composite_months) - 1)
+
+        vals = nino34.loc[pd.Period(window_start.strftime("%Y-%m"), "M") : pd.Period(window_end.strftime("%Y-%m"), "M")].values
+        if vals.size < int(composite_months):
+            continue
+
+        if enso_state == "el_nino":
+            active = vals[: int(composite_months)] >= float(threshold)
+        else:
+            active = vals[: int(composite_months)] <= float(threshold)
+
+        total += np.asarray(active, dtype=int)
+        n_valid += 1
+
+    if n_valid == 0:
+        return np.zeros(int(composite_months), dtype=int)
+
+    return np.rint(100.0 * total / float(n_valid)).astype(int)
+
 def plot_lat_lon_snapshots(
 anomalies: xr.DataArray,
 zonal_wind_da: Optional["xr.DataArray | xr.Dataset"] = None,
@@ -802,25 +1177,28 @@ def plot_latitude_level_snapshots_HadGEN3(
             # Hatch where p > 0.05 or NaN (insignificant)
             hatch_mask = np.where((p_slice > 0.05) | np.isnan(p_slice), 1.0, 0.0)
         
-        # Create a masked version of your lat/lon grid for the pcolor
-        # We only want to 'plot' the grid cells where significance is False (hatch = 1)
-        hatch_data = np.ma.masked_where(hatch_mask != 1, hatch_mask)
-        if hatch_data.shape != data_values.shape and hatch_data.T.shape == data_values.shape:
-            hatch_data = hatch_data.T
-        
-        
-        # Use pcolor which allows more granular control over edges
-        from matplotlib.pyplot import pcolor
-        h_plot = contour_axes[i].pcolor(lat_vals, pressure_hpa, hatch_data, 
-                        hatch='/', 
-                        alpha=0,        # Make the 'fill' completely transparent
-                        zorder=10)
-        
-        for patch in h_plot.get_children():
-            # In pcolor, setting edgecolor to a color BUT linewidth to a value
-            # allows the hatches to show up while the cell borders remain faint/invisible
-            h_plot.set_edgecolor((0.5, 0.5, 0.5, 0.7)) 
-            h_plot.set_linewidth(0.5)
+        if hatch_mask is not None:
+            # Create a masked version of your lat/lon grid for the pcolor.
+            # We only want to 'plot' the grid cells where significance is False (hatch = 1).
+            hatch_data = np.ma.masked_where(hatch_mask != 1, hatch_mask)
+            if hatch_data.shape != data_values.shape and hatch_data.T.shape == data_values.shape:
+                hatch_data = hatch_data.T
+
+            # Use pcolor which allows more granular control over edges.
+            h_plot = contour_axes[i].pcolor(
+                lat_vals,
+                pressure_hpa,
+                hatch_data,
+                hatch='/',
+                alpha=0,
+                zorder=10,
+            )
+
+            for patch in h_plot.get_children():
+                # In pcolor, setting edgecolor to a color BUT linewidth to a value
+                # allows the hatches to show up while the cell borders remain faint/invisible.
+                h_plot.set_edgecolor((0.5, 0.5, 0.5, 0.7))
+                h_plot.set_linewidth(0.5)
         
         # Overlay zonal wind contours
         if zonal_wind_da is not None:

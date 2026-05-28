@@ -1,14 +1,28 @@
 # %%
 import numpy as np
 import xarray as xr
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.cm as cm
 from matplotlib.colors import BoundaryNorm, ListedColormap
 import os
 import glob
 import pandas as pd
 import argparse
-from plot_AAM_level_data import _latitude_band_width_radians
+from typing import Optional
+import sys
+
+
+def _latitude_band_width_radians(lat_deg: np.ndarray) -> np.ndarray:
+    """Return dphi (radians) for latitude bands centered on the latitude points."""
+    lat_rad = np.deg2rad(np.asarray(lat_deg, dtype=float))
+    n = lat_rad.size
+    edges = np.empty(n + 1, dtype=float)
+    edges[1:-1] = 0.5 * (lat_rad[:-1] + lat_rad[1:])
+    edges[0] = -0.5 * np.pi
+    edges[-1] = 0.5 * np.pi
+    return np.abs(np.diff(edges))
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Plot AAM anomalies integrated over specified pressure levels')
@@ -16,7 +30,15 @@ parser.add_argument('--p-min', type=float, default=150, help='Minimum pressure l
 parser.add_argument('--p-max', type=float, default=1000, help='Maximum pressure level (hPa) to include (default: 1000 hPa)')
 parser.add_argument('--start-year', type=int, default=1980, help='Start year for analysis (default: 1980)')
 parser.add_argument('--end-year', type=int, default=2000, help='End year for analysis (default: 2000)')
-args = parser.parse_args()
+parser.add_argument('--input-nc', type=str, default=None, help='Precomputed AAM anomaly NetCDF to replot (default: derived from start/end/p-range)')
+parser.add_argument('--enso-csv', type=str, default=None, help='Niño3.4 CSV for the lower panel (default: nino34/nino34_HadlSST.csv)')
+if "ipykernel" in sys.modules:
+    args, _ = parser.parse_known_args([
+        '--start-year', '1979',
+        '--end-year', '2000',
+    ])
+else:
+    args, _ = parser.parse_known_args()
 
 scratch_path = "/work/scratch-nopw2/hhhn2"
 base_dir = os.getcwd()
@@ -45,6 +67,7 @@ p_min = args.p_min * 100  # Convert hPa to Pa
 p_max = args.p_max * 100
 analysis_start_yr = start_yr
 analysis_end_yr = end_yr
+DEFAULT_ENSO_CSV = os.path.join(base_dir, 'nino34', 'nino34_HadlSST.csv')
 
 # Resolve requested variable name to an actual data variable in the dataset.
 def _resolve_var(ds, var):
@@ -75,8 +98,69 @@ def _resolve_var(ds, var):
     raise KeyError(f"Variable '{var}' not found in dataset; tried: {candidates}")
 
 
+def _load_precomputed_aam_anomaly(nc_path: str, component: str = 'AAM') -> xr.DataArray:
+    """Load a precomputed AAM anomaly NetCDF file produced by this workspace."""
+    ds = xr.open_dataset(nc_path)
+    try:
+        candidates = (
+            f'{component}_anomaly',
+            component,
+            'AAM_anomaly',
+            'AAMA',
+        )
+        for name in candidates:
+            if name in ds.data_vars:
+                return ds[name].load()
+        if len(ds.data_vars) == 1:
+            return next(iter(ds.data_vars.values())).load()
+        raise KeyError(f"Could not identify anomaly variable in {nc_path}; available={list(ds.data_vars)}")
+    finally:
+        ds.close()
+
+
+def _load_nino34_csv(csv_path: str, start_year: int, end_year: int) -> tuple[pd.DatetimeIndex, np.ndarray]:
+    """Load monthly Niño3.4 values from the provided CSV file."""
+    df = pd.read_csv(csv_path, skiprows=1, names=['Date', 'NINO34'])
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df['NINO34'] = pd.to_numeric(df['NINO34'], errors='coerce')
+    df = df.dropna(subset=['Date', 'NINO34'])
+    df = df[(df['Date'].dt.year >= start_year) & (df['Date'].dt.year <= end_year)]
+    if df.empty:
+        return pd.DatetimeIndex([]), np.array([], dtype=float)
+    return pd.DatetimeIndex(df['Date']), df['NINO34'].to_numpy(dtype=float)
+
+
+def _find_precomputed_aam_anomaly(output_dir: str, start_year: int, end_year: int, p_min_hpa: float, p_max_hpa: float) -> Optional[str]:
+    """Return a saved anomaly NetCDF that covers the requested years, if one exists."""
+    pattern = os.path.join(output_dir, f"AAM_anomalies_*_p{int(p_min_hpa)}-{int(p_max_hpa)}hPa.nc")
+    candidates = sorted(glob.glob(pattern))
+    matching = []
+
+    for nc_path in candidates:
+        try:
+            with xr.open_dataset(nc_path) as ds:
+                if 'time' not in ds.coords and 'time' not in ds.dims:
+                    continue
+                time_index = pd.DatetimeIndex(pd.to_datetime(ds['time'].values))
+                if time_index.empty:
+                    continue
+                file_start = int(time_index.min().year)
+                file_end = int(time_index.max().year)
+        except Exception:
+            continue
+
+        if file_start <= start_year and file_end >= end_year:
+            matching.append((file_start, file_end, nc_path))
+
+    if matching:
+        matching.sort(key=lambda item: (item[1] - item[0], item[0]))
+        return matching[0][2]
+
+    return None
+
+
 def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cmap_name='RdBu_r', 
-                       vmin=None, vmax=None, savefile=None, show=True):
+                       vmin=None, vmax=None, savefile=None, show=True, input_nc_path=None, enso_csv_path=None):
     """Plot AAM anomalies (variation from climatological mean) for a given period.
 
     Loads files matching `AAM_ERA5_{year}*.nc` from `AAM_data/monthly_mean/` for all years
@@ -97,6 +181,192 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
         (fig, ax): Matplotlib figure and axis.
     """
     
+    precomputed_nc = input_nc_path
+    if precomputed_nc is None:
+        precomputed_nc = _find_precomputed_aam_anomaly(output_dir, start_year, end_year, args.p_min, args.p_max)
+        if precomputed_nc is None:
+            precomputed_nc = os.path.join(output_dir, f"AAM_anomalies_{start_year}-{end_year}_p{int(p_min/100)}-{int(p_max/100)}hPa.nc")
+
+    if enso_csv_path is None:
+        enso_csv_path = DEFAULT_ENSO_CSV
+
+    if os.path.exists(precomputed_nc):
+        print(f"Loading precomputed AAM anomalies from {precomputed_nc}")
+        anomalies = _load_precomputed_aam_anomaly(precomputed_nc, component=component)
+
+        # Normalize common dim names for plotting.
+        rename = {}
+        if 'lat' in anomalies.dims and 'latitude' not in anomalies.dims:
+            rename['lat'] = 'latitude'
+        if 'lon' in anomalies.dims and 'longitude' not in anomalies.dims:
+            rename['lon'] = 'longitude'
+        if rename:
+            anomalies = anomalies.rename(rename)
+
+        if 'time' not in anomalies.dims or 'latitude' not in anomalies.dims:
+            raise ValueError(f'Precomputed anomaly file must have dims (time, latitude); got {anomalies.dims}')
+
+        anomaly_attrs = anomalies.attrs
+        times = pd.DatetimeIndex(pd.to_datetime(anomalies['time'].values))
+        time_mask = (times.year >= start_year) & (times.year <= end_year)
+        if time_mask.any() and not time_mask.all():
+            anomalies = anomalies.isel(time=np.where(time_mask)[0])
+            times = pd.DatetimeIndex(pd.to_datetime(anomalies['time'].values))
+        lats = np.asarray(anomalies['latitude'].values, dtype=float)
+        data = np.asarray(anomalies.values, dtype=float)
+        if lats[0] > lats[-1]:
+            lats = lats[::-1]
+            data = data[:, ::-1]
+
+        if data.ndim != 2:
+            raise ValueError(f'Expected a 2D anomaly field (time, latitude); got shape {data.shape}')
+
+        if vmin is None:
+            vmin = np.nanpercentile(data, 1)
+        if vmax is None:
+            vmax = np.nanpercentile(data, 99)
+        abs_max = max(abs(vmin), abs(vmax))
+        vmin, vmax = -abs_max, abs_max
+
+        print(f"Initial color limits: vmin={vmin:.2e}, vmax={vmax:.2e}")
+        print(f"Final symmetric color limits: vmin={vmin:.2e}, vmax={vmax:.2e}")
+
+        levels = np.linspace(vmin, vmax, nlevels)
+        colormaps = getattr(mpl, 'colormaps', None)
+        base_cmap = colormaps.get_cmap(cmap_name) if colormaps is not None else cm.get_cmap(cmap_name)
+        cmap_disc = ListedColormap(base_cmap(np.linspace(0, 1, nlevels - 1)))
+        norm = BoundaryNorm(levels, ncolors=cmap_disc.N, clip=True)
+
+        fig = plt.figure(figsize=(16, 6), constrained_layout=False)
+        gs = fig.add_gridspec(nrows=3, ncols=1, height_ratios=[6.0, 1.0, 0.18], hspace=0.08)
+        ax = fig.add_subplot(gs[0, 0])
+        ax_enso = fig.add_subplot(gs[1, 0], sharex=ax)
+        cax = fig.add_subplot(gs[2, 0])
+
+        times_num = np.asarray(mdates.date2num(times.to_pydatetime()), dtype=float)
+        im = ax.imshow(
+            data.T,
+            origin='lower',
+            aspect='auto',
+            cmap=cmap_disc,
+            norm=norm,
+            extent=[times_num[0], times_num[-1], lats[0], lats[-1]],
+            interpolation='bilinear',
+        )
+
+        ax.xaxis_date()
+        years = np.unique(times.year)
+        n_years = len(years)
+        font_size = 14
+        chars = 4
+        char_width_pt = font_size * 0.6
+        label_width_in = (char_width_pt / 72.0) * chars
+        axis_width_in = fig.get_size_inches()[0] * ax.get_position().width
+        required_width_in = n_years * label_width_in * 1.05
+        major_locator = mdates.YearLocator(5) if required_width_in > axis_width_in else mdates.YearLocator(5)
+        # ax.xaxis.set_major_locator(major_locator)
+        # ax.xaxis.set_minor_locator(mdates.MonthLocator(bymonth=(1, 3,5,7,9,11)))
+        ax.xaxis.set_major_locator(mdates.YearLocator(5))
+        ax.xaxis.set_minor_locator(mdates.YearLocator(1))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        plt.setp(ax.get_xticklabels(), ha='center', size=font_size)
+        plt.setp(ax.get_yticklabels(), size=14)
+
+        ax.set_ylim(-60,60)
+        ax.set_ylabel('Latitude (°)', size=16)
+        ax.set_xlabel('', size=16)
+        ax.set_title(
+            f"ERA5 zonally-integrated {component} fluctuations from Climatology ({start_year}-{end_year})\n"
+            f"(Summed: {p_min/100:.0f}-{p_max/100:.0f} hPa)",
+            size=18,
+        )
+        ax.grid(True, alpha=0.3)
+        ax.axhline(y=0, color='black', linewidth=1.5, linestyle='-', zorder=10)
+
+        cbar = fig.colorbar(
+            im,
+            cax=cax,
+            boundaries=levels,
+            extend='both',
+            orientation='horizontal',
+            spacing='proportional',
+        )
+        tick_spacing = max(1, len(levels)//8)
+        cbar.set_ticks(levels[::tick_spacing].tolist())
+
+        max_abs_value = max(abs(vmin), abs(vmax))
+        if max_abs_value >= 1e3 or max_abs_value <= 1e-3:
+            order = int(np.floor(np.log10(max_abs_value)))
+            factor = 10**order
+
+            def _superscript(exp):
+                superscript_map = {'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '-': '⁻'}
+                return ''.join(superscript_map.get(c, c) for c in str(exp))
+
+            units = anomaly_attrs.get('units', '')
+            if units:
+                units_formatted = units.replace('**', '^').replace('m^2', 'm²').replace('s^-1', 's⁻¹').replace('kg^-1', 'kg⁻¹')
+                units_formatted = units_formatted.replace('m^-2', 'm⁻²').replace('s^-2', 's⁻²').replace('kg^-2', 'kg⁻²')
+                units_formatted = units_formatted.replace('^2', '²').replace('^-1', '⁻¹').replace('^3', '³')
+                units_formatted = units_formatted.replace('^-2', '⁻²').replace('^-3', '⁻³').replace('^1', '¹')
+                label_text = f"{component} Anomalies 10{_superscript(order)} {units_formatted} per latitude band"
+            else:
+                label_text = f"{component} Anomalies 10{_superscript(order)} (kg m² s⁻¹ per latitude band)"
+            cbar.set_ticklabels([f'{val/factor:.1f}' for val in levels[::tick_spacing]])
+        else:
+            units = anomaly_attrs.get('units', '')
+            if units:
+                units_formatted = units.replace('**', '^').replace('m^2', 'm²').replace('s^-1', 's⁻¹').replace('kg^-1', 'kg⁻¹')
+                units_formatted = units_formatted.replace('m^-2', 'm⁻²').replace('s^-2', 's⁻²').replace('kg^-2', 'kg⁻²')
+                units_formatted = units_formatted.replace('^2', '²').replace('^-1', '⁻¹').replace('^3', '³')
+                units_formatted = units_formatted.replace('^-2', '⁻²').replace('^-3', '⁻³').replace('^1', '¹')
+                label_text = f"{component} Anomalies ({units_formatted} per latitude band)"
+            else:
+                label_text = f"{component} Anomalies (kg m² s⁻¹ per latitude band)"
+
+        cbar.set_label(label_text, rotation=0, labelpad=10, size=14)
+        cbar.ax.tick_params(labelsize=12)
+
+        enso_times, enso_vals = _load_nino34_csv(enso_csv_path, start_year, end_year)
+        if len(enso_vals) > 0:
+            enso_times_num = np.asarray(mdates.date2num(enso_times.to_pydatetime()), dtype=float)
+            enso_vals = np.asarray(enso_vals, dtype=float).reshape(-1)
+            ax_enso.plot(enso_times_num, enso_vals, color='black', linewidth=1.5)
+            ax_enso.fill_between(enso_times_num, 0.0, enso_vals, where=enso_vals >= 0, color='red', alpha=0.35, interpolate=True)
+            ax_enso.fill_between(enso_times_num, 0.0, enso_vals, where=enso_vals < 0, color='blue', alpha=0.35, interpolate=True)
+            ax_enso.axhline(0.0, color='black', linewidth=1.0, alpha=0.8)
+            ax_enso.set_ylabel('Niño3.4', size=14)
+            ax_enso.set_ylim(-2.5, 2.5)
+            ax_enso.grid(True, alpha=0.3)
+        else:
+            ax_enso.text(0.5, 0.5, 'No Niño3.4 data available', ha='center', va='center', transform=ax_enso.transAxes)
+            ax_enso.set_ylabel('Niño3.4', size=14)
+
+        plt.setp(ax.get_xticklabels(), visible=False)
+        ax_enso.xaxis_date()
+        # ax_enso.xaxis.set_major_locator(major_locator)
+        # ax_enso.xaxis.set_minor_locator(mdates.MonthLocator(bymonth=(1, 3,5,7,9,11)))
+        ax.xaxis.set_major_locator(mdates.YearLocator(5))
+        ax.xaxis.set_minor_locator(mdates.YearLocator(1))
+        ax_enso.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        ax_enso.set_xlabel('Year', size=16)
+        plt.setp(ax_enso.get_xticklabels(), ha='center', size=font_size)
+
+        fig.align_ylabels([ax, ax_enso])
+        fig.subplots_adjust(top=0.92, bottom=0.08)
+        cax_pos = cax.get_position()
+        cax.set_position([cax_pos.x0, cax_pos.y0 - 0.1, cax_pos.width, cax_pos.height * 0.75])
+
+        if savefile:
+            save_path = os.path.join(output_dir, savefile)
+            fig.savefig(save_path, dpi=500, bbox_inches='tight')
+            print(f"Figure saved to: {save_path}")
+
+        if show:
+            plt.show()
+
+        return fig, ax
+
     # Load all data needed for either the analysis window or climatology window.
     data_start_year = min(start_year, clim_start)
     data_end_year = max(end_year, clim_end)
@@ -357,7 +627,7 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
     else:
         major_locator = mdates.YearLocator(1)
     ax.xaxis.set_major_locator(major_locator)
-    ax.xaxis.set_minor_locator(mdates.MonthLocator(bymonth=(1, 7)))
+    # ax.xaxis.set_minor_locator(mdates.MonthLocator(bymonth=(1,3,5,7,9,11)))
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
     plt.setp(ax.get_xticklabels(), ha='center', size=font_size)
     plt.setp(ax.get_yticklabels(), size=14)
@@ -458,7 +728,9 @@ if __name__ == '__main__':
     savefile = f'AAM_anomalies_{start_yr}-{end_yr}_p{int(p_min/100)}-{int(p_max/100)}hPa.png'
     plot_AAM_anomalies(start_yr, end_yr, component='AAM', 
                        savefile=savefile, 
-                       show=True)
+                       show=True,
+                       input_nc_path=args.input_nc,
+                       enso_csv_path=args.enso_csv)
     
     
 # %%

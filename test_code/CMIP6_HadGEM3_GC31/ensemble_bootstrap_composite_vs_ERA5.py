@@ -1,26 +1,11 @@
 """
-Bootstrapping test of the AAM composite signal
-Usage
-- Run from AAM/test_code/ with:
-python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --rolling-period 3
+This code compares the HadGEM3 bootstrap composites from a pool of events per member
+with ERA5 observational reanalysis (regarded as reference/truth) all event simple mean composites. 
 
-To detect La Niña events instead of El Niño, use:
-python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --rolling-period 1 --enso-state la_nina --nino-threshold -0.5
-
-To restrict composite to events that onset in NDJFM only:
-python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --rolling-period 3 --onset-season ndjfm
-
-To composite 24 months starting from December of each onset year:
-python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --composite-months 24 --composite-start december_onset_year
-
-To detect La Niña events that onset in NDJFM and composite 24 months from onset month:
-python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --member 1 --composite-start onset --onset-season ndjfm --enso-state la_nina --nino-threshold -0.5
-
-To composite El Niño events whose threshold never returns above 0.5 for the next 12 months after the event ends, omit `--allow-reinitiation`.
-If you want to compare against the old behavior, add `--allow-reinitiation`.
-Reference 
-Hardiman et al., 2025
-https://doi.org/10.1038/s41612-025-01283-7
+It will first perform a regrid (bilinear interpolation) to upscale the ERA5 data.
+Then it will compute statistics (pattern correlation, normalized std, RMSE) for each HadGEM3 member 
+bootstrap composite against the reference ERA5 composite, and plot Taylor diagrams to visualize the distribution of skill across the bootstrap samples.
+Default bootstrap settings: 2000 iteratiosn, 95% confidence level, pooled resampling across all events (not block bootstrapping).
 """
 # %%
 import xarray as xr
@@ -35,8 +20,13 @@ import argparse
 from pathlib import Path
 from typing import Optional, Tuple
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from utilities import _to_per_latitude_band, _reindex_to_climatology_dims, vertical_sum_over_pressure_range, get_ENSO_index, pressure_range_in_coord_units
-from plotting_utils import plot_latitude_level_snapshots_HadGEN3, plot_lat_lon_snapshots
+from utilities import _to_per_latitude_band, _reindex_to_climatology_dims, vertical_sum_over_pressure_range, get_ENSO_index, pressure_range_in_coord_units, REGION_BOUNDS
+from plotting_utils import (
+    compute_taylor_stats_against_reference,
+    plot_latitude_level_snapshots_HadGEN3,
+    plot_lat_lon_snapshots,
+    plot_taylor_diagram_from_stats,
+)
 import tqdm
 from scipy import stats as _stats
 from matplotlib import pyplot as plt
@@ -94,154 +84,199 @@ REGION_BOUNDS = {
 
 import matplotlib.pyplot as plt
 import numpy as np
+ERA5_RESULTS_DIR = Path(__file__).resolve().parents[1] / "era5" / "composite_non_tracking"
 
-class TaylorDiagram(object):
+def _safe_label_float(value):
+    return f"{float(value):g}"
+
+
+def _load_era5_composite_truth(comp_type: str) -> Optional[xr.DataArray]:
+    """Load the single ERA5 deterministic composite used as ground truth."""
+    if comp_type != "aam":
+        return None
+
+    era5_path = Path(ref_ERA5_composite_dir) / (
+        f"ERA5_Composite_AAM_{args.enso_state}_{args.start_year}-{args.end_year}_"
+        f"{args.p_min:g}-{args.p_max:g}hPa_onset_{args.onset_season}"
+        f"_start_{args.composite_start}_region_{args.region}.nc"
+    )
+
+    if not era5_path.exists():
+        print(f"ERA5 mean composite not found: {era5_path}")
+        return None
+
+    try:
+        ds = xr.open_dataset(era5_path)
+        for var_name in ("composite_mean", "ens_mean", "AAMA", "aam_mean"):
+            if var_name in ds:
+                truth = ds[var_name].copy()
+                ds.close()
+                truth.attrs["source_path"] = str(era5_path)
+                return truth
+        if len(ds.data_vars) == 1:
+            var_name = next(iter(ds.data_vars))
+            truth = ds[var_name].copy()
+            ds.close()
+            truth.attrs["source_path"] = str(era5_path)
+            return truth
+        available = list(ds.data_vars)
+        ds.close()
+        print(f"Could not identify ERA5 truth variable in {era5_path}; variables={available}")
+        return None
+    except Exception as e:
+        print(f"Error loading ERA5 truth from {era5_path}: {e}")
+        return None
+
+
+def _regrid_reference_to_target_grid(
+    reference_da: xr.DataArray,
+    target_da: xr.DataArray,
+) -> tuple[xr.DataArray, xr.DataArray]:
+    """Interpolate the fixed reference field onto the target bootstrap grid.
+
+    The Taylor comparison should keep the reference deterministic. This helper
+    only remaps ERA5 to the HadGEM3 coordinates; it does not create a bootstrap
+    ensemble from ERA5.
     """
-    Taylor diagram.
-    Plot model standard deviation and correlation to reference (data).
-    """
-    def __init__(self, refstd, fig=None, rect=111, label='_'):
-        from matplotlib.projections import PolarAxes
-        import mpl_toolkits.axisartist.floating_axes as FA
-        import mpl_toolkits.axisartist.grid_finder as GF
+    reference = _standardize_taylor_dims(reference_da)
+    target = _standardize_taylor_dims(target_da)
 
-        # 1. Update the angle (Correlation) limits
-        # arccos(1.0) = 0 radians, arccos(0.8) approx 0.64 radians
-        min_corr = 0.8
-        max_angle = np.arccos(min_corr) 
+    interp_coords: dict[str, xr.DataArray] = {}
+    for dim in reference.dims:
+        if dim == "iteration" or dim not in target.dims:
+            continue
+        if dim in target.coords:
+            interp_coords[dim] = target[dim]
 
-        # 2. Update the radial (Std Dev) limits
-        min_std = 0.8
-        max_std = 1.2
-        
-        self.refstd = refstd
-        tr = PolarAxes.PolarTransform()
-        rlocs = np.array([0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2]) * refstd * 1.5
-        tlocs = np.arccos([0, 0.2, 0.4, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0])
-        gl1 = GF.FixedLocator(tlocs)
-        tf1 = GF.DictFormatter(dict(zip(tlocs, [
-            '0', '0.2', '0.4', '0.6', '0.7', '0.8', '0.9', '0.95', '0.99', '1.0'
-        ])))
-        gl2 = GF.FixedLocator(rlocs)
-        rloc_labels = [f"{val:.2f}" for val in rlocs]
-        tf2 = GF.DictFormatter(dict(zip(rlocs, rloc_labels)))
+    ### This is gonna produce bunch of issues if not handled properly, i.e.
+    ## the end point values and the ordering of the lat/lon
+    if interp_coords:
+        try:
+            reference = reference.interp(interp_coords, method="linear")
+        except Exception:
+            reference = reference.reindex(interp_coords, method="nearest")
 
-        # ghelper = FA.GridHelperCurveLinear(tr, extremes=(0, np.pi/2, 0, refstd * 1.5),
-        #                                    grid_locator1=gl1, tick_formatter1=tf1,
-        #                                    grid_locator2=gl2, tick_formatter2=tf2)
-        
-        ghelper = FA.GridHelperCurveLinear(tr, extremes=(0, max_angle, min_std, max_std),
-                                            grid_locator1=gl1, tick_formatter1=tf1,
-                                            grid_locator2=gl2, tick_formatter2=tf2)
-        if fig is None:
-            fig = plt.figure()
-        ax = FA.FloatingSubplot(fig, rect, grid_helper=ghelper)
-        fig.add_subplot(ax)
-        
-        ax.axis["top"].set_axis_direction("bottom")
-        ax.axis["top"].toggle(ticklabels=True, label=True)
-        ax.axis["top"].major_ticklabels.set_axis_direction("top")
-        ax.axis["top"].label.set_text("Correlation")
-        ax.axis["top"].label.set_axis_direction("top")
-        ax.axis["top"].label.set_fontsize(16)
+    shared_dims = [dim for dim in target.dims if dim in reference.dims and dim != "iteration"]
+    if not shared_dims:
+        raise ValueError(
+            f"No shared dimensions between reference {reference.dims} and target {target.dims}"
+        )
 
-        ax.axis["left"].set_axis_direction("bottom")
-        ax.axis["left"].label.set_text("Standard deviation")
-        ax.axis["left"].label.set_fontsize(16)
-        
-        ax.axis["right"].set_axis_direction("top")
-        ax.axis["right"].toggle(ticklabels=True)
-        ax.axis["right"].major_ticklabels.set_axis_direction("left")
-        ax.axis["left"].major_ticklabels.set_fontsize(14)
-        ax.axis["top"].major_ticklabels.set_fontsize(14)
-        
-        ax.axis["bottom"].set_visible(False)
-        self._ax = ax
-        self.ax = ax.get_aux_axes(tr)
-        
-        # Add reference point
-        l, = self.ax.plot([0], self.refstd, 'k*', ls='', ms=10, label=label)
-        t = np.linspace(0, np.pi/2)
-        r = np.zeros_like(t) + self.refstd
-        self.ax.plot(t, r, 'k--', label='_')
-        
-    def add_sample(self, stddev, corrcoef, *args, **kwargs):
-        """Add sample to the Taylor diagram."""
-        l, = self.ax.plot(np.arccos(corrcoef), stddev, *args, **kwargs)
-        return l
+    return reference.transpose(*shared_dims), target.transpose("iteration", *shared_dims)
+
+
+def _standardize_taylor_dims(da: xr.DataArray) -> xr.DataArray:
+    rename_map = {}
+    if "lat" in da.dims and "latitude" not in da.dims:
+        rename_map["lat"] = "latitude"
+    if "lon" in da.dims and "longitude" not in da.dims:
+        rename_map["lon"] = "longitude"
+    if "time" in da.dims and "month" not in da.dims:
+        rename_map["time"] = "month"
+    if rename_map:
+        da = da.rename(rename_map)
+    return da
+
+
+def _align_bootstrap_to_truth(truth_da: xr.DataArray, boot_ds: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
+    """Align HadGEM bootstrap iterations to the ERA5 truth grid before flattening."""
+    truth = _standardize_taylor_dims(truth_da)
+    boot = _standardize_taylor_dims(boot_ds)
+
+    for dim in truth.dims:
+        if dim == "quantile":
+            truth = truth.squeeze(dim, drop=True)
+            continue
+        if dim not in boot.dims:
+            continue
+        if dim in truth.coords and dim in boot.coords:
+            try:
+                boot = boot.interp({dim: truth[dim]}, kwargs={"fill_value": "extrapolate"})
+            except Exception:
+                boot = boot.reindex({dim: truth[dim]}, method="nearest")
+
+    shared_dims = [dim for dim in truth.dims if dim in boot.dims and dim != "iteration"]
+    if not shared_dims:
+        raise ValueError(f"No shared dimensions between ERA5 truth {truth.dims} and HadGEM bootstrap {boot.dims}")
+    return truth.transpose(*shared_dims), boot.transpose("iteration", *shared_dims)
+
+
+def plot_hadgem_bootstrap_taylor_vs_era5(
+    boot_ds: xr.DataArray,
+    comp_type: str,
+    label: str,
+    output_dir: str,
+) -> Optional[str]:
+    """Taylor diagram of all HadGEM3 bootstrap composites against ERA5 truth."""
+    import os
+
+    era5_truth = _load_era5_composite_truth(comp_type)
+    if era5_truth is None:
+        return None
+
+    try:
+        ref_da, boot_aligned = _regrid_reference_to_target_grid(era5_truth, boot_ds)
+    except Exception as e:
+        print(f"Skipping ERA5 Taylor diagram for {comp_type} {label}: alignment failed: {e}")
+        return None
+
+    df = compute_taylor_stats_against_reference(ref_da, boot_aligned, sample_dim="iteration")
+    if df.empty:
+        print(f"Skipping ERA5 Taylor diagram for {comp_type} {label}: no valid bootstrap samples.")
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(
+        output_dir,
+        f"Taylor_Stats_HadGEM3_bootstrap_vs_ERA5_{comp_type}_{label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.csv",
+    )
+    pct_path = os.path.join(
+        output_dir,
+        f"Taylor_Percentiles_HadGEM3_bootstrap_vs_ERA5_{comp_type}_{label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.csv",
+    )
+    era5_source = era5_truth.attrs.get("source_path", "ERA5 composite")
+    save_path = os.path.join(
+        output_dir,
+        f"Taylor_HadGEM3_bootstrap_vs_ERA5_{comp_type}_{label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.png",
+    )
+    ok = plot_taylor_diagram_from_stats(
+        df,
+        output_path=save_path,
+        stats_csv_path=csv_path,
+        percentiles_csv_path=pct_path,
+        title=(
+            f"Taylor Diagram: HadGEM3 bootstrap {comp_type.upper()} vs ERA5 truth\n"
+            f"{label}; ERA5={os.path.basename(str(era5_source))}"
+        ),
+        reference_label="ERA5 truth",
+        sample_label="HadGEM3 bootstrap",
+        min_corr=0.9,
+        min_std=0.8,
+        max_std=1.2,
+    )
+    return save_path if ok else None
 
 
 def plot_bootstrap_taylor_diagram(ref_da, boot_ds, comp_type, label, output_dir, external_ref_name="Ens Mean"):
     """Plot a Taylor diagram for bootstrap iterations against a reference field."""
-    import os
-
     os.makedirs(output_dir, exist_ok=True)
-
-    ref_flat = np.asarray(ref_da.values, dtype=float).ravel()
-    ref_mask = np.isfinite(ref_flat)
-    ref_flat = ref_flat[ref_mask]
-
-    if ref_flat.size == 0:
-        print(f"Skipping Taylor diagram for {comp_type} {label}: reference has no finite values.")
-        return
-
-    ref_mean = float(np.mean(ref_flat))
-    ref_scale = float(np.std(ref_flat))
-    if not np.isfinite(ref_scale) or ref_scale <= 0:
-        print(f"Skipping Taylor diagram for {comp_type} {label}: reference standard deviation is invalid ({ref_scale}).")
-        return
-
-    ref_flat = (ref_flat - ref_mean) / ref_scale
-    ref_std = 1.0
-    fig = plt.figure(figsize=(10, 8))
-    dia = TaylorDiagram(ref_std, fig=fig, label=external_ref_name)
-
-    n_iterations = int(boot_ds.sizes.get('iteration', 0))
-    if n_iterations <= 0:
-        print(f"Skipping Taylor diagram for {comp_type} {label}: no bootstrap iterations available.")
-        return
-
-    sample_count = min(200, n_iterations)
-    rng = np.random.default_rng(0)
-    indices = rng.choice(n_iterations, size=sample_count, replace=False)
-    stats_to_save = []
-
-    for iteration_idx in indices:
-        sample_flat = np.asarray(boot_ds.isel(iteration=iteration_idx).values, dtype=float).ravel()
-        sample_flat = sample_flat[ref_mask]
-        if sample_flat.size != ref_flat.size or sample_flat.size == 0:
-            continue
-        sample_flat = (sample_flat - ref_mean) / ref_scale
-        corr = float(np.corrcoef(ref_flat, sample_flat)[0, 1])
-        if not np.isfinite(corr):
-            continue
-        std = float(np.std(sample_flat))
-        stats_to_save.append({'iteration': int(iteration_idx), 'std': std, 'corr': corr})
-        dia.add_sample(std, corr, marker='o', color='royalblue', alpha=0.2, ms=3, ls='')
-
-    if not stats_to_save:
-        plt.close(fig)
-        print(f"Skipping Taylor diagram for {comp_type} {label}: no valid bootstrap samples.")
-        return
-
-    df = pd.DataFrame(stats_to_save)
+    df = compute_taylor_stats_against_reference(ref_da, boot_ds, sample_dim="iteration")
     csv_path = os.path.join(
         output_dir,
         f"Taylor_Stats_{comp_type}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{label}.csv",
     )
-    df.to_csv(csv_path, index=False)
-    print(f"Saved bootstrap Taylor statistics to {csv_path}")
-
-    plt.legend(loc='upper right', bbox_to_anchor=(1.2, 1.1))
-    plt.title(f"Taylor Diagram: {comp_type.upper()} {label}\nBootstrap iterations vs {external_ref_name}")
-
     save_path = os.path.join(
         output_dir,
         f"Taylor_Bootstrap_{comp_type}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{label}.png",
     )
-    fig.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Saved bootstrap Taylor diagram to {save_path}")
+    return plot_taylor_diagram_from_stats(
+        df,
+        output_path=save_path,
+        stats_csv_path=csv_path,
+        title=f"Taylor Diagram: {comp_type.upper()} {label}\nBootstrap iterations vs {external_ref_name}",
+        reference_label=external_ref_name,
+        sample_label="HadGEM3 bootstrap",
+    )
 
 def bootstrap_pooled_events(event_stack, dim='event', n_iterations=2000, confidence_level=0.95):
     """
@@ -344,13 +379,15 @@ base_dir = os.getcwd()
 # Use scratch space and new directory structure due to workspace migration
 CMIP6_path_base = "/work/scratch-nopw2/hhhn2"
 nino34_directory = f"{CMIP6_path_base}/HadGEM3-GC31-LL/ProcessedFlds/Omon/sst_indices/nino34/historical/"
-output_dir = f"{base_dir}/figures/may_2026/bootstrap/"
+output_dir = f"{base_dir}/figures/may_2026/bootstrap_per_memberc_vs_era5/"
 climatology_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/AAM/climatology/"
 AAM_data_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/AAM/full/"
 u_data_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/Amon/ua/historical"
 uv_data_path_base = f"{CMIP6_path_base}/HadGEM3-GC31-LL/Amon/uv/historical"
 ensemble_mean_output_path = f"{CMIP6_path_base}/HadGEM3-GC31-LL/AAM/ensemble_mean_composite/" 
-ensemble_results_dir = f"{base_dir}/event_composite_ensemble_mean_bootstrap_results/"  # Store composites, significance, active-month data
+ensemble_results_dir = f"{base_dir}/event_composite_per_member_bootstrap_vs_era5_results/"  # Store composites, significance, active-month data
+ref_ERA5_composite_dir = f"/home/users/hhhn2/AAM/test_code/era5/composite_non_tracking/" 
+
 
 u_level_to_plot = 250.0  # hPa
 save_ensemble_mean_netcdf = True  # Save region-specific netCDF files for each run
@@ -616,6 +653,14 @@ def compute_and_save_composite_significance(
             results_dir,
             external_ref_name="Ensemble Mean",
         )
+
+        if composite_type == 'aam' and strength_label == 'all':
+            plot_hadgem_bootstrap_taylor_vs_era5(
+                boot_ds,
+                composite_type,
+                strength_label,
+                results_dir,
+            )
 
         # Save results to NetCDF (including the mask and bounds)
         filepath = save_composite_results(

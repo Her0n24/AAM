@@ -11,8 +11,8 @@ args = parser.parse_args()
 
 scratch_path = "/work/scratch-nopw2/hhhn2"
 base_path = f"{scratch_path}/ERA5/monthly_mean/variables"
-start_year = 1980
-end_year = 1999
+start_year = 1981
+end_year = 2010
 
 missing_files = []
 

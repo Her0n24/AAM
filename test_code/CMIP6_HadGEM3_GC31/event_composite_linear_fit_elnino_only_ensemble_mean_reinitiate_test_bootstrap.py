@@ -1,26 +1,11 @@
 """
 Bootstrapping test of the AAM composite signal
-Usage
-- Run from AAM/test_code/ with:
-python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --rolling-period 3
 
-To detect La Niña events instead of El Niño, use:
-python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --rolling-period 1 --enso-state la_nina --nino-threshold -0.5
+This script performs a bootstrap composite of the pool of all detected El Niño events in the HadGEM3-GC31-LL historical ensemble
+across all members. It will then compare all these bootstrap iterations with
+ensemble mean composite using Taylor diagrams to assess the significance of the observed composite signal.
 
-To restrict composite to events that onset in NDJFM only:
-python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --rolling-period 3 --onset-season ndjfm
-
-To composite 24 months starting from December of each onset year:
-python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --composite-months 24 --composite-start december_onset_year
-
-To detect La Niña events that onset in NDJFM and composite 24 months from onset month:
-python event_composite_linear_fit_elnino_only.py --start-year 1850 --end-year 2010 --member 1 --composite-start onset --onset-season ndjfm --enso-state la_nina --nino-threshold -0.5
-
-To composite El Niño events whose threshold never returns above 0.5 for the next 12 months after the event ends, omit `--allow-reinitiation`.
-If you want to compare against the old behavior, add `--allow-reinitiation`.
-Reference 
-Hardiman et al., 2025
-https://doi.org/10.1038/s41612-025-01283-7
+Note: The ensemble mean is computed with .mean, not a bootstrap-derived mean.
 """
 # %%
 import xarray as xr
@@ -35,8 +20,14 @@ import argparse
 from pathlib import Path
 from typing import Optional, Tuple
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from utilities import _to_per_latitude_band, _reindex_to_climatology_dims, vertical_sum_over_pressure_range, get_ENSO_index, pressure_range_in_coord_units
-from plotting_utils import plot_latitude_level_snapshots_HadGEN3, plot_lat_lon_snapshots
+from utilities import _infer_latitude_band_width_deg, _to_per_latitude_band, _reindex_to_climatology_dims, vertical_sum_over_pressure_range, get_ENSO_index, pressure_range_in_coord_units
+from plotting_utils import (
+    add_active_month_percent_labels,
+    compute_taylor_stats_against_reference,
+    plot_latitude_level_snapshots_HadGEN3,
+    plot_lat_lon_snapshots,
+    plot_taylor_diagram_from_stats,
+)
 import tqdm
 from scipy import stats as _stats
 from matplotlib import pyplot as plt
@@ -71,7 +62,7 @@ parser.add_argument(
     choices=['all', 'pacific', 'indian', 'atlantic'],
     help='Geographic region to analyze (default: all). Pacific: 125–(-110)°, Indian: 50–100°, Atlantic: -60–10°',
 )
-replot = False  # If True, skip composite calculation and just replot from saved ensemble mean NetCDF
+replot = True  # If True, skip composite calculation and just replot from saved ensemble mean NetCDF
 
 if "ipykernel" in sys.modules:
     args = parser.parse_args([
@@ -95,153 +86,65 @@ REGION_BOUNDS = {
 import matplotlib.pyplot as plt
 import numpy as np
 
-class TaylorDiagram(object):
-    """
-    Taylor diagram.
-    Plot model standard deviation and correlation to reference (data).
-    """
-    def __init__(self, refstd, fig=None, rect=111, label='_'):
-        from matplotlib.projections import PolarAxes
-        import mpl_toolkits.axisartist.floating_axes as FA
-        import mpl_toolkits.axisartist.grid_finder as GF
+def _taylor_stats_csv_path(comp_type, label, output_dir):
+    return os.path.join(
+        output_dir,
+        f"Taylor_Stats_{comp_type}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{label}.csv",
+    )
 
-        # 1. Update the angle (Correlation) limits
-        # arccos(1.0) = 0 radians, arccos(0.8) approx 0.64 radians
-        min_corr = 0.8
-        max_angle = np.arccos(min_corr) 
 
-        # 2. Update the radial (Std Dev) limits
-        min_std = 0.8
-        max_std = 1.2
-        
-        self.refstd = refstd
-        tr = PolarAxes.PolarTransform()
-        rlocs = np.array([0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2]) * refstd * 1.5
-        tlocs = np.arccos([0, 0.2, 0.4, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0])
-        gl1 = GF.FixedLocator(tlocs)
-        tf1 = GF.DictFormatter(dict(zip(tlocs, [
-            '0', '0.2', '0.4', '0.6', '0.7', '0.8', '0.9', '0.95', '0.99', '1.0'
-        ])))
-        gl2 = GF.FixedLocator(rlocs)
-        rloc_labels = [f"{val:.2f}" for val in rlocs]
-        tf2 = GF.DictFormatter(dict(zip(rlocs, rloc_labels)))
-
-        # ghelper = FA.GridHelperCurveLinear(tr, extremes=(0, np.pi/2, 0, refstd * 1.5),
-        #                                    grid_locator1=gl1, tick_formatter1=tf1,
-        #                                    grid_locator2=gl2, tick_formatter2=tf2)
-        
-        ghelper = FA.GridHelperCurveLinear(tr, extremes=(0, max_angle, min_std, max_std),
-                                            grid_locator1=gl1, tick_formatter1=tf1,
-                                            grid_locator2=gl2, tick_formatter2=tf2)
-        if fig is None:
-            fig = plt.figure()
-        ax = FA.FloatingSubplot(fig, rect, grid_helper=ghelper)
-        fig.add_subplot(ax)
-        
-        ax.axis["top"].set_axis_direction("bottom")
-        ax.axis["top"].toggle(ticklabels=True, label=True)
-        ax.axis["top"].major_ticklabels.set_axis_direction("top")
-        ax.axis["top"].label.set_text("Correlation")
-        ax.axis["top"].label.set_axis_direction("top")
-        ax.axis["top"].label.set_fontsize(16)
-
-        ax.axis["left"].set_axis_direction("bottom")
-        ax.axis["left"].label.set_text("Standard deviation")
-        ax.axis["left"].label.set_fontsize(16)
-        
-        ax.axis["right"].set_axis_direction("top")
-        ax.axis["right"].toggle(ticklabels=True)
-        ax.axis["right"].major_ticklabels.set_axis_direction("left")
-        ax.axis["left"].major_ticklabels.set_fontsize(14)
-        ax.axis["top"].major_ticklabels.set_fontsize(14)
-        
-        ax.axis["bottom"].set_visible(False)
-        self._ax = ax
-        self.ax = ax.get_aux_axes(tr)
-        
-        # Add reference point
-        l, = self.ax.plot([0], self.refstd, 'k*', ls='', ms=10, label=label)
-        t = np.linspace(0, np.pi/2)
-        r = np.zeros_like(t) + self.refstd
-        self.ax.plot(t, r, 'k--', label='_')
-        
-    def add_sample(self, stddev, corrcoef, *args, **kwargs):
-        """Add sample to the Taylor diagram."""
-        l, = self.ax.plot(np.arccos(corrcoef), stddev, *args, **kwargs)
-        return l
+def _taylor_plot_png_path(comp_type, label, output_dir):
+    return os.path.join(
+        output_dir,
+        f"Taylor_Bootstrap_{comp_type}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{label}.png",
+    )
 
 
 def plot_bootstrap_taylor_diagram(ref_da, boot_ds, comp_type, label, output_dir, external_ref_name="Ens Mean"):
     """Plot a Taylor diagram for bootstrap iterations against a reference field."""
-    import os
-
     os.makedirs(output_dir, exist_ok=True)
-
-    ref_flat = np.asarray(ref_da.values, dtype=float).ravel()
-    ref_mask = np.isfinite(ref_flat)
-    ref_flat = ref_flat[ref_mask]
-
-    if ref_flat.size == 0:
-        print(f"Skipping Taylor diagram for {comp_type} {label}: reference has no finite values.")
-        return
-
-    ref_mean = float(np.mean(ref_flat))
-    ref_scale = float(np.std(ref_flat))
-    if not np.isfinite(ref_scale) or ref_scale <= 0:
-        print(f"Skipping Taylor diagram for {comp_type} {label}: reference standard deviation is invalid ({ref_scale}).")
-        return
-
-    ref_flat = (ref_flat - ref_mean) / ref_scale
-    ref_std = 1.0
-    fig = plt.figure(figsize=(10, 8))
-    dia = TaylorDiagram(ref_std, fig=fig, label=external_ref_name)
-
-    n_iterations = int(boot_ds.sizes.get('iteration', 0))
-    if n_iterations <= 0:
-        print(f"Skipping Taylor diagram for {comp_type} {label}: no bootstrap iterations available.")
-        return
-
-    sample_count = min(200, n_iterations)
-    rng = np.random.default_rng(0)
-    indices = rng.choice(n_iterations, size=sample_count, replace=False)
-    stats_to_save = []
-
-    for iteration_idx in indices:
-        sample_flat = np.asarray(boot_ds.isel(iteration=iteration_idx).values, dtype=float).ravel()
-        sample_flat = sample_flat[ref_mask]
-        if sample_flat.size != ref_flat.size or sample_flat.size == 0:
-            continue
-        sample_flat = (sample_flat - ref_mean) / ref_scale
-        corr = float(np.corrcoef(ref_flat, sample_flat)[0, 1])
-        if not np.isfinite(corr):
-            continue
-        std = float(np.std(sample_flat))
-        stats_to_save.append({'iteration': int(iteration_idx), 'std': std, 'corr': corr})
-        dia.add_sample(std, corr, marker='o', color='royalblue', alpha=0.2, ms=3, ls='')
-
-    if not stats_to_save:
-        plt.close(fig)
-        print(f"Skipping Taylor diagram for {comp_type} {label}: no valid bootstrap samples.")
-        return
-
-    df = pd.DataFrame(stats_to_save)
-    csv_path = os.path.join(
-        output_dir,
-        f"Taylor_Stats_{comp_type}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{label}.csv",
+    stats_df = compute_taylor_stats_against_reference(ref_da, boot_ds, sample_dim="iteration")
+    return plot_taylor_diagram_from_stats(
+        stats_df,
+        output_path=_taylor_plot_png_path(comp_type, label, output_dir),
+        stats_csv_path=_taylor_stats_csv_path(comp_type, label, output_dir),
+        title=f"Taylor Diagram: {comp_type.upper()} {label}\nBootstrap iterations vs {external_ref_name}",
+        reference_label=external_ref_name,
+        sample_label="HadGEM3 bootstrap",
+        min_corr=0.96,
+        min_std=0.95,
+        max_std=1.1,
     )
-    df.to_csv(csv_path, index=False)
-    print(f"Saved bootstrap Taylor statistics to {csv_path}")
 
-    plt.legend(loc='upper right', bbox_to_anchor=(1.2, 1.1))
-    plt.title(f"Taylor Diagram: {comp_type.upper()} {label}\nBootstrap iterations vs {external_ref_name}")
 
-    save_path = os.path.join(
-        output_dir,
-        f"Taylor_Bootstrap_{comp_type}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{label}.png",
-    )
-    fig.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Saved bootstrap Taylor diagram to {save_path}")
+def plot_all_saved_taylor_diagrams(output_dir):
+    """Plot known Taylor diagrams from saved CSV stats using the shared Taylor plotting function."""
+    combos = [
+        ('aam', 'all'),
+        ('latlev', 'all'),
+        ('latlon', 'all'),
+    ] + [('aam', strength_label) for strength_label, _, _ in EVENT_STRENGTH_BINS]
+
+    n_done = 0
+    for comp_type, label in combos:
+        csv_path = _taylor_stats_csv_path(comp_type, label, output_dir)
+        if not os.path.exists(csv_path):
+            print(f"Taylor stats CSV not found; skipping {comp_type} {label}: {csv_path}")
+            continue
+        stats_df = pd.read_csv(csv_path)
+        if plot_taylor_diagram_from_stats(
+            stats_df,
+            output_path=_taylor_plot_png_path(comp_type, label, output_dir),
+            title=f"Taylor Diagram: {comp_type.upper()} {label}\nBootstrap iterations vs Ensemble Mean",
+            reference_label="Ensemble Mean",
+            sample_label="HadGEM3 bootstrap",
+            min_corr=0.96,
+            min_std=0.9,
+            max_std=1.1,
+        ):
+            n_done += 1
+
+    print(f"Taylor CSV plot complete: regenerated {n_done}/{len(combos)} diagram(s).")
 
 def bootstrap_pooled_events(event_stack, dim='event', n_iterations=2000, confidence_level=0.95):
     """
@@ -818,6 +721,9 @@ def _match_plot_orientation(reference_values, candidate_values):
     )
 
 
+
+
+
 def _plot_and_save_ensemble_mean_aam_composite(
     *,
     ens_stack: xr.DataArray,
@@ -917,12 +823,16 @@ def _plot_and_save_ensemble_mean_aam_composite(
     _abs = max(abs(vmin), abs(vmax))
     order = int(np.floor(np.log10(_abs))) if _abs > 0 else 0
     factor = 10 ** order
+    lat_band_width_deg = _infer_latitude_band_width_deg(lat_vals)
+    lat_band_label = (
+        f"{lat_band_width_deg:g}° latitude band" if lat_band_width_deg is not None else "latitude band"
+    )
 
     cax = fig.add_axes([0.125, 0.06, 0.775, 0.015])
     cbar = fig.colorbar(cf, cax=cax, orientation="horizontal", extend="both")
     _sup = str.maketrans("0123456789-", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207b")
     _order_sup = str(order).translate(_sup)
-    cbar.set_label(f"AAM anomaly (×10{_order_sup})", size=14)
+    cbar.set_label(f"AAM anomaly (×10{_order_sup} kg m² s⁻¹ per {lat_band_label})", size=14)
     tick_levels = list(levels[::2])
     cbar.set_ticks(tick_levels)
     cbar.ax.tick_params(labelsize=11)
@@ -975,37 +885,39 @@ def _plot_and_save_ensemble_mean_aam_composite(
     ax.set_xlabel("Month since onset", fontsize=14)
     ax.set_ylabel("Latitude (°N)", fontsize=14)
 
-    if active_month_percent is not None:
-        pct_cmap = LinearSegmentedColormap.from_list(
-            "enso_active_pct",
-            ["#7c7b66", "#9e833b", "#f39c34", "#e85d3a", "#bd491f"],
-        )
-        pct_norm = Normalize(vmin=0, vmax=100)
-        ax.text(
-            -0.06,
-            -0.155,
-            "ENSO active (%)",
-            transform=ax.transAxes,
-            ha="right",
-            va="center",
-            rotation=90,
-            fontsize=14,
-        )
-        for month_idx, (month_val, pct_val) in enumerate(zip(month_vals, active_month_percent)):
-            if month_idx % 2 != 0:
-                continue
-            ax.text(
-                month_val,
-                -0.19,
-                f"{int(pct_val)}%",
-                transform=ax.get_xaxis_transform(),
-                ha="center",
-                va="top",
-                fontsize=10,
-                fontweight="bold",
-                color=pct_cmap(pct_norm(int(pct_val))),
-                clip_on=False,
-            )
+    add_active_month_percent_labels(ax, month_vals, active_month_percent)
+    
+    # if active_month_percent is not None:
+    #     pct_cmap = LinearSegmentedColormap.from_list(
+    #         "enso_active_pct",
+    #         ["#7c7b66", "#9e833b", "#f39c34", "#e85d3a", "#bd491f"],
+    #     )
+    #     pct_norm = Normalize(vmin=0, vmax=100)
+    #     ax.text(
+    #         -0.06,
+    #         -0.155,
+    #         "ENSO active (%)",
+    #         transform=ax.transAxes,
+    #         ha="right",
+    #         va="center",
+    #         rotation=90,
+    #         fontsize=14,
+    #     )
+    #     for month_idx, (month_val, pct_val) in enumerate(zip(month_vals, active_month_percent)):
+    #         if month_idx % 2 != 0:
+    #             continue
+    #         ax.text(
+    #             month_val,
+    #             -0.19,
+    #             f"{int(pct_val)}%",
+    #             transform=ax.get_xaxis_transform(),
+    #             ha="center",
+    #             va="top",
+    #             fontsize=10,
+    #             fontweight="bold",
+    #             color=pct_cmap(pct_norm(int(pct_val))),
+    #             clip_on=False,
+    #         )
 
     ax.set_xlim(1, len(month_vals))
     ax.set_ylim(-60, 60)
@@ -1137,7 +1049,7 @@ def _process_single_ensemble_member(
         AAM_da = _select_region(AAM_da, args.region)
         
         if "longitude" in AAM_da.dims or "lon" in AAM_da.dims:
-            AAM_da = _to_per_latitude_band(AAM_da)
+            AAM_da, dphi_val = _to_per_latitude_band(AAM_da)
             
         u_da = xr.open_dataset(f"{u_data_path_base}/ua_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc")['ua']
         # Normalize dimension names
@@ -1172,7 +1084,7 @@ def _process_single_ensemble_member(
         clim_aam_data = clim_da['AAM']
         clim_aam_data = _select_region(clim_aam_data, args.region)
         if 'longitude' in clim_aam_data.dims or 'lon' in clim_aam_data.dims:
-            clim_da = _to_per_latitude_band(clim_aam_data)
+            clim_da, dphi_val_clim = _to_per_latitude_band(clim_aam_data)
         else:
             clim_da = clim_aam_data
         
@@ -1343,7 +1255,7 @@ def _process_single_ensemble_member(
         aam_full = AAM_da["AAM"] if isinstance(AAM_da, xr.Dataset) and "AAM" in AAM_da else AAM_da
         aam_full = _select_region(aam_full, args.region)
         if "longitude" in aam_full.dims or "lon" in aam_full.dims:
-            aam_full = _to_per_latitude_band(aam_full)
+            aam_full, dphi_val = _to_per_latitude_band(aam_full)
         
         clim_full = clim_da["AAM"] if isinstance(clim_da, xr.Dataset) and "AAM" in clim_da else clim_da
         # Normalize dimensions
@@ -1926,6 +1838,9 @@ if __name__ == '__main__':
                     strength_active_month_percent_by_label[strength_label] = loaded_strength['active_month_percent']
                     print(f"  Loaded active_month_percent for {strength_label} from bootstrap results")
 
+        # Replot Taylor diagrams directly from previously saved CSV stats.
+        plot_all_saved_taylor_diagrams(ensemble_results_dir)
+
     _cmp = ">" if args.enso_state == "el_nino" else "<"
     _snap_season_label = "  |  NDJFM onsets only" if args.onset_season == "ndjfm" else ""
     _snap_suffix = (
@@ -2029,6 +1944,10 @@ if __name__ == '__main__':
             _abs = max(abs(vmin), abs(vmax))
             order = int(np.floor(np.log10(_abs))) if _abs > 0 else 0
             factor = 10 ** order
+            lat_band_width_deg = _infer_latitude_band_width_deg(lat_vals)
+            lat_band_label = (
+                f"{lat_band_width_deg:g}° latitude band" if lat_band_width_deg is not None else "latitude band"
+            )
 
             cax = fig.add_axes([0.125, 0.06, 0.775, 0.015])
             cbar = fig.colorbar(cf, cax=cax, orientation="horizontal", extend="both")
@@ -2036,7 +1955,7 @@ if __name__ == '__main__':
             _sup = str.maketrans("0123456789-", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207b")
             _order_sup = str(order).translate(_sup)
 
-            cbar.set_label(f"AAM anomaly (×10{_order_sup})", size=14)
+            cbar.set_label(f"AAM anomaly (×10{_order_sup} kg m² s⁻¹ per {lat_band_label})", size=14)
 
             _tick_levels = cf.levels[::2]
             cbar.set_ticks(_tick_levels)
@@ -2097,37 +2016,7 @@ if __name__ == '__main__':
             ax.set_xlabel("Month since onset", fontsize=14)
             ax.set_ylabel("Latitude (°N)", fontsize=14)
 
-            if active_month_percent is not None:
-                pct_cmap = LinearSegmentedColormap.from_list(
-                    "enso_active_pct",
-                    ["#7c7b66", "#9e833b", "#f39c34", "#e85d3a", "#bd491f"],
-                )
-                pct_norm = Normalize(vmin=0, vmax=100)
-                ax.text(
-                    -0.06,
-                    -0.155,
-                    "ENSO active (%)",
-                    transform=ax.transAxes,
-                    ha="right",
-                    va="center",
-                    rotation=90,
-                    fontsize=14,
-                )
-                for month_idx, (month_val, pct_val) in enumerate(zip(month_vals, active_month_percent)):
-                    if month_idx % 2 != 0:
-                        continue
-                    ax.text(
-                        month_val,
-                        -0.19,
-                        f"{int(pct_val)}%",
-                        transform=ax.get_xaxis_transform(),
-                        ha="center",
-                        va="top",
-                        fontsize=10,
-                        fontweight="bold",
-                        color=pct_cmap(pct_norm(int(pct_val))),
-                        clip_on=False,
-                    )
+            add_active_month_percent_labels(ax, month_vals, active_month_percent)
 
 
             ax.set_xlim(1, len(month_vals))
@@ -2391,7 +2280,7 @@ if __name__ == '__main__':
             traceback.print_exc()
 
     strength_desc_map = {
-        "weak": "weak (0.5-0.9)",
+        "weak": "weak (0.5-1.0)",
         "moderate": "moderate (1.0-1.4)",
         "strong": "strong (>=1.5)",
     }

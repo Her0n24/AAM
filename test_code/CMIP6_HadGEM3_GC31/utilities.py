@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Optional, Tuple
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+REGION_BOUNDS = {
+    'all': None,  # no filtering
+    'pacific': (125, -110),      # 125°E to 110°W
+    'indian': (50, 100),         # 50°E to 100°E
+    'atlantic': (-60, 10),       # 60°W to 10°E
+}
+
 def _latitude_band_width_radians(lat_deg: np.ndarray) -> np.ndarray:
     lat_deg = np.asarray(lat_deg, dtype=float)
     if lat_deg.size < 2:
@@ -31,8 +38,21 @@ def _zonal_integral_radians(da: xr.DataArray) -> xr.DataArray:
     da = da.assign_coords({lon_dim: lon_rad}).sortby(lon_dim)
     return da.integrate(lon_dim)
 
+def _infer_latitude_band_width_deg(lat_values):
+    """Infer a representative latitude spacing in degrees for plot labels."""
+    lat_array = np.asarray(lat_values, dtype=float)
+    if lat_array.size < 2:
+        return None
 
-def _to_per_latitude_band(da: xr.DataArray) -> xr.DataArray:
+    lat_array = np.sort(lat_array)
+    diffs = np.diff(lat_array)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size == 0:
+        return None
+
+    return float(np.median(diffs))
+
+def _to_per_latitude_band(da: xr.DataArray) -> tuple[xr.DataArray, float]:
     """
     Converts a zonally integrated xarray.DataArray to per-latitude-band
     values by multiplying with the latitude band width in radians. Expects a
@@ -46,6 +66,7 @@ def _to_per_latitude_band(da: xr.DataArray) -> xr.DataArray:
     da_lonint = _zonal_integral_radians(da)
 
     dphi = _latitude_band_width_radians(da_lonint[lat_dim].values)
+    band_width_deg = float(np.rad2deg(dphi)[0])
     dphi_da = xr.DataArray(dphi, coords={lat_dim: da_lonint[lat_dim]}, dims=(lat_dim,))
     dphi_da.attrs['units'] = 'radian'
 
@@ -53,7 +74,7 @@ def _to_per_latitude_band(da: xr.DataArray) -> xr.DataArray:
     out.attrs = dict(da.attrs)
     out.attrs['zonal_reduction'] = 'integral_radians'
     out.attrs['lat_scaling'] = 'dphi_radians'
-    return out
+    return out, band_width_deg
 
 def _reindex_to_climatology_dims(input_da: xr.DataArray, climatology_da: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
     """Align `input_da` to the non-time dims of `climatology_da`, and expand the climatology over `time`.

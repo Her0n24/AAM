@@ -15,7 +15,8 @@ import argparse
 
 base_dir = os.getcwd()
 scratch_path = "/work/scratch-nopw2/hhhn2"
-Variable_data_path = f"{scratch_path}/ERA5/monthly_mean/AAM/full/" # Full data path (not zonal mean)
+#Variable_data_path = f"{scratch_path}/ERA5/monthly_mean/AAM/full/" # Full data path (not zonal mean)
+Variable_data_path = f"{scratch_path}/ERA5/monthly_mean/variables/"  # Full data path (not zonal mean)
 output_dir = f"{scratch_path}/ERA5/climatology/"
 
 # Create output directory if it doesn't exist
@@ -43,9 +44,10 @@ def make_full_climatology(start_year, end_year, variable, vertically_integrated=
     # Load all data for the specified period
     suf = '_vertint' if vertically_integrated else '_full'
     all_files = []
-    for year in range(start_year, end_year):
+    for year in range(start_year, end_year + 1):
         for month in range(1, 13):
-            pattern = f"{Variable_data_path}{variable}_ERA5_{year}-{month:02d}{suf}.nc"
+            #pattern = f"{Variable_data_path}{variable}_ERA5_{year}-{month:02d}{suf}.nc"
+            pattern = f"{Variable_data_path}ERA5_{variable}_{year}-{month:02d}.nc"
             month_files = glob.glob(pattern)
             if not month_files:
                 print(f"Warning: No files found for {year}-{month:02d}")
@@ -147,7 +149,7 @@ def make_full_climatology(start_year, end_year, variable, vertically_integrated=
     # Add metadata
     data_type = 'vertically integrated' if vertically_integrated or 'level' not in climatology.dims else '3D'
     climatology.attrs['description'] = f'Monthly climatology of {variable} ({data_type})'
-    climatology.attrs['climatology_period'] = f'{start_year}-{end_year-1}'
+    climatology.attrs['climatology_period'] = f'{start_year}-{end_year}'
     climatology.attrs['created_by'] = 'make_full_climatology.py'
     if vertically_integrated:
         climatology.attrs['data_type'] = 'vertically_integrated'

@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --partition=standard
 #SBATCH --qos=high
-#SBATCH --array=1-2900%20
+#SBATCH --array=1-12%12
 
 # Load required modules
 module load jaspy
@@ -16,8 +16,8 @@ module load jaspy
 # Activate virtual environment if you have one
 
 # Run your command
-START_YEAR=1991
-END_YEAR=2019
+START_YEAR=1984
+END_YEAR=1985
 
 MONTH_INDEX=$SLURM_ARRAY_TASK_ID
 

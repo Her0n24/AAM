@@ -26,8 +26,8 @@ print(monthly_mean_path_base)
 # Create save path if it doesn't exist
 os.makedirs(save_path, exist_ok=True)
 
-start_yr = 1980
-end_yr = 2000
+start_yr = 1984
+end_yr = 1985
 
 # Load the a and b sigma level coefficients
 sigma_coeff = pd.read_csv(f'{base_path}/l137_a_b.csv')

@@ -9,17 +9,31 @@ import glob
 import pandas as pd
 import argparse
 
-# Parse command line arguments
-parser = argparse.ArgumentParser(description='Plot AAM anomalies integrated over specified pressure levels')
-parser.add_argument('--p-min', type=float, default=100, help='Minimum pressure level (hPa) to include (default: 100 hPa)')
-parser.add_argument('--p-max', type=float, default=1000, help='Maximum pressure level (hPa) to include (default: 1000 hPa)')
-parser.add_argument('--start-year', type=int, default=1980, help='Start year for analysis (default: 1980)')
-parser.add_argument('--end-year', type=int, default=2000, help='End year for analysis (default: 2000)')
-args = parser.parse_args()
+def _build_parser():
+    parser = argparse.ArgumentParser(description='Plot AAM anomalies integrated over specified pressure levels')
+    parser.add_argument('--p-min', type=float, default=100, help='Minimum pressure level (hPa) to include (default: 100 hPa)')
+    parser.add_argument('--p-max', type=float, default=1000, help='Maximum pressure level (hPa) to include (default: 1000 hPa)')
+    parser.add_argument('--start-year', type=int, default=1980, help='Start year for analysis (default: 1980)')
+    parser.add_argument('--end-year', type=int, default=2000, help='End year for analysis (default: 2000)')
+    return parser
 
+
+def _parse_args(argv=None):
+    return _build_parser().parse_args(argv)
+
+
+if __name__ == '__main__':
+    args = _parse_args()
+else:
+    args = _parse_args([])
+
+clim_start = 1981
+clim_end = 2010
 scratch_path = "/work/scratch-nopw2/hhhn2"
 base_dir = os.getcwd()
-AAM_data_path = f"{base_dir}/monthly_mean/AAM/"
+#AAM_data_path = f"{base_dir}/monthly_mean/AAM/"
+AAM_data_path = f"{scratch_path}/ERA5/monthly_mean/AAM/full/"
+climatology_path = f"{scratch_path}/ERA5/climatology/"
 output_dir = f"{base_dir}/AAMA_fig/"
 
 # Create output directory if it doesn't exist
@@ -38,6 +52,74 @@ start_yr = args.start_year
 end_yr = args.end_year
 p_min = args.p_min * 100  # Convert hPa to Pa
 p_max = args.p_max * 100
+
+
+
+def _resolve_var(ds, component):
+    candidates = [component, component.upper(), component.lower(), 'AAM', 'aam', 'angular_momentum']
+    for name in candidates:
+        if name in ds.data_vars:
+            return ds[name]
+    if len(ds.data_vars) == 1:
+        return ds[next(iter(ds.data_vars))]
+    raise KeyError(f"Variable '{component}' not found in dataset; available variables: {list(ds.data_vars)}")
+
+
+def _find_precomputed_climatology_file(component):
+    candidates = [
+        f"{climatology_path}ERA5_AAM_full_climatology_{clim_start}-{clim_end}.nc",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(
+        "No precomputed climatology NetCDF found. Tried:\n  " + "\n  ".join(candidates)
+    )
+
+
+def _prepare_precomputed_climatology(component, selected_levels=None):
+    clim_file = _find_precomputed_climatology_file(component)
+    print(f"Loading precomputed climatology from: {clim_file}")
+    ds_clim = xr.open_dataset(clim_file)
+    clim = _resolve_var(ds_clim, component)
+    chunk_map = {}
+    if 'level' in clim.dims:
+        chunk_map['level'] = 50
+    if 'latitude' in clim.dims:
+        chunk_map['latitude'] = 180
+    if 'longitude' in clim.dims:
+        chunk_map['longitude'] = 360
+    if chunk_map:
+        clim = clim.chunk(chunk_map)
+
+    if 'level' in clim.dims:
+        if selected_levels is not None and len(selected_levels) > 0:
+            print("Applying the selected pressure levels to the precomputed climatology...")
+            clim = clim.sel(level=selected_levels).sum(dim='level')
+        else:
+            print("No selected pressure-level subset available; summing all climatology levels.")
+            clim = clim.sum(dim='level')
+
+    if 'longitude' in clim.dims:
+        print("Integrating precomputed climatology over longitude dimension...")
+        clim = clim.sum(dim='longitude')
+
+    if 'month' not in clim.dims and 'month' not in clim.coords:
+        if 'time' in clim.dims:
+            print("Climatology file has time dimension; converting to monthly climatology.")
+            clim = clim.groupby('time.month').mean('time')
+        else:
+            raise ValueError(f"Precomputed climatology must have a month or time dimension, got {clim.dims}")
+
+    if 'month' in clim.coords:
+        clim_months = clim['month'].values
+        if np.size(clim_months) and np.nanmin(clim_months) == 0 and np.nanmax(clim_months) == 11:
+            clim = clim.assign_coords(month=clim['month'] + 1)
+
+    if hasattr(clim, 'compute'):
+        clim = clim.compute()
+    print(f"Precomputed climatology prepared: shape={clim.shape}, dims={clim.dims}")
+    return clim, ds_clim
 
 
 def _latitude_band_width_radians(lat_deg: np.ndarray) -> np.ndarray:
@@ -75,7 +157,7 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
     # Load all data for the specified period
     all_files = []
     for year in range(start_year, end_year + 1):
-        pattern = f"{AAM_data_path}AAM_ERA5_{year}*_full_level.nc"
+        pattern = f"{AAM_data_path}AAM_ERA5_{year}*.nc"
         year_files = glob.glob(pattern)
         if not year_files:
             print(f"Warning: No files found for year {year}")
@@ -291,12 +373,12 @@ def plot_AAM_anomalies(start_year, end_year, component='AAM', *, nlevels=11, cma
     
     # Calculate climatological mean
     # Group by month and calculate mean across all years
-    print("Computing climatology...")
-    climatology = da.groupby('time.month').mean('time')
-    if hasattr(climatology, 'compute'):
-        climatology = climatology.compute()
-    print(f"Climatology computed: shape={climatology.shape}")
-    
+    print("preparing climatology...")
+    clim_file = _find_precomputed_climatology_file('AAM')
+    climatology = xr.open_dataset(clim_file)
+
+    print(f"Climatology loaded")
+
     # Calculate anomalies by subtracting climatology from each month
     print("Computing anomalies...")
     anomalies = da.groupby('time.month') - climatology
@@ -485,5 +567,5 @@ if __name__ == '__main__':
     savefile = f'AAM_anomalies_{start_yr}-{end_yr}_p{int(p_min/100)}-{int(p_max/100)}hPa_new.png'
     plot_AAM_anomalies(start_yr, end_yr, component='AAM', 
                        savefile=savefile, 
-                       show=True, vmin=-1e21, vmax=1e21)
+                       show=True)
 # %%

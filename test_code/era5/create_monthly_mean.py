@@ -24,6 +24,7 @@ import gc
 base_path = os.getcwd()
 scratch_path = "/work/scratch-nopw2/hhhn2"
 era5_path_base = "/badc/ecmwf-era5/data/oper/an_ml/" #an_ml for analysis on model levels
+#era5_path_base = "/badc/ecmwf-era51/data/oper/an_ml/" #ERA51 Correction for year 2000-2006
 # an_sfc for analysis on surface levels
 save_path = f"{scratch_path}/ERA5/monthly_mean/variables"
 os.makedirs(save_path, exist_ok=True)
