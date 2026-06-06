@@ -2240,6 +2240,8 @@ if __name__ == '__main__':
                 title_suffix=f"{number_of_available_members} BOOTSTRAP {region_label} | " + _snap_suffix,
                 rolling_period=int(args.rolling_period),
                 filename_suffix=f"_ensemble_mean_{args.enso_state}_{region_label.lower()}{reinitiation_suffix}",
+                dec_onset_month=args.composite_start,
+                onset_season_ndjfm=args.onset_season,
                 pmin=float(args.p_min),
                 pmax=float(args.p_max),
                 nino_threshold=float(ACTIVE_MONTH_EL_NINO_THRESHOLD),

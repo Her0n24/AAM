@@ -37,7 +37,7 @@ class TaylorDiagram(object):
         fig=None,
         rect=111,
         label="_",
-        min_corr=0.8,
+        min_corr=0.9,
         min_std=0.8,
         max_std=1.25,
     ):
@@ -80,6 +80,7 @@ class TaylorDiagram(object):
         ax.axis["top"].set_axis_direction("bottom")
         ax.axis["top"].toggle(ticklabels=True, label=True)
         ax.axis["top"].major_ticklabels.set_axis_direction("top")
+        ax.axis["top"].major_ticklabels.set_pad(10)
         ax.axis["top"].label.set_text("Correlation")
         ax.axis["top"].label.set_axis_direction("top")
         ax.axis["top"].label.set_fontsize(16)
@@ -158,13 +159,15 @@ def plot_taylor_diagram_from_stats(
     title: str,
     reference_label: str = "Reference",
     sample_label: str = "Bootstrap samples",
-    min_corr: float = 0.8,
+    min_corr: float = 0.9,
     min_std: float = 0.8,
     max_std: float = 1.2,
-    sample_color: str = "0.35",
-    sample_alpha: float = 0.18,
-    sample_ms: float = 2.5,
+    sample_color: str = "black",
+    sample_alpha: float = 0.8,
+    sample_ms: float = 1.0,
     draw_percentiles: bool = True,
+    label_column: str | None = None,
+    label_fontsize: float = 12.0,
 ) -> bool:
     """Plot a Taylor diagram from a stats DataFrame containing std and corr columns."""
     import pandas as pd
@@ -181,6 +184,24 @@ def plot_taylor_diagram_from_stats(
     if df.empty:
         print(f"Taylor stats are empty after filtering; skipping {output_path}")
         return False
+
+    corr_vals = df["corr"].values
+    std_vals = df["std"].values
+    corr_low = float(np.nanpercentile(corr_vals, 1))
+    std_low = float(np.nanpercentile(std_vals, 1))
+    std_high = float(np.nanpercentile(std_vals, 99))
+
+    if np.isfinite(corr_low) and corr_low < min_corr:
+        min_corr = max(-1.0, np.floor((corr_low - 0.02) * 20.0) / 20.0)
+        print(f"Taylor diagram axis expanded to min_corr={min_corr:.2f} for {output_path}")
+    if np.isfinite(std_low) and std_low < min_std:
+        min_std = max(0.0, np.floor((std_low - 0.02) * 10.0) / 10.0)
+        print(f"Taylor diagram axis expanded to min_std={min_std:.2f} for {output_path}")
+    if np.isfinite(std_high) and std_high > max_std:
+        max_std = np.ceil((std_high + 0.02) * 10.0) / 10.0
+        print(f"Taylor diagram axis expanded to max_std={max_std:.2f} for {output_path}")
+    if max_std <= min_std:
+        max_std = min_std + 0.2
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,6 +234,57 @@ def plot_taylor_diagram_from_stats(
         ls="",
         label="_nolegend_",
     )
+    if label_column is not None and label_column in df.columns:
+        
+        for _, row in df.iterrows():
+            corr_val = float(row["corr"])
+            std_val = float(row["std"])
+            label_text = str(row[label_column])
+            if not label_text:
+                continue
+            theta = float(np.arccos(np.clip(corr_val, -1.0, 1.0)))
+            
+            # --- CUSTOM HIGHLIGHT FOR THE CONTROL RUN (MEMBER 1) ---
+            if label_text == "1":
+                # Plot the special orange diamond directly over its standard black dot
+                dia.ax.plot(
+                    theta,
+                    std_val,
+                    marker="D",          
+                    color="darkorange",  
+                    mec="black",         
+                    mew=1.2,             
+                    ms=sample_ms * 2.2,  # Make it larger to completely engulf/hide the black dot underneath
+                    ls="",
+                    zorder=5,            # Bring to front layer
+                    label="HadGEM3 CTRL" 
+                )
+                
+                # Create text object for member 1
+                dia.ax.text(
+                    theta,
+                    std_val,
+                    f" {label_text}",    
+                    fontsize=label_fontsize + 2.0, 
+                    fontweight="bold",
+                    ha="left",
+                    va="bottom",
+                    color="darkorange",
+                    zorder=6
+                )
+            
+    # --- ADD MINOR RADIAL ARC AT 0.5 STD DEV ---
+    theta_grid = np.linspace(0, dia.max_angle, 240)
+    dia.ax.plot(
+        theta_grid,
+        np.full_like(theta_grid, 0.5),  # Creates an array of 0.5 values matching theta_grid
+        color="gray",                   # Neutral color for a minor gridline
+        linestyle="--",                 # Dashed line style
+        linewidth=1.0,                  # Slightly thinner than the main percentile lines
+        alpha=0.3,                      # Faint transparency requested
+        label="_nolegend_",             # Keeps it out of the legend
+        zorder=1                        # Puts it in the background behind data points
+    )
 
     if draw_percentiles:
         percentile_specs = [
@@ -223,17 +295,20 @@ def plot_taylor_diagram_from_stats(
         theta_grid = np.linspace(0, dia.max_angle, 240)
 
         radial_span = max(float(dia.max_std - dia.min_std), 1e-6)
+
+        # Place the correlation annotations on an inner radial band so they do
+        # not collide with the right-hand correlation tick labels.
         corr_label_rs = np.linspace(
-            dia.max_std - 0.12 * radial_span,
-            dia.max_std - 0.30 * radial_span,
+            dia.min_std + 0.18 * radial_span,
+            dia.min_std + 0.34 * radial_span,
             len(percentile_specs),
         )
         std_label_thetas = np.linspace(
-            0.05 * dia.max_angle,
-            0.17 * dia.max_angle,
+            0.02 * dia.max_angle,
+            0.12 * dia.max_angle,
             len(percentile_specs),
         )
-
+        
         for idx, (pct_label, color, corr_val, std_val) in enumerate(percentile_specs):
             theta = float(np.arccos(np.clip(corr_val, -1.0, 1.0)))
             dia.ax.plot(
@@ -254,27 +329,31 @@ def plot_taylor_diagram_from_stats(
                 label="_nolegend_",
             )
 
-            corr_label_theta = min(theta + 0.015 * dia.max_angle, dia.max_angle)
+            # Nudge the text slightly inward along the angular direction too.
+            corr_label_theta = min(theta - 0.015 * dia.max_angle, dia.max_angle - 0.03 * dia.max_angle)
+            
+            # Plot correlation labels with a protective white background box
             dia.ax.text(
                 corr_label_theta,
-                float(corr_label_rs[idx]+0.04),
+                float(corr_label_rs[idx]),  # Removed the +0.04 overshoot pushing it outside
                 f"r={float(corr_val):.3f}",
                 ha="left",
                 va="center",
                 color=color,
-                fontsize=14,
+                fontsize=13,
                 clip_on=False,
             )
 
-            std_label_r = float(np.clip(std_val, dia.min_std + 0.03 * radial_span, dia.max_std - 0.03 * radial_span))
+            # Plot std dev labels cleanly cutting through the dashed lines using the bbox
+            std_label_r = float(np.clip(std_val, dia.min_std + 0.01 * radial_span, dia.max_std - 0.01 * radial_span))
             dia.ax.text(
                 float(std_label_thetas[idx]),
                 std_label_r,
                 f"{float(std_val):.3f}",
-                ha="left",
+                ha="right",  # Center alignment looks much cleaner inside a bbox
                 va="center",
                 color=color,
-                fontsize=14,
+                fontsize=13,
                 clip_on=False,
             )
 
@@ -296,9 +375,9 @@ def plot_taylor_diagram_from_stats(
         legend_handles, legend_labels = zip(*visible)
         plt.legend(legend_handles, legend_labels, loc="upper left", bbox_to_anchor=(0.98, 1.02), fontsize=12, frameon=False)
 
-    fig.suptitle(title, fontsize=18, fontweight="bold", y=0.98)
+    fig.suptitle(title, fontsize=12, y=0.98)
     fig.subplots_adjust(top=0.84, right=0.82, left=0.08, bottom=0.08)
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    fig.savefig(output_path, format="svg", bbox_inches="tight")
     plt.close(fig)
     print(f"Saved Taylor diagram to {output_path}")
     return True
@@ -472,6 +551,9 @@ region: str = "all",
     lat_vals = anomalies["latitude"].values
     lon_vals = anomalies["longitude"].values
     time_vals = anomalies["time"].values
+
+    # Debug: report region/filename inputs so runs clearly indicate intended output
+    print(f"plot_lat_lon_snapshots: region='{region}', filename_suffix='{filename_suffix}'")
 
     # --- Patch: Add +180° longitude column for seamless plotting if needed ---
     # If longitude runs from -180 to 177.5 (step 2.5), add a +180 column duplicating -180 values
@@ -686,8 +768,23 @@ region: str = "all",
                         )
                 
                 wind_vals = gaussian_filter(wind_data.values, sigma=1)  # shape: (lat, lon)
-                wind_contour_levels = np.arange(-60, 61, 10)  # adjust as needed
-                wind_contour_levels = wind_contour_levels[np.abs(wind_contour_levels) >= 30]  # Only show |u| >= 15 m/s
+                wind_peak = float(np.nanmax(np.abs(wind_vals)))
+                if np.isfinite(wind_peak) and wind_peak >= 30:
+                    # 1. Set the step size to 15
+                    wind_step = 15.0
+                    # 2. Find the maximum limit required to cover the peak wind speed
+                    wind_max = max(30.0, wind_step * np.ceil(wind_peak / wind_step))
+                    
+                    # 3. Generate steps: e.g., [-45, -30, -15, 0, 15, 30, 45]
+                    wind_contour_levels = np.arange(-wind_max, wind_max + wind_step, wind_step)
+                    
+                    # 4. Filter: Keep only values where absolute magnitude is >= 30
+                    # This drops 0, 15, and -15 entirely
+                    wind_contour_levels = wind_contour_levels[np.abs(wind_contour_levels) >= 30.0]
+                else:
+                    wind_contour_levels = np.array([])
+                if wind_contour_levels.size == 0:
+                    raise ValueError("wind field has no finite amplitude to contour")
                 cs = ax.contour(wind_lon, wind_lat, wind_vals,
                                     levels=wind_contour_levels, colors='C4', 
                                     linewidths=1.5, alpha=1.0)
@@ -799,12 +896,16 @@ region: str = "all",
         
     nino_thres_tag = "nino_thres" + str(float(nino_threshold)) if nino_threshold is not None else ""
 
-    output_file = (
-        f'{output_dir}AAM_anomalies_lat_lon_snapshots_{ensemble_member}_{start_year}-{end_year}_{pmin:.1f}-{pmax:.1f}hPa_{region}{rolling_tag}_{nino_thres_tag}{file_suffix}.png')
-    ensure_dir(Path(output_dir))
+    # Compose filename including region explicitly and ensure output directory exists
+    fname = (
+        f'AAM_anomalies_lat_lon_snapshots_{ensemble_member}_{start_year}-{end_year}_{pmin:.1f}-{pmax:.1f}hPa_{region}{rolling_tag}_{nino_thres_tag}{file_suffix}.svg'
+    )
+    output_path = Path(output_dir) / fname
+    ensure_dir(output_path.parent)
     plt.tight_layout(rect=[0, 0.04, 1, 0.97])  # Leave space for colorbar at bottom and title at top
-    plt.savefig(output_file, dpi=400, bbox_inches="tight")
-    print(f"Lat-lon snapshot figure saved to: {output_file}")
+    plt.savefig(output_path, format = "svg", bbox_inches="tight")
+    print(f"Lat-lon snapshot figure saved to: {output_path}")
+    print(f"Lat-lon snapshot figure saved to: {output_path}")
     plt.close(fig)
 
 
@@ -1055,9 +1156,9 @@ def plot_latitude_level_snapshots_HadGEN3(
     import matplotlib.pyplot as plt
     import pandas as pd
     
-    # vmax = np.nanpercentile(np.abs(anomalies.values), vpercentile)
+    vmax = np.nanpercentile(np.abs(anomalies.values), vpercentile)
     # vmax = 1e23
-    vmax = 1e23
+    # vmax = 1e23
     vmin = -vmax
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax == 0:
         print(f"Warning: Invalid color limits (vmin={vmin}, vmax={vmax}), using fallback values")
@@ -1266,8 +1367,16 @@ def plot_latitude_level_snapshots_HadGEN3(
 
                 # Use the same pressure_vals array that was used for the anomaly plot
                 # This ensures wind contours align with the same vertical coordinate system
-                wind_contour_levels = np.arange(-60, 61, 10)  # Contours every 10 m/s
-                wind_contour_levels = wind_contour_levels[np.abs(wind_contour_levels) >= 10]  # Only show |u| >= 15 m/s
+                wind_peak = float(np.nanmax(np.abs(wind_values)))
+                if np.isfinite(wind_peak) and wind_peak > 0:
+                    wind_step = 10.0 if wind_peak >= 40.0 else 5.0
+                    wind_max = max(wind_step, wind_step * np.ceil(wind_peak / wind_step))
+                    wind_contour_levels = np.arange(-wind_max, wind_max + wind_step, wind_step)
+                    wind_contour_levels = wind_contour_levels[np.abs(wind_contour_levels) >= wind_step]
+                else:
+                    wind_contour_levels = np.array([])
+                if wind_contour_levels.size == 0:
+                    raise ValueError("wind field has no finite amplitude to contour")
                 cs = contour_axes[i].contour(wind_lat, pressure_hpa, wind_values,
                                     levels=wind_contour_levels, colors='black', 
                                     linewidths=0.8, alpha=0.6)
@@ -1294,8 +1403,7 @@ def plot_latitude_level_snapshots_HadGEN3(
                 ticks = common_ticks[(common_ticks >= pmin) & (common_ticks <= pmax)]
                 if ticks.size >= 3:
                     contour_axes[i].set_yticks(ticks)
-                    contour_axes[i].yaxis.set_major_formatter(mticker.ScalarFormatter())
-                    contour_axes[i].yaxis.set_minor_formatter(mticker.NullFormatter())
+                    contour_axes[i].set_yticklabels([f"{int(t)}" for t in ticks])
         contour_axes[i].invert_yaxis()  # surface (large p) at bottom
         
         # Find latitude of maximum or minimum AAM in northern hemisphere.
@@ -1426,9 +1534,9 @@ def plot_latitude_level_snapshots_HadGEN3(
     nino_thres_tag = "nino_thres" + str(float(nino_threshold)) if nino_threshold is not None else ""
 
     output_file = (
-        f'{output_dir}AAM_anomalies_lat_level_snapshots_{ensemble_member}_{start_year}-{end_year}{rolling_tag}_{nino_thres_tag}{file_suffix}.png'
+        f'{output_dir}AAM_anomalies_lat_level_snapshots_{ensemble_member}_{start_year}-{end_year}{rolling_tag}_{nino_thres_tag}{file_suffix}.svg'
     )
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.savefig(output_file, format="svg", bbox_inches='tight')
     print(f"Snapshot figure saved to: {output_file}")
     plt.close()
 
@@ -1801,8 +1909,8 @@ def plot_lat_level_postage_stamp_5x12(
     )
     fig.tight_layout(rect=[0, 0.05, 1, 0.95])
     
-    out_path = output_dir / f"postage_stamp_lat_level_ensemble_{enso_state}_{region_label.lower()}_{n_members}members.png"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    out_path = output_dir / f"postage_stamp_lat_level_ensemble_{enso_state}_{region_label.lower()}_{n_members}members.svg"
+    fig.savefig(out_path, format='svg', bbox_inches="tight")
     plt.close(fig)
     print(f"Postage stamp (lat×level) saved to {out_path}")
 
@@ -1946,8 +2054,8 @@ def plot_lat_level_monthly_stamps_10col(
         )
         fig.tight_layout(rect=[0, 0.05, 1, 0.95])
         
-        out_path = output_dir / f"postage_stamp_lat_level_month{month_idx+1:02d}_{region_label.lower()}_{enso_state}.png"
-        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        out_path = output_dir / f"postage_stamp_lat_level_month{month_idx+1:02d}_{region_label.lower()}_{enso_state}.svg"
+        fig.savefig(out_path, format="svg", bbox_inches="tight")
         plt.close(fig)
         print(f"Month {month_idx+1:02d} lat×level stamps saved to {out_path}")
 
@@ -2094,8 +2202,8 @@ def plot_lat_time_postage_stamp_all_members(
     
     fig.tight_layout(rect=[0, 0.05, 1, 0.94])
     
-    out_path = output_dir / f"postage_stamp_lat_time_ensemble_{enso_state}_{region_label.lower()}_{n_members}members.png"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    out_path = output_dir / f"postage_stamp_lat_time_ensemble_{enso_state}_{region_label.lower()}_{n_members}members.svg"
+    fig.savefig(out_path, format="svg", bbox_inches="tight")
     plt.close(fig)
     print(f"Lat×time evolution postage stamp saved to {out_path}")
 
@@ -2269,8 +2377,8 @@ def plot_lat_lon_monthly_stamps_10col(
         )
         fig.tight_layout(rect=[0, 0.05, 1, 0.95])
         
-        out_path = output_dir / f"postage_stamp_lat_lon_month{month_idx+1:02d}_{region_label.lower()}_{enso_state}.png"
-        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        out_path = output_dir / f"postage_stamp_lat_lon_month{month_idx+1:02d}_{region_label.lower()}_{enso_state}.svg"
+        fig.savefig(out_path, format="svg", bbox_inches="tight")
         plt.close(fig)
         print(f"Month {month_idx+1:02d} lat×lon stamps saved to {out_path}")
 

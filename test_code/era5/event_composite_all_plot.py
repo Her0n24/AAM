@@ -20,11 +20,12 @@ import dask
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import event_composite_all as composite_core
-from plotting_utils import plot_lat_lon_snapshots, plot_latitude_level_snapshots_HadGEN3
+from plotting_utils import compute_monthly_climatology, plot_lat_lon_snapshots, plot_latitude_level_snapshots_HadGEN3
 from scipy import stats as _stats
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import matplotlib.colors as mcolors
+import matplotlib.ticker as mticker
 
 base_dir = os.getcwd()
 scratch_path = "/work/scratch-nopw2/hhhn2"
@@ -38,10 +39,26 @@ os.makedirs(output_dir, exist_ok=True)
 os.makedirs(climatology_path_base, exist_ok=True)
 os.makedirs(composite_output_dir, exist_ok=True)
 sys.path.append(str(Path(__file__).resolve().parents[1] / "CMIP6_HadGEM3_GC31"))
-from utilities import (
+from CMIP6_HadGEM3_GC31.utilities import (
     _to_per_latitude_band,
     vertical_sum_over_pressure_range, REGION_BOUNDS
 )
+
+# Ensure REGION_BOUNDS is defined even if import timing/order differs when
+# this module is imported from other scripts.
+if 'REGION_BOUNDS' not in globals():
+    try:
+        from CMIP6_HadGEM3_GC31.utilities import REGION_BOUNDS as _REGION_BOUNDS_FALLBACK
+        REGION_BOUNDS = _REGION_BOUNDS_FALLBACK
+    except Exception:
+        try:
+            from CMIP6_HadGEM3_GC31.utilities import REGION_BOUNDS as _REGION_BOUNDS_FALLBACK2
+            REGION_BOUNDS = _REGION_BOUNDS_FALLBACK2
+        except Exception:
+            # Minimal safe fallback covering full globe to avoid hard failures;
+            # downstream code will still work but region selection becomes no-op.
+            REGION_BOUNDS = {"all": (-180.0, 180.0)}
+            raise ImportError("Could not import REGION_BOUNDS from expected modules. Using fallback covering full globe, but this may cause issues if region selection is used.")
 
 # Climatology period
 clim_start_yr, clim_end_yr = 1981, 2010
@@ -117,7 +134,7 @@ def plot_lat_lon_anomalies(start_year, end_year, variable, clim_start_yr=1980, c
     
     if os.path.exists(clim_file_3d):
         print(f"Loading 3D climatology from: {clim_file_3d}")
-        ds_climatology = xr.open_dataset(clim_file_3d, chunks={'level': 50})
+        ds_climatology = xr.open_dataset(clim_file_3d)
         clim_is_3d = True
     elif os.path.exists(clim_file_vi):
         print(f"Loading pre-integrated climatology from: {clim_file_vi}")
@@ -141,26 +158,20 @@ def plot_lat_lon_anomalies(start_year, end_year, variable, clim_start_yr=1980, c
     
     all_files.sort()
     
-    # Load time series with chunking for 3D data
+    # Load time series eagerly so the script can use available RAM instead of dask chunks.
+    datasets = []
+    for f in all_files:
+        ds = xr.open_dataset(f, decode_times=False)
+        if 'time' in ds.dims and 'time' not in ds.coords:
+            ds = ds.set_coords('time')
+        datasets.append(ds)
+    ds_timeseries = xr.concat(datasets, dim='time', coords='minimal', compat='override')
     try:
-        ds_timeseries = xr.open_mfdataset(all_files, combine='by_coords', 
-                                          chunks={'time': 1, 'level': 50, 'latitude': 200, 'longitude': 400})
-    except ValueError:
-        print("Warning: xarray failed to decode time coordinates; loading manually")
-        datasets = []
-        for f in all_files:
-            ds = xr.open_dataset(f, decode_times=False, 
-                                chunks={'time': 1, 'level': 50, 'latitude': 200, 'longitude': 400})
-            if 'time' in ds.dims and 'time' not in ds.coords:
-                ds = ds.set_coords('time')
-            datasets.append(ds)
-        ds_timeseries = xr.concat(datasets, dim='time', coords='minimal', compat='override')
-        try:
-            import cftime
-            ds_timeseries = xr.decode_cf(ds_timeseries)
-            print("Info: successfully decoded times using cftime")
-        except Exception as e:
-            print(f"Warning: Could not decode times ({e})")
+        import cftime
+        ds_timeseries = xr.decode_cf(ds_timeseries)
+        print("Info: successfully decoded times using cftime")
+    except Exception as e:
+        print(f"Warning: Could not decode times ({e})")
     
     # Resolve variable
     def _resolve_var(ds, var):
@@ -328,8 +339,8 @@ def plot_lat_lon_anomalies(start_year, end_year, variable, clim_start_yr=1980, c
     n_rows = 4
     
     # Determine color limits
-    vmin = np.nanpercentile(anomalies.values, 4)
-    vmax = np.nanpercentile(anomalies.values, 96)
+    vmin = np.nanpercentile(anomalies.values, 1)
+    vmax = np.nanpercentile(anomalies.values, 99)
     # Make symmetric
     vlim = max(abs(vmin), abs(vmax))
     vmin, vmax = -vlim, vlim
@@ -578,103 +589,122 @@ def parse_composite_args() -> argparse.Namespace:
         help="Also save the full event stack used in the composite.",
     )
     parser.add_argument(
-        "--compute-significance",
+        "--replot",
         action="store_true",
-        help="Compute and save significance masks (extra memory and runtime).",
+        help="Load existing composite NetCDF and re-generate plots (no recomputation).",
     )
     return parser.parse_args()
 
 
 def _load_era5_full_field_lazy(args: argparse.Namespace) -> xr.DataArray:
     """Load full-field ERA5 AAM lazily to avoid eager in-memory spikes."""
-    max_needed_year = args.end_year + int(np.ceil(args.composite_months / 12.0)) + 1
+    return _load_era5_full_field_lazy_for_years(
+        args,
+        start_year=args.start_year,
+        end_year=args.end_year + int(np.ceil(args.composite_months / 12.0)) + 1,
+    )
+
+
+def _load_era5_full_field_lazy_for_years(
+    args: argparse.Namespace,
+    *,
+    start_year: int,
+    end_year: int,
+) -> xr.DataArray:
+    """Load full-field ERA5 AAM lazily for an explicit year span."""
     files = []
-    for year in range(args.start_year, max_needed_year + 1):
+    for year in range(start_year, end_year + 1):
         files.extend(sorted(glob.glob(str(composite_core.AAM_DATA_DIR / f"AAM_ERA5_{year}-*_full.nc"))))
     if not files:
         raise FileNotFoundError(f"No ERA5 AAM files found in fixed directory: {composite_core.AAM_DATA_DIR}")
 
-    ds = xr.open_mfdataset(
-        files,
-        combine="by_coords",
-        chunks={"time": 12, "level": 24, "latitude": 90, "longitude": 180},
-    )
+    datasets = [xr.open_dataset(file_path).load() for file_path in files]
+    ds = xr.concat(datasets, dim="time", coords="minimal", compat="override").sortby("time")
     da = composite_core._first_data_var(ds, ("AAM", "aam", "angular_momentum", "momentum", "AAMA"))
     da = composite_core._standardize_dims(da)
     if "time" not in da.dims:
         raise ValueError("Full-field ERA5 data must include a time dimension.")
 
-    da = da.sel(time=slice(f"{args.start_year}-01-01", f"{max_needed_year}-12-31"))
+    da = da.sel(time=slice(f"{start_year}-01-01", f"{end_year}-12-31"))
     return da
 
 
 def _load_era5_variable_full_field_lazy(variable: str, args: argparse.Namespace) -> xr.DataArray:
     """Load a full-field ERA5 monthly variable lazily from monthly_mean/variables."""
-    max_needed_year = args.end_year + int(np.ceil(args.composite_months / 12.0)) + 1
+    return _load_era5_variable_full_field_lazy_for_years(
+        variable,
+        args,
+        start_year=args.start_year,
+        end_year=args.end_year + int(np.ceil(args.composite_months / 12.0)) + 1,
+    )
+
+
+def _load_era5_variable_full_field_lazy_for_years(
+    variable: str,
+    args: argparse.Namespace,
+    *,
+    start_year: int,
+    end_year: int,
+) -> xr.DataArray:
+    """Load a full-field ERA5 monthly variable lazily for an explicit year span."""
     files = []
-    for year in range(args.start_year, max_needed_year + 1):
+    for year in range(start_year, end_year + 1):
         for month in range(1, 13):
             files.extend(sorted(glob.glob(f"{sp_path_base}ERA5_{variable}_{year}-{month:02d}.nc")))
     if not files:
         raise FileNotFoundError(f"No ERA5 {variable} monthly files found in {sp_path_base}")
 
-    chunks = {"time": 12, "level": 24, "latitude": 90, "longitude": 180}
-    try:
-        ds = xr.open_mfdataset(
-            files,
-            combine="by_coords",
-            chunks=chunks,
-        )
-    except ValueError:
-        # Some ERA5 monthly files do not expose usable concat coordinates.
-        # Fall back to assembling time from filename stamps (ERA5_u_YYYY-MM.nc).
-        datasets = []
-        for file_path in files:
-            ds_single = xr.open_dataset(file_path, decode_times=False, chunks=chunks)
-            match = re.search(r"(\d{4})-(\d{2})\.nc$", os.path.basename(file_path))
-            if match is None:
-                raise ValueError(f"Could not infer time from filename: {file_path}")
-            timestamp = pd.Timestamp(f"{match.group(1)}-{match.group(2)}-01")
+    datasets = []
+    for file_path in files:
+        ds_single = xr.open_dataset(file_path).load()
+        match = re.search(r"(\d{4})-(\d{2})\.nc$", os.path.basename(file_path))
+        if match is None:
+            raise ValueError(f"Could not infer time from filename: {file_path}")
+        timestamp = pd.Timestamp(f"{match.group(1)}-{match.group(2)}-01")
 
-            if "time" in ds_single.dims:
-                if ds_single.sizes.get("time", 0) == 1:
-                    ds_single = ds_single.assign_coords(time=[timestamp])
-                else:
-                    raise ValueError(
-                        f"Expected monthly file with a single time step, got {ds_single.sizes.get('time', 0)} in {file_path}"
-                    )
+        if "time" in ds_single.dims:
+            if ds_single.sizes.get("time", 0) == 1:
+                ds_single = ds_single.assign_coords(time=[timestamp])
             else:
-                ds_single = ds_single.expand_dims(time=[timestamp])
+                raise ValueError(
+                    f"Expected monthly file with a single time step, got {ds_single.sizes.get('time', 0)} in {file_path}"
+                )
+        else:
+            ds_single = ds_single.expand_dims(time=[timestamp])
 
-            datasets.append(ds_single)
+        datasets.append(ds_single)
 
-        ds = xr.concat(datasets, dim="time", coords="minimal", compat="override").sortby("time")
+    ds = xr.concat(datasets, dim="time", coords="minimal", compat="override").sortby("time")
 
     da = composite_core._first_data_var(ds, (variable, "u", "eastward_wind", "u_component_of_wind", "AAM", "aam"))
     da = composite_core._standardize_dims(da)
     if "time" not in da.dims:
         raise ValueError(f"ERA5 {variable} data must include a time dimension.")
 
-    da = da.sel(time=slice(f"{args.start_year}-01-01", f"{max_needed_year}-12-31"))
+    da = da.sel(time=slice(f"{start_year}-01-01", f"{end_year}-12-31"))
     return da
 
 
+def _load_era5_full_field_climatology(args: argparse.Namespace) -> xr.DataArray:
+    """Compute the ERA5 AAM monthly climatology on the fly from the full field."""
+    clim_da = _load_era5_full_field_lazy_for_years(
+        args,
+        start_year=args.clim_start_year,
+        end_year=args.clim_end_year,
+    )
+    clim = compute_monthly_climatology(clim_da, args.clim_start_year, args.clim_end_year)
+    return clim
+
+
 def _load_era5_variable_climatology(variable: str, args: argparse.Namespace) -> xr.DataArray:
-    """Load a variable-specific ERA5 climatology, preferring a 3D file over a pre-integrated one."""
-    clim_file_3d = f"{climatology_path_base}ERA5_{variable}_full_climatology_{args.clim_start_year}-{args.clim_end_year}.nc"
-    clim_file_vi = f"{climatology_path_base}ERA5_{variable}_full_climatology_vi_{args.clim_start_year}-{args.clim_end_year}.nc"
-
-    if os.path.exists(clim_file_3d):
-        print(f"Loading 3D climatology from: {clim_file_3d}")
-        ds_climatology = xr.open_dataset(clim_file_3d, chunks={"level": 50})
-    elif os.path.exists(clim_file_vi):
-        print(f"Loading pre-integrated climatology from: {clim_file_vi}")
-        ds_climatology = xr.open_dataset(clim_file_vi)
-    else:
-        raise FileNotFoundError(f"No climatology file found. Tried:\n  {clim_file_3d}\n  {clim_file_vi}")
-
-    da = composite_core._first_data_var(ds_climatology, (variable, "u", "eastward_wind", "u_component_of_wind", "AAM", "aam"))
-    return composite_core._standardize_dims(da)
+    """Compute a variable-specific ERA5 monthly climatology on the fly."""
+    clim_da = _load_era5_variable_full_field_lazy_for_years(
+        variable,
+        args,
+        start_year=args.clim_start_year,
+        end_year=args.clim_end_year,
+    )
+    return compute_monthly_climatology(clim_da, args.clim_start_year, args.clim_end_year)
 
 
 def _load_mean_pressure_profile_hpa(args: argparse.Namespace) -> xr.DataArray:
@@ -883,7 +913,7 @@ def _composite_cache_is_valid(result_path: str) -> bool:
     try:
         with xr.open_dataset(result_path) as ds:
             required_vars = {"lat_lon_composite", "height_lat_composite", "u_lat_lon_composite", "u_height_lat_composite"}
-            return ds.attrs.get("composite_format") == "pressure_hpa_v1" and required_vars.issubset(ds.data_vars)
+            return ds.attrs.get("composite_format") == "pressure_hpa_v2" and required_vars.issubset(ds.data_vars)
     except Exception:
         return False
 
@@ -901,9 +931,10 @@ def _build_streamed_composites(
     list[str],
 ]:
     level_pressure_hpa = _load_mean_pressure_profile_hpa(args)
+    overlay_pressure_hpa = 250.0
 
     aam_da = _load_era5_full_field_lazy(args)
-    aam_clim = composite_core.load_era5_climatology(args)
+    aam_clim = _load_era5_full_field_climatology(args)
     u_da = _load_era5_variable_full_field_lazy("u", args)
     u_clim = _load_era5_variable_climatology("u", args)
 
@@ -963,20 +994,20 @@ def _build_streamed_composites(
         )
         u_event["level"].attrs["units"] = "hPa"
 
+        # The lat-lon wind overlay should show a single pressure slice, not a vertical integral.
+        # Use the nearest level to 250 hPa so the map overlay is directly interpretable.
+        u_overlay_idx = int(np.nanargmin(np.abs(level_pressure_hpa_u_values - overlay_pressure_hpa)))
+        u_lat_lon_event = u_event.isel(level=u_overlay_idx)
+
         aam_lat_lon_event = vertical_sum_over_pressure_range(
             aam_event,
             p_min_hpa=args.p_min,
             p_max_hpa=args.p_max,
             level_dim="level",
         )
-        aam_height_lat_event = aam_event.mean("longitude", skipna=True)
+        # ZONALLY INTEGRATED AAM: integrate over longitude to produce latitude×level
+        aam_height_lat_event = aam_event.sum("longitude", skipna=True)
 
-        u_lat_lon_event = vertical_sum_over_pressure_range(
-            u_event,
-            p_min_hpa=args.p_min,
-            p_max_hpa=args.p_max,
-            level_dim="level",
-        )
         u_height_lat_event = u_event.mean("longitude", skipna=True)
 
         aam_lat_lon_event = aam_lat_lon_event.transpose("month", "latitude", "longitude")
@@ -1012,6 +1043,11 @@ def _build_streamed_composites(
     if event_count == 0:
         raise RuntimeError("No complete ERA5 event windows were available for compositing.")
 
+    assert lat_lon_sum is not None
+    assert height_lat_sum is not None
+    assert u_lat_lon_sum is not None
+    assert u_height_lat_sum is not None
+
     lat_lon_composite = _finalize_mean(lat_lon_sum, event_count, aam_lat_lon_event)
     height_lat_composite = _finalize_mean(height_lat_sum, event_count, aam_height_lat_event)
     u_lat_lon_composite = _finalize_mean(u_lat_lon_sum, event_count, u_lat_lon_event)
@@ -1032,9 +1068,14 @@ def _build_streamed_composites(
     u_lat_lon_sig = None
     u_height_lat_sig = None
     if args.compute_significance:
+        lat_lon_sample_array = np.stack([np.stack(samples, axis=0) for samples in lat_lon_samples], axis=0)
+        height_lat_sample_array = np.stack([np.stack(samples, axis=0) for samples in height_lat_samples], axis=0)
+        u_lat_lon_sample_array = np.stack([np.stack(samples, axis=0) for samples in u_lat_lon_samples], axis=0)
+        u_height_lat_sample_array = np.stack([np.stack(samples, axis=0) for samples in u_height_lat_samples], axis=0)
+
         lat_lon_sig = _event_significance_mask(
             xr.DataArray(
-                np.stack(lat_lon_samples, axis=1),
+                lat_lon_sample_array,
                 dims=("month", "event", "latitude", "longitude"),
                 coords={"month": np.arange(1, len(lat_lon_samples) + 1)},
             ),
@@ -1042,7 +1083,7 @@ def _build_streamed_composites(
         ).transpose("time", "latitude", "longitude")
         height_lat_sig = _event_significance_mask(
             xr.DataArray(
-                np.stack(height_lat_samples, axis=1),
+                height_lat_sample_array,
                 dims=("month", "event", "level", "latitude"),
                 coords={"month": np.arange(1, len(height_lat_samples) + 1)},
             ),
@@ -1050,7 +1091,7 @@ def _build_streamed_composites(
         ).transpose("time", "level", "latitude")
         u_lat_lon_sig = _event_significance_mask(
             xr.DataArray(
-                np.stack(u_lat_lon_samples, axis=1),
+                u_lat_lon_sample_array,
                 dims=("month", "event", "latitude", "longitude"),
                 coords={"month": np.arange(1, len(u_lat_lon_samples) + 1)},
             ),
@@ -1058,7 +1099,7 @@ def _build_streamed_composites(
         ).transpose("time", "latitude", "longitude")
         u_height_lat_sig = _event_significance_mask(
             xr.DataArray(
-                np.stack(u_height_lat_samples, axis=1),
+                u_height_lat_sample_array,
                 dims=("month", "event", "level", "latitude"),
                 coords={"month": np.arange(1, len(u_height_lat_samples) + 1)},
             ),
@@ -1119,7 +1160,8 @@ def save_composite_results(
             "rolling_period": int(args.rolling_period),
             "region": args.region,
             "pressure_range_hpa": f"{args.p_min}-{args.p_max}",
-            "composite_format": "pressure_hpa_v1",
+            "u_overlay_pressure_hpa": 250.0,
+            "composite_format": "pressure_hpa_v2",
         }
     )
     ds.to_netcdf(result_path)
@@ -1134,6 +1176,7 @@ def save_composite_results(
 def _plot_composite_outputs(
     lat_lon_composite: xr.DataArray,
     lat_lon_mask: Optional[xr.DataArray],
+    lat_time_plot: str,
     height_lat_composite: xr.DataArray,
     height_lat_mask: Optional[xr.DataArray],
     u_lat_lon_composite: Optional[xr.DataArray],
@@ -1145,11 +1188,22 @@ def _plot_composite_outputs(
     height_lat_plot: str,
 ) -> None:
     try:
+        _plot_lat_time_composite(
+            lat_lon_composite,
+            lat_lon_mask,
+            args,
+            lat_time_plot,
+            event_count,
+        )
+    except Exception as exc:
+        print(f"Warning: lat-time plotting failed after saving composites: {exc}")
+
+    try:
         plot_lat_lon_snapshots(
             lat_lon_composite,
             zonal_wind_da=u_lat_lon_composite,
             significance_mask=None if lat_lon_mask is None else lat_lon_mask.values,
-            ensemble_member="ERA5_EVENT_MEAN",
+            ensemble_member="ERA5_EVENT_COMPOSITE",
             start_year=args.start_year,
             end_year=args.end_year,
             clim_start_yr=args.clim_start_year,
@@ -1168,12 +1222,42 @@ def _plot_composite_outputs(
     except Exception as exc:
         print(f"Warning: lat-lon plotting failed after saving composites: {exc}")
 
+    if args.region != "all":
+        try:
+            subregion_mean_plot = os.path.join(
+                composite_output_dir,
+                f"AAM_anomalies_lat_lon_snapshots_ERA5_EVENT_MEAN_SUBREGION_{args.start_year}-{args.end_year}_{args.p_min:.1f}-{args.p_max:.1f}hPa_{args.region}{_plotting_utils_file_suffix(f'_event_mean_{args.enso_state}_{args.region}', args.composite_start, args.onset_season)}.png",
+            )
+            plot_lat_lon_snapshots(
+                lat_lon_composite,
+                zonal_wind_da=u_lat_lon_composite,
+                significance_mask=None if lat_lon_mask is None else lat_lon_mask.values,
+                ensemble_member="ERA5_EVENT_COMPOSITE",
+                start_year=args.start_year,
+                end_year=args.end_year,
+                clim_start_yr=args.clim_start_year,
+                clim_end_yr=args.clim_end_year,
+                output_dir=composite_output_dir,
+                title_suffix=f"Subregion event-mean {args.enso_state} composite | {event_count} events",
+                rolling_period=args.rolling_period,
+                filename_suffix=f"_event_mean_subregion_{args.enso_state}_{args.region}",
+                dec_onset_month=args.composite_start,
+                onset_season_ndjfm=args.onset_season,
+                pmin=args.p_min,
+                pmax=args.p_max,
+                nino_threshold=args.nino_threshold,
+                region=args.region,
+            )
+            print(f"Saved subregion event-mean figure to {subregion_mean_plot}")
+        except Exception as exc:
+            print(f"Warning: subregion event-mean plotting failed after saving composites: {exc}")
+
     try:
         plot_latitude_level_snapshots_HadGEN3(
             height_lat_composite,
             zonal_wind_da=u_height_lat_composite,
             significance_mask=None if height_lat_mask is None else height_lat_mask.values,
-            ensemble_member="ERA5_EVENT_MEAN",
+            ensemble_member="ERA5_EVENT_COMPOSITE",
             start_year=args.start_year,
             end_year=args.end_year,
             clim_start_yr=args.clim_start_year,
@@ -1190,7 +1274,76 @@ def _plot_composite_outputs(
         print(f"Warning: height-lat plotting failed after saving composites: {exc}")
 
     print(f"Saved lat-lon figure to {lat_lon_plot}")
+    print(f"Saved lat-time figure to {lat_time_plot}")
     print(f"Saved height-lat figure to {height_lat_plot}")
+
+
+def _plot_lat_time_composite(
+    lat_lon_composite: xr.DataArray,
+    lat_lon_mask: Optional[xr.DataArray],
+    args: argparse.Namespace,
+    output_path: str,
+    event_count: int,
+) -> str:
+    if "longitude" not in lat_lon_composite.dims:
+        raise ValueError("lat_lon_composite must contain a longitude dimension for lat-time plotting")
+
+    comp = lat_lon_composite.mean("longitude", skipna=True).transpose("latitude", "time")
+    vals = comp.values
+    lat_vals = comp["latitude"].values
+    time_vals = comp["time"].values
+
+    vmax = float(np.nanpercentile(np.abs(vals), 99))
+    vmax = vmax if np.isfinite(vmax) and vmax > 0 else 1.0
+    levels = np.linspace(-vmax, vmax, 13)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    fig.subplots_adjust(bottom=0.22)
+    cf = ax.contourf(time_vals, lat_vals, vals, levels=levels, cmap="RdBu_r", extend="both")
+
+    sig_mask = None
+    if lat_lon_mask is not None:
+        sig_mask = lat_lon_mask.any("longitude") if "longitude" in lat_lon_mask.dims else lat_lon_mask
+        sig_mask = sig_mask.transpose("latitude", "time")
+        insig = np.where(sig_mask.values, 0, 1)
+        if np.any(insig == 1):
+            hatches = ax.contourf(
+                time_vals,
+                lat_vals,
+                insig,
+                levels=[0.5, 1.5],
+                colors="none",
+                hatches=["//"],
+                zorder=10,
+            )
+            for collection in getattr(hatches, "collections", []):
+                collection.set_facecolor("none")
+                collection.set_edgecolor((0.4, 0.4, 0.4, 0.35))
+                collection.set_linewidth(0.0)
+
+    cax = fig.add_axes([0.125, 0.08, 0.775, 0.02])
+    cbar = fig.colorbar(cf, cax=cax, orientation="horizontal", extend="both")
+    cbar.set_label("AAM anomaly (zonal mean)", size=12)
+    cbar.ax.tick_params(labelsize=10)
+
+    ax.axhline(0, color="black", linewidth=1.0, alpha=0.8)
+    for lat in (-40, -20, 20, 40):
+        ax.axhline(lat, color="gray", linestyle="--", linewidth=0.8, alpha=0.4, zorder=2)
+
+    ax.set_xlim(1, args.composite_months)
+    ax.set_ylim(-60, 60)
+    ax.xaxis.set_major_locator(mticker.MultipleLocator(1))
+    ax.set_xlabel("Month since onset", fontsize=14)
+    ax.set_ylabel("Latitude", fontsize=14)
+    ax.tick_params(axis="both", labelsize=11)
+    ax.set_title(
+        f"ERA5 Reanalysis Event Mean AAM anomaly\n"
+        f"({args.p_min:g}-{args.p_max:g} hPa) {event_count} events {args.start_year}-{args.end_year}"
+    )
+
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
 
 
 def run_event_composite_all_plot() -> None:
@@ -1201,6 +1354,9 @@ def run_event_composite_all_plot() -> None:
         raise ValueError("--composite-months must be >= 1")
     if args.rolling_period < 1:
         raise ValueError("--rolling-period must be >= 1")
+
+    # Always compute significance by default
+    args.compute_significance = True
 
     result_path = _composite_result_path(args, composite_output_dir)
     rolling_tag = f"_rolling{int(args.rolling_period)}" if int(args.rolling_period) > 1 else ""
@@ -1214,10 +1370,38 @@ def run_event_composite_all_plot() -> None:
         composite_output_dir,
         f"AAM_anomalies_lat_lon_snapshots_ERA5_EVENT_MEAN_{args.start_year}-{args.end_year}_{args.p_min:.1f}-{args.p_max:.1f}hPa_{args.region}{rolling_tag}_{nino_thres_tag}{file_suffix}.png",
     )
+    lat_time_plot = os.path.join(
+        composite_output_dir,
+        f"AAM_anomalies_lat_time_ERA5_EVENT_MEAN_{args.start_year}-{args.end_year}_{args.p_min:.1f}-{args.p_max:.1f}hPa_{args.region}{rolling_tag}_{nino_thres_tag}{file_suffix}.png",
+    )
     height_lat_plot = os.path.join(
         composite_output_dir,
-        f"AAM_anomalies_lat_level_snapshots_ERA5_EVENT_MEAN_{args.start_year}-{args.end_year}{rolling_tag}_{nino_thres_tag}{file_suffix}.png",
+        f"AAM_anomalies_lat_level_snapshots_ERA5_EVENT_MEAN_{args.start_year}-{args.end_year}_{args.region}{rolling_tag}_{nino_thres_tag}{file_suffix}.png",
     )
+
+    if args.replot:
+        if os.path.exists(result_path):
+            print(f"Replot requested. Loading composite NetCDF from {result_path} and regenerating plots.")
+            with xr.open_dataset(result_path) as ds:
+                ds = ds.load()
+                _plot_composite_outputs(
+                    ds["lat_lon_composite"],
+                    ds["lat_lon_significance_mask"] if "lat_lon_significance_mask" in ds.data_vars else None,
+                    lat_time_plot,
+                    ds["height_lat_composite"],
+                    ds["height_lat_significance_mask"] if "height_lat_significance_mask" in ds.data_vars else None,
+                    ds["u_lat_lon_composite"] if "u_lat_lon_composite" in ds.data_vars else None,
+                    ds["u_height_lat_composite"] if "u_height_lat_composite" in ds.data_vars else None,
+                    args,
+                    int(ds.attrs.get("n_events", 0)),
+                    composite_output_dir,
+                    lat_lon_plot,
+                    height_lat_plot,
+                )
+            print(f"Replotted composite results from {result_path}")
+            return
+        else:
+            raise RuntimeError(f"Replot requested but no valid composite NetCDF found at {result_path}")
 
     if _composite_cache_is_valid(result_path):
         print(f"Composite NetCDF already exists at {result_path}; reusing it for plotting.")
@@ -1226,6 +1410,7 @@ def run_event_composite_all_plot() -> None:
             _plot_composite_outputs(
                 ds["lat_lon_composite"],
                 ds["lat_lon_significance_mask"] if "lat_lon_significance_mask" in ds.data_vars else None,
+                lat_time_plot,
                 ds["height_lat_composite"],
                 ds["height_lat_significance_mask"] if "height_lat_significance_mask" in ds.data_vars else None,
                 ds["u_lat_lon_composite"] if "u_lat_lon_composite" in ds.data_vars else None,
@@ -1279,6 +1464,7 @@ def run_event_composite_all_plot() -> None:
     _plot_composite_outputs(
         lat_lon_composite,
         lat_lon_mask,
+        lat_time_plot,
         height_lat_composite,
         height_lat_mask,
         u_lat_lon_composite,

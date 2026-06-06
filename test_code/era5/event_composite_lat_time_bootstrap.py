@@ -39,10 +39,12 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from plotting_utils import add_active_month_percent_labels, compute_active_month_percent
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "CMIP6_HadGEM3_GC31"))
-from utilities import (
+from CMIP6_HadGEM3_GC31.utilities import (
     _to_per_latitude_band,
     vertical_sum_over_pressure_range,
+    REGION_BOUNDS
 )
+
 
 try:
     import tqdm

@@ -37,30 +37,25 @@ import xarray as xr
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+import event_composite_all as composite_core
 from plotting_utils import add_active_month_percent_labels, compute_active_month_percent
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "CMIP6_HadGEM3_GC31"))
-from utilities import (
+from CMIP6_HadGEM3_GC31.utilities import (
     _to_per_latitude_band,
     vertical_sum_over_pressure_range,
+    REGION_BOUNDS
 )
-
 
 ACTIVE_MONTH_EL_NINO_THRESHOLD = 0.5
 ACTIVE_MONTH_LA_NINA_THRESHOLD = -0.5
 
-REGION_BOUNDS = {
-    "all": None,
-    "pacific": (125.0, -110.0),
-    "indian": (50.0, 100.0),
-    "atlantic": (-60.0, 10.0),
-}
-
 ERA5_DIR = Path(__file__).resolve().parent
 NINO34_CSV = ERA5_DIR / "nino34" / "nino34_HadlSST.csv"
+L137_CSV = ERA5_DIR / "l137_a_b.csv"
 AAM_FIG_DIR = ERA5_DIR / "AAMA_fig"
 AAM_DATA_DIR = Path("/work/scratch-nopw2/hhhn2/ERA5/monthly_mean/AAM/full")
-CLIMATOLOGY_DIR = ERA5_DIR / "climatology"
+CLIMATOLOGY_DIR = Path("/work/scratch-nopw2/hhhn2/ERA5/climatology")
 OUTPUT_DIR = ERA5_DIR / "composite_non_tracking"
 
 
@@ -156,8 +151,12 @@ def _resolve_climatology_file(args: argparse.Namespace) -> str:
         f"No ERA5 AAM climatology file found in fixed directory: {CLIMATOLOGY_DIR}"
     )
 
-
 def _resolve_precomputed_anomaly_file(args: argparse.Namespace) -> Optional[str]:
+    # Region-specific composites must start from the full field so longitude can be
+    # trimmed before any zonal integration or latitude-band weighting.
+    if args.region != "all":
+        return None
+
     pattern = str(AAM_FIG_DIR / f"AAM_anomalies_*_p{args.p_min:g}-{args.p_max:g}hPa.nc")
     candidates = sorted(glob.glob(pattern))
     if not candidates:
@@ -181,6 +180,14 @@ def _resolve_precomputed_anomaly_file(args: argparse.Namespace) -> Optional[str]
             continue
 
         if file_start <= args.start_year and file_end >= args.end_year:
+            try:
+                with xr.open_dataset(path) as ds:
+                    file_region = ds.attrs.get("region")
+                    has_lon = "longitude" in ds.dims or "lon" in ds.dims
+            except Exception:
+                file_region = None
+                has_lon = False
+
             matching.append((file_start, file_end, path))
 
     if not matching:
@@ -240,17 +247,29 @@ def _apply_latitude_band_weighting(da: xr.DataArray) -> tuple[xr.DataArray, floa
 
 def _select_region(da: xr.DataArray, region: str) -> xr.DataArray:
     if region == "all" or "longitude" not in da.dims:
+        print("Region is set to all or Expected full AAM field not present for longitude trimming")
         return da
     lon_min, lon_max = REGION_BOUNDS[region]
     lon = da["longitude"]
     lon_360 = lon % 360.0
     lon_min_360 = lon_min % 360.0
     lon_max_360 = lon_max % 360.0
+    
     if lon_min_360 > lon_max_360:
         mask = (lon_360 >= lon_min_360) | (lon_360 <= lon_max_360)
     else:
         mask = (lon_360 >= lon_min_360) & (lon_360 <= lon_max_360)
-    selected = da.isel(longitude=mask)
+        
+    # FIX 1: Extract pure boolean numpy array to prevent xarray alignment failures
+    mask_vals = mask.values 
+    
+    selected_lon = np.asarray(lon_360.values[mask_vals], dtype=float)
+    if lon_min_360 > lon_max_360:
+        # Unwrap Greenwich-crossing regions so longitude remains monotonic
+        selected_lon = np.where(selected_lon <= lon_max_360, selected_lon + 360.0, selected_lon)
+        
+    selected = da.isel(longitude=mask_vals).assign_coords(longitude=selected_lon)
+    selected = selected.sortby("longitude")
     if selected.sizes.get("longitude", 0) == 0:
         raise ValueError(f"Region {region!r} selected zero longitudes.")
     return selected
@@ -269,21 +288,7 @@ def _infer_time_from_filenames(files: list[str]) -> list[pd.Timestamp]:
     return times
 
 
-def load_era5_aam(args: argparse.Namespace) -> tuple[xr.DataArray, bool]:
-    anomaly_path = _resolve_precomputed_anomaly_file(args)
-    if anomaly_path is not None:
-        print(f"Opening precomputed ERA5 anomaly file: {anomaly_path}")
-        ds = xr.open_dataset(anomaly_path)
-        da = _first_data_var(ds, ("AAM_anomaly", "AAM", "aam", "AAMA")).load()
-        da = _standardize_dims(da)
-        if "time" not in da.dims:
-            raise ValueError(f"Precomputed anomaly file must have a time dimension: {anomaly_path}")
-
-        end_year_buffer = int(np.ceil(args.composite_months / 12.0)) + 1
-        da = da.sel(time=slice(f"{args.start_year}-01-01", f"{args.end_year + end_year_buffer}-12-31"))
-        ds.close()
-        return da, True
-
+def load_era5_aam(args: argparse.Namespace) -> xr.DataArray:
     max_needed_year = args.end_year + int(np.ceil(args.composite_months / 12.0)) + 1
     files = []
     for year in range(args.start_year, max_needed_year + 1):
@@ -293,10 +298,12 @@ def load_era5_aam(args: argparse.Namespace) -> tuple[xr.DataArray, bool]:
 
     print(f"Opening {len(files)} ERA5 AAM monthly files.")
     try:
+        # Keep this lazy/chunked to avoid OOM on large regional composites.
         ds = xr.open_mfdataset(
             files,
             combine="by_coords",
-            chunks={"time": 12, "level": 50, "latitude": 180, "longitude": 360},
+            chunks={"time": 12},
+            parallel=False,
         )
     except ValueError:
         datasets = [xr.open_dataset(path, decode_times=False) for path in files]
@@ -308,7 +315,7 @@ def load_era5_aam(args: argparse.Namespace) -> tuple[xr.DataArray, bool]:
         times = _infer_time_from_filenames(files)
         if len(times) == da.sizes["time"]:
             da = da.assign_coords(time=pd.DatetimeIndex(times))
-    return da, False
+    return da
 
 
 def load_era5_climatology(args: argparse.Namespace) -> xr.DataArray:
@@ -320,6 +327,106 @@ def load_era5_climatology(args: argparse.Namespace) -> xr.DataArray:
     if "month" not in da.dims and "month" not in da.coords:
         raise ValueError(f"Climatology must have a monthly 'month' dimension or coord: {path}")
     return da
+
+
+def _prepare_monthly_anomalies(
+    da: xr.DataArray,
+    clim_da: xr.DataArray,
+    args: argparse.Namespace,
+    variable_name: str,
+) -> xr.DataArray:
+    data = _standardize_dims(da)
+    clim = _standardize_dims(clim_da)
+
+    if "month" not in clim.dims and "month" not in clim.coords:
+        raise ValueError(f"{variable_name} climatology must have a monthly 'month' dimension or coord.")
+
+    clim_months = clim["month"].values
+    if np.size(clim_months) and np.nanmin(clim_months) == 0 and np.nanmax(clim_months) == 11:
+        clim = clim.assign_coords(month=clim["month"] + 1)
+
+    if args.region != "all" and "longitude" in data.dims:
+        orig_lon_count = int(data.sizes.get("longitude", 0))
+        data = _select_region(data, args.region)
+        new_lon_count = int(data.sizes.get("longitude", 0))
+        lon_vals = np.asarray(data["longitude"].values, dtype=float)
+        lon_min = float(np.nanmin(lon_vals)) if lon_vals.size else float("nan")
+        lon_max = float(np.nanmax(lon_vals)) if lon_vals.size else float("nan")
+        print(
+            f"Applied region slice '{args.region}' for {variable_name}: "
+            f"longitude count {orig_lon_count} -> {new_lon_count}, range [{lon_min:.1f}, {lon_max:.1f}]"
+        )
+        clim = _select_region(clim, args.region)
+
+        # Force climatology onto the same region grid as the data so the monthly
+        # subtraction cannot silently align to an empty or mismatched longitude index.
+        # Force climatology onto the same region grid as the data
+        clim = clim.sortby("latitude") if "latitude" in clim.dims else clim
+        data = data.sortby("latitude") if "latitude" in data.dims else data
+        
+        # FIX 2: Use .values and method="nearest" to avoid NaN-filled reindexing 
+        # from floating-point misalignment
+        if "longitude" in clim.dims and "longitude" in data.dims:
+            clim = clim.sel(
+                latitude=data["latitude"].values, 
+                longitude=data["longitude"].values, 
+                method="nearest"
+            )
+        elif "latitude" in clim.dims and "latitude" in data.dims:
+            clim = clim.sel(
+                latitude=data["latitude"].values, 
+                method="nearest"
+            )
+
+        data, clim = xr.align(data, clim, join="override")
+        print(
+            f"Aligned {variable_name} region grid: data lon [{float(np.nanmin(data.longitude.values)):.1f}, "
+            f"{float(np.nanmax(data.longitude.values)):.1f}], climatology lon [{float(np.nanmin(clim.longitude.values)):.1f}, "
+            f"{float(np.nanmax(clim.longitude.values)):.1f}]"
+        )
+
+    anomalies = data.groupby("time.month") - clim
+    if "time" not in anomalies.dims:
+        raise ValueError(f"{variable_name} anomalies must have a time dimension.")
+    return anomalies
+
+
+def _debug_report(stage: str, da: xr.DataArray) -> None:
+    """Always print detailed stage-by-stage diagnostics."""
+    total_count = int(np.prod([int(da.sizes[d]) for d in da.dims], dtype=np.int64))
+
+    finite_count = int(da.count().compute().item())
+    zero_count = int((da == 0).sum(skipna=True).compute().item())
+    nonzero_count = max(finite_count - zero_count, 0)
+
+    if finite_count:
+        vmin = float(da.min(skipna=True).compute().item())
+        vmax = float(da.max(skipna=True).compute().item())
+        vmean = float(da.mean(skipna=True).compute().item())
+        vstd = float(da.std(skipna=True).compute().item())
+        absmax = float(np.abs(da).max(skipna=True).compute().item())
+    else:
+        vmin = vmax = vmean = vstd = absmax = float("nan")
+
+    print(
+        f"[DEBUG][{stage}] dims={da.dims}, shape={da.shape}, "
+        f"finite={finite_count}/{total_count}, zero={zero_count}, nonzero={nonzero_count}, "
+        f"min={vmin:.6g}, max={vmax:.6g}, mean={vmean:.6g}, std={vstd:.6g}, absmax={absmax:.6g}"
+    )
+
+    if "time" in da.dims:
+        reduce_dims = tuple(dim for dim in da.dims if dim != "time")
+        month_absmax = np.abs(da).groupby("time.month").max(dim=reduce_dims, skipna=True).compute()
+        try:
+            sample_months = [1, 2, 3, 6, 9, 12]
+            items = []
+            for m in sample_months:
+                if m in month_absmax["month"].values:
+                    items.append(f"m{m}={float(month_absmax.sel(month=m).values):.6g}")
+            if items:
+                print(f"[DEBUG][{stage}] monthly absmax: " + ", ".join(items))
+        except Exception:
+            pass
 
 
 def load_nino34(args: argparse.Namespace, end_year_buffer: int = 3) -> pd.Series:
@@ -419,28 +526,58 @@ def _circular_rolling_mean(da: xr.DataArray, *, dim: str, window: int) -> xr.Dat
 
 def build_event_stack(
     aam_da: xr.DataArray,
-    clim_da: Optional[xr.DataArray],
+    clim_da: xr.DataArray,
     date_list: list[tuple[str, str]],
     args: argparse.Namespace,
 ) -> tuple[xr.DataArray, list[str], float]:
-    aam = _select_region(aam_da, args.region)
-    aam, dphi_deg = _apply_latitude_band_weighting(aam)
-    if "level" in aam.dims:
-        aam = vertical_sum_over_pressure_range(aam, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
-    if clim_da is None:
-        anomalies = aam
-    else:
-        clim = _select_region(clim_da, args.region)
-        clim, clim_dphi_deg = _apply_latitude_band_weighting(clim)
-        if not np.isfinite(dphi_deg):
-            dphi_deg = clim_dphi_deg
-        if "level" in clim.dims:
-            clim = vertical_sum_over_pressure_range(clim, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
+    anomalies = _prepare_monthly_anomalies(aam_da, clim_da, args, "AAM")
+    _debug_report("anomalies_after_subtraction", anomalies)
 
-        clim_months = clim["month"].values
-        if np.size(clim_months) and np.nanmin(clim_months) == 0 and np.nanmax(clim_months) == 11:
-            clim = clim.assign_coords(month=clim["month"] + 1)
-        anomalies = aam.groupby("time.month") - clim
+    anomalies, dphi_deg = _apply_latitude_band_weighting(anomalies)
+    _debug_report("after_latitude_band_weighting", anomalies)
+
+    if "level" in anomalies.dims:
+        level_vals = np.asarray(anomalies["level"].values, dtype=float)
+        if level_vals.size:
+            # 1. Map requested pressure to model levels using the CSV table
+            try:
+                level_df = pd.read_csv(L137_CSV)
+                
+                # Clean up the table: remove non-numeric rows (like n=0 which has '-')
+                level_df = level_df[level_df['ph [hPa]'] != '-'].copy()
+                level_df['ph [hPa]'] = pd.to_numeric(level_df['ph [hPa]'])
+                level_df['n'] = pd.to_numeric(level_df['n'])
+
+                # Find the closest model levels using half-level pressures (ph)
+                n_min_idx = (level_df['ph [hPa]'] - args.p_min).abs().idxmin()
+                n_max_idx = (level_df['ph [hPa]'] - args.p_max).abs().idxmin()
+
+                n_start = level_df.loc[n_min_idx, 'n']
+                n_end = level_df.loc[n_max_idx, 'n']
+
+                # Ensure lower 'n' is first for the slice (n=1 is the top of the atmosphere)
+                target_n_min = min(n_start, n_end)
+                target_n_max = max(n_start, n_end)
+
+                print(
+                    f"[DEBUG][level_coord] size={level_vals.size}, min={np.nanmin(level_vals):.6g}, "
+                    f"max={np.nanmax(level_vals):.6g}, unit is model level (n).\n"
+                    f"Mapped requested {args.p_min}-{args.p_max} hPa to model levels n={target_n_min} to n={target_n_max}"
+                )
+            except Exception as e:
+                raise RuntimeError(f"Failed to map pressure to model levels using CSV: {e}")
+            
+            # 2. Prevent empty slices from reversed coordinates
+            anomalies = anomalies.sortby("level")
+            
+            # 3. Subset to the mapped model level range
+            # Xarray's slice is inclusive and will capture all points (like 1.5, 2.5) between the integer boundaries
+            anomalies = anomalies.sel(level=slice(target_n_min, target_n_max))
+            
+            # 4. Perform the vertical sum
+            anomalies = anomalies.sum(dim="level", skipna=True)
+            
+        _debug_report("after_vertical_sum", anomalies)
 
     stacked = []
     event_labels = []
@@ -475,6 +612,7 @@ def build_event_stack(
 
     event_stack = xr.concat(stacked, dim=pd.Index(event_labels, name="event"))
     event_stack = _circular_rolling_mean(event_stack, dim="month", window=args.rolling_period)
+    _debug_report("event_stack", event_stack)
     event_stack.name = "AAMA_event_stack"
     return event_stack, event_labels, dphi_deg
 
@@ -643,8 +781,8 @@ def main() -> None:
         raise RuntimeError("No ENSO events matched the requested criteria.")
     print(f"Detected {len(date_list)} ENSO event onset(s): {[onset[:7] for onset, _ in date_list]}")
 
-    aam_da, is_precomputed = load_era5_aam(args)
-    clim_da = None if is_precomputed else load_era5_climatology(args)
+    aam_da = load_era5_aam(args)
+    clim_da = load_era5_climatology(args)
     event_stack, event_labels, dphi_float = build_event_stack(aam_da, clim_da, date_list, args)
     print(f"Built event stack with {event_stack.sizes['event']} complete event(s): {event_labels}")
 

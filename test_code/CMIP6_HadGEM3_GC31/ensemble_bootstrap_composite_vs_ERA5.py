@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import json
 import traceback
+import re
 # Allow importing shared utilities from AAM/test_code
 import sys
 import os
@@ -61,7 +62,14 @@ parser.add_argument(
     choices=['all', 'pacific', 'indian', 'atlantic'],
     help='Geographic region to analyze (default: all). Pacific: 125–(-110)°, Indian: 50–100°, Atlantic: -60–10°',
 )
-replot = False  # If True, skip composite calculation and just replot from saved ensemble mean NetCDF
+parser.add_argument(
+    '--member-bootstrap-taylor-vs-era5',
+    action='store_true',
+    help=(
+        'Also create one bootstrapped AAM composite per HadGEM3 member from that member event pool, '
+        'then compare those member bootstrap composites to ERA5 in a labeled Taylor diagram.'
+    ),
+)
 
 if "ipykernel" in sys.modules:
     args = parser.parse_args([
@@ -72,6 +80,9 @@ if "ipykernel" in sys.modules:
 else:
     args = parser.parse_args()
 # args = parser.parse_args()
+replot = False
+if args.member_bootstrap_taylor_vs_era5:
+    replot = False
 
 n_cpus_to_use = 8
 # Define region longitude bounds (degrees East; negative = West)
@@ -90,20 +101,70 @@ def _safe_label_float(value):
     return f"{float(value):g}"
 
 
-def _load_era5_composite_truth(comp_type: str) -> Optional[xr.DataArray]:
-    """Load the single ERA5 deterministic composite used as ground truth."""
+def _era5_composite_path_candidates(comp_type: str) -> list[Path]:
+    """Return ERA5 composite candidates, preferring an exact run-argument match."""
     if comp_type != "aam":
-        return None
+        return []
 
-    era5_path = Path(ref_ERA5_composite_dir) / (
+    era5_dir = Path(ref_ERA5_composite_dir)
+    exact_path = era5_dir / (
         f"ERA5_Composite_AAM_{args.enso_state}_{args.start_year}-{args.end_year}_"
         f"{args.p_min:g}-{args.p_max:g}hPa_onset_{args.onset_season}"
         f"_start_{args.composite_start}_region_{args.region}.nc"
     )
 
-    if not era5_path.exists():
-        print(f"ERA5 mean composite not found: {era5_path}")
+    pattern = (
+        f"ERA5_Composite_AAM_{args.enso_state}_*hPa_onset_{args.onset_season}"
+        f"_start_{args.composite_start}_region_{args.region}.nc"
+    )
+    candidates = [exact_path]
+    if era5_dir.exists():
+        candidates.extend(sorted(era5_dir.glob(pattern)))
+
+    seen: set[Path] = set()
+    unique_candidates = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique_candidates.append(candidate)
+
+    def _sort_key(path: Path) -> tuple[float, float, str]:
+        if path == exact_path:
+            return (0.0, 0.0, path.name)
+        match = re.search(
+            r"_(?P<start>\d{4})-(?P<end>\d{4})_(?P<pmin>[\d.]+)-(?P<pmax>[\d.]+)hPa_",
+            path.name,
+        )
+        if not match:
+            return (1.0e9, 1.0e9, path.name)
+        pressure_penalty = (
+            abs(float(match.group("pmin")) - float(args.p_min))
+            + abs(float(match.group("pmax")) - float(args.p_max))
+        )
+        year_penalty = (
+            abs(int(match.group("start")) - int(args.start_year))
+            + abs(int(match.group("end")) - int(args.end_year))
+        )
+        return (pressure_penalty, year_penalty, path.name)
+
+    return sorted(unique_candidates, key=_sort_key)
+
+
+def _load_era5_composite_truth(comp_type: str) -> Optional[xr.DataArray]:
+    """Load the single ERA5 deterministic composite used as ground truth."""
+    candidates = _era5_composite_path_candidates(comp_type)
+
+    era5_path = next((candidate for candidate in candidates if candidate.exists()), None)
+    if era5_path is None:
+        expected = candidates[0] if candidates else Path(ref_ERA5_composite_dir)
+        print(f"ERA5 mean composite not found: {expected}")
         return None
+    if candidates and era5_path != candidates[0]:
+        print(
+            "ERA5 exact composite not found for the CMIP6 run arguments; "
+            f"using available ERA5 composite instead: {era5_path}"
+        )
 
     try:
         ds = xr.open_dataset(era5_path)
@@ -137,10 +198,39 @@ def _regrid_reference_to_target_grid(
     The Taylor comparison should keep the reference deterministic. This helper
     only remaps ERA5 to the HadGEM3 coordinates; it does not create a bootstrap
     ensemble from ERA5.
+    
+    We will use an area-weighted block average to transition from high (Era5) to low (HadGEM3) resolution. 
     """
     reference = _standardize_taylor_dims(reference_da)
     target = _standardize_taylor_dims(target_da)
 
+    # 1. Dynamically identify if the dataset uses "lat/lon" or "latitude/longitude"
+    lat_dim = next((d for d in reference.dims if d in ["lat", "latitude"]), None)
+    lon_dim = next((d for d in reference.dims if d in ["lon", "longitude"]), None)
+    
+    # 1. Check for resolution factor downscaling (e.g., 0.25 to 2.5 deg = factor of 10)
+    # We apply an area-weighted coarsen to smooth high-res features into the coarse grid footprint.
+    coarsen_dict = {}
+    for dim in [lat_dim, lon_dim]:
+        if dim in reference.dims and dim in target.dims:
+            ref_res = abs(float(reference[dim].diff(dim).median()))
+            tgt_res = abs(float(target[dim].diff(dim).median()))
+            factor = int(round(tgt_res / ref_res))
+            if factor > 1:
+                coarsen_dict[dim] = factor
+    #import pdb; pdb.set_trace()
+    if coarsen_dict:
+        # AAM is an EXTENSIVE quantity (total momentum). 
+        # When moving from a 0.25 deg grid to a 2.5 deg grid, we must SUM 
+        # the smaller bands to match the total mass/momentum of the wider band.
+        if lat_dim in coarsen_dict:
+            lat_coarsen = {lat_dim: coarsen_dict[lat_dim]}
+            reference = reference.coarsen(lat_coarsen, boundary="trim").sum()
+        else:
+            # Fallback if only longitude is being coarsened (unlikely since it's zonally integrated)
+            reference = reference.coarsen(coarsen_dict, boundary="trim").sum()
+            
+    #import pdb; pdb.set_trace()
     interp_coords: dict[str, xr.DataArray] = {}
     for dim in reference.dims:
         if dim == "iteration" or dim not in target.dims:
@@ -219,6 +309,15 @@ def plot_hadgem_bootstrap_taylor_vs_era5(
     except Exception as e:
         print(f"Skipping ERA5 Taylor diagram for {comp_type} {label}: alignment failed: {e}")
         return None
+    
+    # --- ADD LATITUDE TRIMMING HERE ---
+    if ref_da["latitude"].values[0] > ref_da["latitude"].values[-1]:
+        ref_da = ref_da.sel(latitude=slice(60, -60))
+        boot_aligned = boot_aligned.sel(latitude=slice(60, -60))
+    else:
+        ref_da = ref_da.sel(latitude=slice(-60, 60))
+        boot_aligned = boot_aligned.sel(latitude=slice(-60, 60))
+    # ----------------------------------
 
     df = compute_taylor_stats_against_reference(ref_da, boot_aligned, sample_dim="iteration")
     if df.empty:
@@ -237,7 +336,7 @@ def plot_hadgem_bootstrap_taylor_vs_era5(
     era5_source = era5_truth.attrs.get("source_path", "ERA5 composite")
     save_path = os.path.join(
         output_dir,
-        f"Taylor_HadGEM3_bootstrap_vs_ERA5_{comp_type}_{label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.png",
+        f"Taylor_HadGEM3_bootstrap_vs_ERA5_{comp_type}_{label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.svg",
     )
     ok = plot_taylor_diagram_from_stats(
         df,
@@ -245,16 +344,163 @@ def plot_hadgem_bootstrap_taylor_vs_era5(
         stats_csv_path=csv_path,
         percentiles_csv_path=pct_path,
         title=(
-            f"Taylor Diagram: HadGEM3 bootstrap {comp_type.upper()} vs ERA5 truth\n"
+            f"Taylor Diagram: HadGEM3 bootstrap {comp_type.upper()} vs ERA5 Reanalysis\n"
             f"{label}; ERA5={os.path.basename(str(era5_source))}"
         ),
-        reference_label="ERA5 truth",
+        reference_label="ERA5 Reanalysis",
         sample_label="HadGEM3 bootstrap",
-        min_corr=0.9,
-        min_std=0.8,
-        max_std=1.2,
+        min_corr=0.0,
+        min_std=0.0,
+        max_std=1.0,
     )
     return save_path if ok else None
+
+
+def plot_member_bootstrap_taylor_vs_era5(
+    member_bootstrap_ds: xr.DataArray,
+    comp_type: str,
+    label: str,
+    output_dir: str,
+) -> Optional[str]:
+    """Taylor diagram for one bootstrapped composite per HadGEM3 member vs ERA5."""
+    if comp_type != "aam":
+        return None
+
+    era5_truth = _load_era5_composite_truth(comp_type)
+    if era5_truth is None:
+        return None
+
+    try:
+        ref_da, boot_aligned = _regrid_reference_to_target_grid(era5_truth, member_bootstrap_ds)
+    except Exception as e:
+        print(f"Skipping member-bootstrap ERA5 Taylor diagram for {label}: alignment failed: {e}")
+        return None
+    
+    # --- ADD LATITUDE TRIMMING HERE ---
+    if ref_da["latitude"].values[0] > ref_da["latitude"].values[-1]:
+        ref_da = ref_da.sel(latitude=slice(60, -60))
+        boot_aligned = boot_aligned.sel(latitude=slice(60, -60))
+    else:
+        ref_da = ref_da.sel(latitude=slice(-60, 60))
+        boot_aligned = boot_aligned.sel(latitude=slice(-60, 60))
+    # ----------------------------------
+
+    df = compute_taylor_stats_against_reference(ref_da, boot_aligned, sample_dim="iteration")
+    if df.empty:
+        print(f"Skipping member-bootstrap ERA5 Taylor diagram for {label}: no valid member samples.")
+        return None
+    
+    if "member" in boot_aligned.coords:
+        # Split on 'i' to drop the suffix, then use [1:] to skip the leading 'r'
+        member_labels = [str(v).split("i")[0][1:] for v in boot_aligned["member"].values]
+    else:
+        member_labels = [f"{i + 1}" for i in range(int(boot_aligned.sizes["iteration"]))]
+    df["member"] = [member_labels[int(i)] for i in df["iteration"].values]
+
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(
+        output_dir,
+        f"Taylor_Stats_HadGEM3_member_bootstrap_vs_ERA5_{comp_type}_{label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.csv",
+    )
+    pct_path = os.path.join(
+        output_dir,
+        f"Taylor_Percentiles_HadGEM3_member_bootstrap_vs_ERA5_{comp_type}_{label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.csv",
+    )
+    era5_source = era5_truth.attrs.get("source_path", "ERA5 composite")
+    save_path = os.path.join(
+        output_dir,
+        f"Taylor_HadGEM3_member_bootstrap_vs_ERA5_{comp_type}_{label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.svg",
+    )
+    ok = plot_taylor_diagram_from_stats(
+        df,
+        output_path=save_path,
+        stats_csv_path=csv_path,
+        percentiles_csv_path=pct_path,
+        title=(
+            f"Taylor Diagram: HadGEM3 member bootstraps {comp_type.upper()} vs ERA5 Reanalysis\n"
+            f"{label}; ERA5={os.path.basename(str(era5_source))}"
+        ),
+        reference_label="ERA5 Reanalysis",
+        sample_label="HadGEM3 member bootstrap",
+        min_corr=0.0,
+        min_std=0.0,
+        max_std=1.0,
+        sample_ms=3.5,
+        sample_alpha=0.85,
+        label_column="member",
+        label_fontsize=10.0,
+    )
+    return save_path if ok else None
+
+
+def _era5_taylor_output_paths(
+    results_dir: str,
+    comp_type: str,
+    strength_label: str,
+) -> tuple[str, str, str]:
+    stats_csv = os.path.join(
+        results_dir,
+        f"Taylor_Stats_HadGEM3_bootstrap_vs_ERA5_{comp_type}_{strength_label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.csv",
+    )
+    percentiles_csv = os.path.join(
+        results_dir,
+        f"Taylor_Percentiles_HadGEM3_bootstrap_vs_ERA5_{comp_type}_{strength_label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.csv",
+    )
+    plot_path = os.path.join(
+        results_dir,
+        f"Taylor_HadGEM3_bootstrap_vs_ERA5_{comp_type}_{strength_label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.svg",
+    )
+    return stats_csv, percentiles_csv, plot_path
+
+
+def _plot_or_rebuild_era5_taylor(
+    *,
+    results_dir: str,
+    comp_type: str,
+    strength_label: str,
+    boot_ds: Optional[xr.DataArray] = None,
+) -> bool:
+    """Plot HadGEM3-vs-ERA5 Taylor stats from CSV, or rebuild from bootstrap samples."""
+    if comp_type != "aam" or strength_label != "all":
+        return False
+
+    stats_csv, percentiles_csv, plot_path = _era5_taylor_output_paths(
+        results_dir,
+        comp_type,
+        strength_label,
+    )
+
+    if os.path.exists(stats_csv):
+        print("[ERA5 TAYLOR] Replotting HadGEM3 bootstrap vs ERA5 from saved CSV:")
+        print(f"  CSV: {stats_csv}")
+        print(f"  SVG: {plot_path}")
+        return _plot_taylor_diagram_from_csv(
+            stats_csv_path=stats_csv,
+            output_path=plot_path,
+            title=(
+                f"Taylor Diagram: HadGEM3 bootstrap {comp_type.upper()} vs ERA5 Reanalysis\n"
+                f"{strength_label}"
+            ),
+            reference_label="ERA5 Reanalysis",
+            sample_label="HadGEM3 bootstrap",
+            percentiles_csv_path=percentiles_csv,
+        )
+
+    if boot_ds is not None:
+        print("[ERA5 TAYLOR] Saved CSV missing; rebuilding HadGEM3 bootstrap vs ERA5 from bootstrap samples.")
+        return plot_hadgem_bootstrap_taylor_vs_era5(
+            boot_ds,
+            comp_type,
+            strength_label,
+            results_dir,
+        ) is not None
+
+    print(
+        "[ERA5 TAYLOR] Cannot create HadGEM3 bootstrap vs ERA5 Taylor diagram in replot mode: "
+        f"missing stats CSV and no saved bootstrap samples at {stats_csv}. "
+        "Run once with --no-replot to generate the ERA5 stats."
+    )
+    return False
 
 
 def plot_bootstrap_taylor_diagram(ref_da, boot_ds, comp_type, label, output_dir, external_ref_name="Ens Mean"):
@@ -267,7 +513,7 @@ def plot_bootstrap_taylor_diagram(ref_da, boot_ds, comp_type, label, output_dir,
     )
     save_path = os.path.join(
         output_dir,
-        f"Taylor_Bootstrap_{comp_type}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{label}.png",
+        f"Taylor_Bootstrap_{comp_type}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{label}.svg",
     )
     return plot_taylor_diagram_from_stats(
         df,
@@ -276,6 +522,43 @@ def plot_bootstrap_taylor_diagram(ref_da, boot_ds, comp_type, label, output_dir,
         title=f"Taylor Diagram: {comp_type.upper()} {label}\nBootstrap iterations vs {external_ref_name}",
         reference_label=external_ref_name,
         sample_label="HadGEM3 bootstrap",
+    )
+
+
+def _plot_taylor_diagram_from_csv(
+    *,
+    stats_csv_path: str,
+    output_path: str,
+    title: str,
+    reference_label: str,
+    sample_label: str,
+    percentiles_csv_path: Optional[str] = None,
+    min_corr: float = 0.0,
+    min_std: float = 0.0,
+    max_std: float = 1.1,
+) -> bool:
+    """Recreate a Taylor diagram from a saved stats CSV."""
+    if not os.path.exists(stats_csv_path):
+        print(f"[TAYLOR] ERROR: CSV not found: {stats_csv_path}")
+        return False
+
+    try:
+        stats_df = pd.read_csv(stats_csv_path)
+    except Exception as e:
+        print(f"[TAYLOR] ERROR: Could not load CSV {stats_csv_path}: {e}")
+        return False
+
+    return plot_taylor_diagram_from_stats(
+        stats_df,
+        output_path=output_path,
+        stats_csv_path=stats_csv_path,
+        percentiles_csv_path=percentiles_csv_path,
+        title=title,
+        reference_label=reference_label,
+        sample_label=sample_label,
+        min_corr=min_corr,
+        min_std=min_std,
+        max_std=max_std,
     )
 
 def bootstrap_pooled_events(event_stack, dim='event', n_iterations=2000, confidence_level=0.95):
@@ -452,6 +735,7 @@ def save_composite_results(
     significance_mask: np.ndarray,
     bootstrap_lower_bound: Optional[xr.DataArray] = None,
     bootstrap_upper_bound: Optional[xr.DataArray] = None,
+    bootstrap_samples: Optional[xr.DataArray] = None,
     active_month_percent: Optional[np.ndarray] = None,
     metadata: Optional[dict] = None,
 ) -> str:
@@ -508,6 +792,10 @@ def save_composite_results(
         ds['bootstrap_lower_bound'] = bootstrap_lower_bound
     if bootstrap_upper_bound is not None:
         ds['bootstrap_upper_bound'] = bootstrap_upper_bound
+    if bootstrap_samples is not None:
+        bootstrap_samples_copy = bootstrap_samples.copy()
+        bootstrap_samples_copy.name = "bootstrap_samples"
+        ds["bootstrap_samples"] = bootstrap_samples_copy
     
     # Store active-month percentages if available
     if active_month_percent is not None:
@@ -578,6 +866,7 @@ def load_composite_results(
             'significance_mask': ds['significance_mask'].copy() if 'significance_mask' in ds else None,
             'bootstrap_lower_bound': ds['bootstrap_lower_bound'].copy() if 'bootstrap_lower_bound' in ds else None,
             'bootstrap_upper_bound': ds['bootstrap_upper_bound'].copy() if 'bootstrap_upper_bound' in ds else None,
+            'bootstrap_samples': ds['bootstrap_samples'].copy() if 'bootstrap_samples' in ds else None,
             'active_month_percent': ds['active_month_percent'].values if 'active_month_percent' in ds else None,
             'metadata': dict(ds.attrs),
         }
@@ -635,6 +924,35 @@ def compute_and_save_composite_significance(
         significance_mask = loaded_results['significance_mask']
         if significance_mask is None:
             raise RuntimeError("Significance mask not found in loaded results for replotting.")
+
+        print(f"[REPLOT TAYLOR] Entering replot Taylor generation for {composite_type} {strength_label}")
+        
+        bootstrap_taylor_stats_csv = os.path.join(
+            results_dir,
+            f"Taylor_Stats_{composite_type}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{strength_label}.csv",
+        )
+        bootstrap_taylor_png = os.path.join(
+            results_dir,
+            f"Taylor_Bootstrap_{composite_type}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{strength_label}.svg",
+        )
+        print(f"[REPLOT TAYLOR] Attempting bootstrap Taylor replot:")
+        print(f"  CSV: {bootstrap_taylor_stats_csv}")
+        print(f"  PNG: {bootstrap_taylor_png}")
+        
+        _plot_taylor_diagram_from_csv(
+            stats_csv_path=bootstrap_taylor_stats_csv,
+            output_path=bootstrap_taylor_png,
+            title=f"Taylor Diagram: {composite_type.upper()} {strength_label}\nBootstrap iterations vs Ensemble Mean",
+            reference_label="Ensemble Mean",
+            sample_label="HadGEM3 bootstrap",
+        )
+
+        _plot_or_rebuild_era5_taylor(
+            results_dir=results_dir,
+            comp_type=composite_type,
+            strength_label=strength_label,
+            boot_ds=loaded_results.get("bootstrap_samples"),
+        )
         return significance_mask, "loaded_from_saved_results"
     
     else:
@@ -654,13 +972,12 @@ def compute_and_save_composite_significance(
             external_ref_name="Ensemble Mean",
         )
 
-        if composite_type == 'aam' and strength_label == 'all':
-            plot_hadgem_bootstrap_taylor_vs_era5(
-                boot_ds,
-                composite_type,
-                strength_label,
-                results_dir,
-            )
+        _plot_or_rebuild_era5_taylor(
+            results_dir=results_dir,
+            comp_type=composite_type,
+            strength_label=strength_label,
+            boot_ds=boot_ds,
+        )
 
         # Save results to NetCDF (including the mask and bounds)
         filepath = save_composite_results(
@@ -672,6 +989,7 @@ def compute_and_save_composite_significance(
             significance_mask=sig_mask,
             bootstrap_lower_bound=lower_bound,
             bootstrap_upper_bound=upper_bound,
+            bootstrap_samples=boot_ds if composite_type == 'aam' else None,
             active_month_percent=active_month_percent,
             metadata={'bootstrap': 'pooled_events', 'iterations': 2000}
         )
@@ -931,7 +1249,7 @@ def _plot_and_save_ensemble_mean_aam_composite(
         # Create mask for plotting (1 = insignificant, hatch it)
         insig_mask = np.where(sig_mask_saved, 0, 1)
     else:
-        # Replot Mode: Load the boolean mask directly
+        # Replot Mode: Load the boolean mask directly and regenerate Taylor diagrams
         strength_results = load_composite_results(ensemble_results_dir, 'aam', strength_label)
         if strength_results is not None and strength_results.get('significance_mask') is not None:
             sig_mask = strength_results['significance_mask']
@@ -939,6 +1257,24 @@ def _plot_and_save_ensemble_mean_aam_composite(
         else:
             print(f"  WARNING: Combined bootstrap results not found for {strength_label}. Hatching everything.")
             insig_mask = np.ones_like(aam_vals)
+        
+        # TAYLOR REPLOT: Generate Taylor diagrams from saved CSV statistics
+        if args is not None:
+            bootstrap_taylor_stats_csv = os.path.join(
+                ensemble_results_dir,
+                f"Taylor_Stats_aam_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{strength_label}.csv",
+            )
+            bootstrap_taylor_png = os.path.join(
+                ensemble_results_dir,
+                f"Taylor_Bootstrap_aam_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}_{strength_label}.svg",
+            )
+            _plot_taylor_diagram_from_csv(
+                stats_csv_path=bootstrap_taylor_stats_csv,
+                output_path=bootstrap_taylor_png,
+                title=f"Taylor Diagram: AAM {strength_label}\nBootstrap iterations vs Ensemble Mean",
+                reference_label="Ensemble Mean",
+                sample_label="HadGEM3 bootstrap",
+            )
 
     insig_mask = _match_plot_orientation(aam_vals, insig_mask)
 
@@ -1067,9 +1403,9 @@ def _plot_and_save_ensemble_mean_aam_composite(
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(
         output_dir,
-        f"AAM_composite_ENSEMBLE_MEAN_{strength_label}_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_region_{args.region}{reinitiation_suffix}.png",
+        f"AAM_composite_ENSEMBLE_MEAN_{strength_label}_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_region_{args.region}{reinitiation_suffix}.svg",
     )
-    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    fig.savefig(out_path, format="svg", bbox_inches="tight")
     plt.close(fig)
     print(f"Ensemble mean composite plot saved to {out_path}")
 
@@ -1144,6 +1480,7 @@ def _process_single_ensemble_member(
     'u_latlon', 'u_latlev', 'uv_vi', 'onset_dates', 'onset_members', 'peak_amplitudes'
     """
     results = {
+        'ensemble_member': ensemble_member,
         'composite': None,
         'lat_lev_composite': None,
         'lat_lon_composite': None,
@@ -1153,6 +1490,7 @@ def _process_single_ensemble_member(
         'onset_dates': [],
         'onset_members': [],
         'peak_amplitudes': [],
+        'member_bootstrap_composite': None,
         'composites_by_strength': {label: None for label, _, _ in EVENT_STRENGTH_BINS},
         'enso_active_profile': np.zeros(int(args.composite_months), dtype=int),
         'enso_active_member_count': 0,
@@ -1182,7 +1520,7 @@ def _process_single_ensemble_member(
         AAM_da = _select_region(AAM_da, args.region)
         
         if "longitude" in AAM_da.dims or "lon" in AAM_da.dims:
-            AAM_da = _to_per_latitude_band(AAM_da)
+            AAM_da, _ = _to_per_latitude_band(AAM_da)
             
         u_da = xr.open_dataset(f"{u_data_path_base}/ua_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc")['ua']
         # Normalize dimension names
@@ -1217,7 +1555,7 @@ def _process_single_ensemble_member(
         clim_aam_data = clim_da['AAM']
         clim_aam_data = _select_region(clim_aam_data, args.region)
         if 'longitude' in clim_aam_data.dims or 'lon' in clim_aam_data.dims:
-            clim_da = _to_per_latitude_band(clim_aam_data)
+            clim_da, _ = _to_per_latitude_band(clim_aam_data)
         else:
             clim_da = clim_aam_data
         
@@ -1362,6 +1700,29 @@ def _process_single_ensemble_member(
         )
         if comp is not None:
             results['composite'] = comp.expand_dims({"ensemble": [ensemble_member]})
+
+        if comp is not None and getattr(args, "member_bootstrap_taylor_vs_era5", False):
+            member_number_match = re.search(r"r(\d+)i", str(ensemble_member))
+            member_number = int(member_number_match.group(1)) if member_number_match else 0
+            member_bootstrap_comp = composite_propagating_years_no_plot(
+                AAM_da,
+                wind_da=None,
+                date_list=date_list,
+                clim_da=clim_da,
+                clim_start_yr=clim_start_yr,
+                clim_end_yr=clim_end_yr,
+                p_min_hpa=float(args.p_min),
+                p_max_hpa=float(args.p_max),
+                enso_state=str(args.enso_state),
+                rolling_period=int(args.rolling_period),
+                composite_months=int(args.composite_months),
+                composite_start=str(args.composite_start),
+                onset_season=str(args.onset_season),
+                bootstrap_events=True,
+                bootstrap_seed=10_000 + member_number,
+            )
+            if member_bootstrap_comp is not None:
+                results['member_bootstrap_composite'] = member_bootstrap_comp.expand_dims({"iteration": [0]})
 
         for strength_label, strength_dates in strength_date_lists.items():
             if not strength_dates:
@@ -1607,6 +1968,8 @@ def composite_propagating_years_no_plot(
     composite_start: str = "onset",
     nlevels: int = 13,
     onset_season: str = "all",
+    bootstrap_events: bool = False,
+    bootstrap_seed: Optional[int] = None,
 ) -> xr.DataArray:
     """Composite AAM/variable anomalies for ENSO event onset windows.
 
@@ -1766,7 +2129,13 @@ def composite_propagating_years_no_plot(
     print(f"Compositing {n_events} {composite_months}-month window(s) from {_start_desc}.")
     aam_stack = xr.concat(stacked_AAM, dim="event")
     aam_stack_for_plot = _circular_rolling_mean(aam_stack, dim="month", window=rolling_period)
-    composite_AAM = aam_stack_for_plot.mean("event", skipna=True)
+    if bootstrap_events:
+        rng = np.random.default_rng(bootstrap_seed)
+        resample_indices = rng.integers(0, n_events, size=n_events)
+        composite_AAM = aam_stack_for_plot.isel(event=resample_indices).mean("event", skipna=True)
+        print(f"  member bootstrap: resampled {n_events} events with replacement.")
+    else:
+        composite_AAM = aam_stack_for_plot.mean("event", skipna=True)
 
     composite_wind = None
     if stacked_wind:
@@ -1805,6 +2174,8 @@ if __name__ == '__main__':
     ensemble_u_latlon = []
     ensemble_u_latlev = []
     ensemble_uv_vi_lat = []
+    member_bootstrap_composites = []
+    member_bootstrap_labels = []
     ensemble_composites_by_strength = {label: [] for label, _, _ in EVENT_STRENGTH_BINS}
     available_members = []
     # Collect onset dates across ensemble members for histogram plotting
@@ -1877,6 +2248,9 @@ if __name__ == '__main__':
         for result in results_list:
             if result['composite'] is not None:
                 ensemble_composites.append(result['composite'])
+            if result.get('member_bootstrap_composite') is not None:
+                member_bootstrap_composites.append(result['member_bootstrap_composite'])
+                member_bootstrap_labels.append(str(result.get('ensemble_member', f"member_{len(member_bootstrap_labels) + 1}")))
             for strength_label in ensemble_composites_by_strength:
                 strength_composite = result['composites_by_strength'].get(strength_label)
                 if strength_composite is not None:
@@ -1915,6 +2289,21 @@ if __name__ == '__main__':
                     active_event_count_by_strength[strength_label] += int(strength_event_counts.get(strength_label, 0))
         
         number_of_available_members = len(available_members)
+
+        if getattr(args, "member_bootstrap_taylor_vs_era5", False) and member_bootstrap_composites:
+            member_bootstrap_stack = xr.concat(
+                member_bootstrap_composites,
+                dim=xr.IndexVariable("iteration", np.arange(len(member_bootstrap_composites))),
+            )
+            member_bootstrap_stack = member_bootstrap_stack.assign_coords(
+                member=("iteration", member_bootstrap_labels)
+            )
+            plot_member_bootstrap_taylor_vs_era5(
+                member_bootstrap_stack,
+                "aam",
+                "all",
+                ensemble_results_dir,
+            )
     
     else:
         # replot=True: Load pre-computed ensemble mean composites and boolean masks
@@ -1939,6 +2328,12 @@ if __name__ == '__main__':
                 ensemble_composites.append(main_results['ens_mean'])
             significance_mask_aam = main_results.get('significance_mask')
             print(f"  Loaded bootstrap AAM results for {number_of_available_members} members.")
+            _plot_or_rebuild_era5_taylor(
+                results_dir=ensemble_results_dir,
+                comp_type='aam',
+                strength_label='all',
+                boot_ds=main_results.get('bootstrap_samples'),
+            )
         else:
             print("  WARNING: No bootstrap AAM results found for replotting.")
 
@@ -2197,10 +2592,10 @@ if __name__ == '__main__':
 
             out_path = os.path.join(
                 output_dir,
-                f"AAM_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{region_label}_{args.onset_season}_start_{args.composite_start}{reinitiation_suffix}.png",
+                f"AAM_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{region_label}_{args.onset_season}_start_{args.composite_start}{reinitiation_suffix}.svg",
             )
 
-            fig.savefig(out_path, dpi=300, bbox_inches="tight")
+            fig.savefig(out_path, format="svg", bbox_inches="tight")
             plt.close(fig)
 
             print(f"Ensemble mean composite plot saved to {out_path}")
@@ -2515,9 +2910,9 @@ if __name__ == '__main__':
 
             out_hist_path = os.path.join(
                 output_dir,
-                f"ENSO_onset_months_histogram_{args.enso_state}_{args.start_year}-{args.end_year}{reinitiation_suffix}.png",
+                f"ENSO_onset_months_histogram_{args.enso_state}_{args.start_year}-{args.end_year}{reinitiation_suffix}.svg",
             )
-            fig.savefig(out_hist_path, dpi=300, bbox_inches='tight')
+            fig.savefig(out_hist_path, format="svg", bbox_inches='tight')
             plt.close(fig)
             print(f"Saved onset months histogram to {out_hist_path}")
         except Exception as e:
@@ -2545,9 +2940,9 @@ if __name__ == '__main__':
 
                     out_hist_peaks = os.path.join(
                         output_dir,
-                        f"ENSO_event_peak_nino34_histogram_{args.enso_state}_{args.start_year}-{args.end_year}{reinitiation_suffix}_bin{bin_width}.png",
+                        f"ENSO_event_peak_nino34_histogram_{args.enso_state}_{args.start_year}-{args.end_year}{reinitiation_suffix}_bin{bin_width}.svg",
                     )
-                    fig.savefig(out_hist_peaks, dpi=300, bbox_inches='tight')
+                    fig.savefig(out_hist_peaks, format="svg", bbox_inches='tight')
                     plt.close(fig)
                     print(f"Saved event peak Nino3.4 histogram to {out_hist_peaks}")
             except Exception as e:

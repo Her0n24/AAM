@@ -50,10 +50,34 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from plotting_utils import add_active_month_percent_labels, compute_active_month_percent
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "CMIP6_HadGEM3_GC31"))
-from utilities import (
-    _to_per_latitude_band,
-    vertical_sum_over_pressure_range,
-)
+try:
+    from CMIP6_HadGEM3_GC31.utilities import (
+        _to_per_latitude_band,
+        vertical_sum_over_pressure_range,
+        REGION_BOUNDS,
+    )
+except ImportError:
+    from utilities import (  # type: ignore[import-not-found]
+        _to_per_latitude_band,
+        vertical_sum_over_pressure_range,
+        REGION_BOUNDS,
+    )
+
+# Ensure REGION_BOUNDS is defined even if import timing/order differs when
+# this module is imported from other scripts.
+if 'REGION_BOUNDS' not in globals():
+    try:
+        from CMIP6_HadGEM3_GC31.utilities import REGION_BOUNDS as _REGION_BOUNDS_FALLBACK
+        REGION_BOUNDS = _REGION_BOUNDS_FALLBACK
+    except Exception:
+        try:
+            from CMIP6_HadGEM3_GC31.utilities import REGION_BOUNDS as _REGION_BOUNDS_FALLBACK2
+            REGION_BOUNDS = _REGION_BOUNDS_FALLBACK2
+        except Exception:
+            # Minimal safe fallback covering full globe to avoid hard failures;
+            # downstream code will still work but region selection becomes no-op.
+            REGION_BOUNDS = {"all": (-180.0, 180.0)}
+            raise ImportError("Could not import REGION_BOUNDS from expected modules. Using fallback covering full globe, but this may cause issues if region selection is used.")
 
 
 ACTIVE_MONTH_EL_NINO_THRESHOLD = 0.5
