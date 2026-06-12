@@ -27,7 +27,14 @@ import sys
 import os
 import argparse
 from pathlib import Path
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+# 1. Define the base test_code directory
+test_code_dir = Path(__file__).resolve().parents[1]
+
+# 2. Append both the root test_code directory AND the era5 subdirectory
+sys.path.append(str(test_code_dir))          # Finds utilities, plotting_utils, etc.
+sys.path.append(str(test_code_dir / "era5")) # Fixes downstream imports inside the era5 folder
+
+from era5.event_composite_lat_time import _infer_latitude_band_width_deg
 from utilities import _to_per_latitude_band, _reindex_to_climatology_dims, vertical_sum_over_pressure_range, get_ENSO_index, pressure_range_in_coord_units
 from plotting_utils import plot_lat_level_postage_stamp_5x12, plot_lat_level_monthly_stamps_10col, plot_lat_time_postage_stamp_all_members, plot_lat_lon_monthly_stamps_10col
 import tqdm
@@ -387,6 +394,10 @@ def _process_single_ensemble_member(
         
         if "longitude" in AAM_da.dims or "lon" in AAM_da.dims:
             AAM_da = _to_per_latitude_band(AAM_da)
+            if isinstance(AAM_da, tuple):
+                AAM_da = AAM_da[0]
+            else:
+                AAM_da = AAM_da
             
         u_da = xr.open_dataset(f"{u_data_path_base}/ua_mon_historical_HadGEM3-GC31-LL_{ensemble_member}_interp.nc")['ua']
         
@@ -420,10 +431,17 @@ def _process_single_ensemble_member(
         
         # Use the per-latitude-band + zonal-integral climatology
         # CRITICAL: Apply region selection to climatology BEFORE zonal integration to match main AAM data
+        # Use the per-latitude-band + zonal-integral climatology
+        # CRITICAL: Apply region selection to climatology BEFORE zonal integration to match main AAM data
         clim_aam_data = clim_da['AAM']
         clim_aam_data = _select_region(clim_aam_data, args.region)
         if 'longitude' in clim_aam_data.dims or 'lon' in clim_aam_data.dims:
-            clim_da = _to_per_latitude_band(clim_aam_data)
+            # Unpack the tuple or index the first element if it returns multiple values
+            clim_da_result = _to_per_latitude_band(clim_aam_data)
+            if isinstance(clim_da_result, tuple):
+                clim_da = clim_da_result[0]
+            else:
+                clim_da = clim_da_result
         else:
             clim_da = clim_aam_data
         
@@ -486,8 +504,8 @@ def _process_single_ensemble_member(
         u_level = u_da.sel(plev=p_selected, method="nearest")
         u_zm = u_da_zonal_band
         
-        aam_latlon = vertical_sum_over_pressure_range(AAM_da, p_min_hpa=float(args.p_min), p_max_hpa=float(args.p_max), level_dim="level")
-        aam_latlev = AAM_da.sum(dim="longitude", skipna=True) if "longitude" in AAM_da.dims else AAM_da
+        # aam_latlon = vertical_sum_over_pressure_range(AAM_da, p_min_hpa=float(args.p_min), p_max_hpa=float(args.p_max), level_dim="level")
+        # aam_latlev = AAM_da.sum(dim="longitude", skipna=True) if "longitude" in AAM_da.dims else AAM_da
         uv_vi = vertical_sum_over_pressure_range(uv_da, p_min_hpa=float(args.p_min), p_max_hpa=float(args.p_max), level_dim="plev")
         
         u_latlon_comp = compute_composite_field(u_level, date_list=date_list, args=args)
@@ -525,6 +543,10 @@ def _process_single_ensemble_member(
         aam_full = _select_region(aam_full, args.region)
         if "longitude" in aam_full.dims or "lon" in aam_full.dims:
             aam_full = _to_per_latitude_band(aam_full)
+            if isinstance(aam_full, tuple):
+                clim_da = aam_full[0]
+            else:
+                clim_da = aam_full
         
         clim_full = clim_da["AAM"] if isinstance(clim_da, xr.Dataset) and "AAM" in clim_da else clim_da
         # Normalize dimensions
@@ -1062,6 +1084,7 @@ if __name__ == '__main__':
                 levels=levels,
                 cmap="RdBu_r",
                 extend="both",
+                rasterised=True,
             )
 
             # -------------------------------
@@ -1071,13 +1094,25 @@ if __name__ == '__main__':
             order = int(np.floor(np.log10(_abs))) if _abs > 0 else 0
             factor = 10 ** order
 
-            cax = fig.add_axes([0.125, 0.06, 0.775, 0.015])
-            cbar = fig.colorbar(cf, cax=cax, orientation="horizontal", extend="both")
+            cax = fig.add_axes([0.15, 0.03, 0.7, 0.01])  # [left, bottom, width, height]
+            cbar = fig.colorbar(cf, cax=cax, orientation='horizontal', extend='both', spacing='proportional')
+            
 
+            # Create neat unicode superscripts
             _sup = str.maketrans("0123456789-", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207b")
             _order_sup = str(order).translate(_sup)
 
-            cbar.set_label(f"AAM anomaly (×10{_order_sup})", size=12)
+            # Infer the latitude band width for the label description
+            # Assuming 'ens_mean' or your working xarray dataset is accessible here to read latitude track:
+            try:
+                dphi_deg = _infer_latitude_band_width_deg(ens_mean)
+            except Exception:
+                dphi_deg = 0.25 # Fallback to standard ERA5 resolution if unavailable
+
+            if np.isfinite(dphi_deg):
+                cbar.set_label(f"AAM anomaly (×10{_order_sup} kg m² s⁻¹ per {dphi_deg:g}° latitude band)", size=12)
+            else:
+                cbar.set_label(f"AAM anomaly (×10{_order_sup} kg m² s⁻¹ per 0.25° latitude band)", size=12)
 
             _tick_levels = cf.levels[::2]
             cbar.set_ticks(_tick_levels)
@@ -1087,18 +1122,23 @@ if __name__ == '__main__':
             # -------------------------------
             # Significance overlay (FIXED)
             # -------------------------------
-            sig_lat_idx, sig_month_idx = np.where(p_vals < 0.05)
+            insig = np.where(p_vals < 0.05, 0, 1)
 
-            if sig_lat_idx.size > 0:
-                ax.scatter(
-                    month_vals[sig_month_idx],   # correct
-                    lat_vals[sig_lat_idx],       # correct
-                    s=20,
-                    c="k",
-                    marker=".",
-                    linewidths=0,
+            if np.any(insig == 1):
+                hatches = ax.contourf(
+                    month_vals,
+                    lat_vals,
+                    insig,
+                    levels=[0.5, 1.5],
+                    colors="none",
+                    hatches=["//"],
                     zorder=10,
+                    rasterised=True
                 )
+                for collection in getattr(hatches, "collections", []):
+                    collection.set_facecolor("none")
+                    collection.set_edgecolor((0.4, 0.4, 0.4, 0.35))
+                    collection.set_linewidth(0.0)
             else:
                 print("No significant points (p < 0.05)")
 
@@ -1110,6 +1150,11 @@ if __name__ == '__main__':
 
             ax.set_xlim(1, len(month_vals))
             ax.set_ylim(-60, 60)
+            
+            # Horizontal gridlines decoration from reference style
+            ax.axhline(0, color="black", linewidth=1.0, alpha=0.8)
+            for lat in (-40, -20, 20, 40):
+                ax.axhline(lat, color="gray", linestyle="--", linewidth=0.8, alpha=0.4, zorder=2)
 
             ax.xaxis.set_major_locator(mticker.MultipleLocator(1))
 
@@ -1130,7 +1175,7 @@ if __name__ == '__main__':
 
             out_path = os.path.join(
                 output_dir,
-                f"AAM_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{region_label}_{args.onset_season}_start_{args.composite_start}_ninothres{float(args.nino_threshold)}.png",
+                f"AAM_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{region_label}_{args.onset_season}_start_{args.composite_start}_ninothres{float(args.nino_threshold)}.svg",
             )
 
             fig.savefig(out_path, dpi=300, bbox_inches="tight")
@@ -1155,6 +1200,13 @@ if __name__ == '__main__':
                 member_composite = ens_stack.isel(ensemble=i).drop_vars("ensemble")
                 member_composites_lattime.append((str(member_name), member_composite))
                 
+            p_vals_da = xr.DataArray(
+                p_vals,
+                coords={lat_dim: lat_vals, "month": month_vals},
+                dims=[lat_dim, "month"]
+            )
+            # -----------------------------------------------------------------------------------
+
             plot_lat_time_postage_stamp_all_members(
                 member_composites_lattime,
                 output_dir=output_dir,
@@ -1162,6 +1214,7 @@ if __name__ == '__main__':
                 enso_state=args.enso_state,
                 nino_threshold=float(args.nino_threshold),
                 title_suffix=f" ({args.enso_state.upper()} events, {args.start_year}–{args.end_year}, {args.p_min}–{args.p_max} hPa)",
+                member_pvals=p_vals_da  # <-- ADD THIS LINE to actually pass the data!
             )
             
         except Exception as e:
@@ -1197,11 +1250,12 @@ if __name__ == '__main__':
             #     nino_threshold=float(args.nino_threshold),
             #     title_suffix=f" ({args.enso_state.upper()} events, {args.start_year}–{args.end_year})",
             # )
-            
+        
             # Plot monthly 10-column postage stamps
             plot_lat_level_monthly_stamps_10col(
                 member_composites_latlev,
                 output_dir=output_dir,
+                
                 region=args.region,
                 enso_state=args.enso_state,
                 nino_threshold=float(args.nino_threshold),
@@ -1268,9 +1322,9 @@ if __name__ == '__main__':
 
             out_hist_path = os.path.join(
                 output_dir,
-                f"ENSO_onset_months_histogram_{args.enso_state}_{args.start_year}-{args.end_year}_ninothres{float(args.nino_threshold)}.png",
+                f"ENSO_onset_months_histogram_{args.enso_state}_{args.start_year}-{args.end_year}_ninothres{float(args.nino_threshold)}.svg",
             )
-            fig.savefig(out_hist_path, dpi=300, bbox_inches='tight')
+            fig.savefig(out_hist_path, format="svg", dpi=200, bbox_inches='tight')
             plt.close(fig)
             print(f"Saved onset months histogram to {out_hist_path}")
         except Exception as e:

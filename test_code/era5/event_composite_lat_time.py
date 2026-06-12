@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
         description="Build a deterministic ERA5 AAM event mean composite over ENSO events."
     )
     parser.add_argument("--p-min", type=float, default=150.0, help="Minimum pressure level in hPa.")
-    parser.add_argument("--p-max", type=float, default=1000.0, help="Maximum pressure level in hPa.")
+    parser.add_argument("--p-max", type=float, default=700, help="Maximum pressure level in hPa.")
     parser.add_argument("--start-year", type=int, default=1979, help="First onset year to consider.")
     parser.add_argument("--end-year", type=int, default=2019, help="Last onset year to consider.")
     parser.add_argument("--clim-start-year", type=int, default=1981, help="Climatology start year.")
@@ -697,7 +697,7 @@ def plot_composite(
     order = int(np.floor(np.log10(_abs))) if _abs > 0 else 0
     factor = 10 ** order
     
-    cax = fig.add_axes([0.125, 0.06, 0.775, 0.015])
+    cax = fig.add_axes([0.125, 0.08, 0.775, 0.02])
     cbar = fig.colorbar(cf, cax=cax, orientation="horizontal", extend="both")
     try:
         cbar.formatter.set_useOffset(False)
@@ -756,10 +756,10 @@ def plot_composite(
     tag = (
         f"ERA5_AAM_composite_{args.enso_state}_{args.start_year}-{args.end_year}"
         f"_{args.p_min:g}-{args.p_max:g}hPa_onset_{args.onset_season}"
-        f"_start_{args.composite_start}_region_{args.region}.png"
+        f"_start_{args.composite_start}_region_{args.region}.svg"
     )
     out_path = os.path.join(output_dir, tag)
-    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    fig.savefig(out_path, format="svg", bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -791,7 +791,7 @@ def main() -> None:
     lat_dim = "latitude" if "latitude" in event_stack.dims else ("lat" if "lat" in event_stack.dims else None)
     if lat_dim is None:
         raise ValueError(f"No latitude dimension found in event stack with dims {event_stack.dims}")
-    aam_for_ttest = event_stack.transpose("event", lat_dim, "month").values
+    aam_for_ttest = event_stack.transpose("event", lat_dim, "month").values.astype(np.float64)
     _, p_vals = _stats.ttest_1samp(aam_for_ttest, 0.0, axis=0, nan_policy="omit")
     significant = xr.DataArray(
         p_vals < 0.05,

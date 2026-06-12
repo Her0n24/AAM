@@ -16,8 +16,8 @@ from typing import Optional, Tuple
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Plot CMIP6 AAM anomalies integrated over specified pressure levels')
-parser.add_argument('--p-min', type=float, default=100, help='Minimum pressure level (hPa) to include (default: 100 hPa)')
-parser.add_argument('--p-max', type=float, default=1000, help='Maximum pressure level (hPa) to include (default: 1000 hPa)')
+parser.add_argument('--p-min', type=float, default=150, help='Minimum pressure level (hPa) to include (default: 100 hPa)')
+parser.add_argument('--p-max', type=float, default=700, help='Maximum pressure level (hPa) to include (default: 1000 hPa)')
 parser.add_argument('--start-year', type=int, default=1980, help='Start year to plot (default: 1980)')
 parser.add_argument('--end-year', type=int, default=2000, help='End year to plot (default: 2000)')
 parser.add_argument('--member', type=str, default='1', help='Ensemble member to plot (default: 1, control)')
@@ -42,7 +42,7 @@ os.makedirs(output_dir, exist_ok=True)
 
 # Default period 
 start_yr, end_yr = args.start_year, args.end_year
-clim_start_yr, clim_end_yr = 1980, 2000
+clim_start_yr, clim_end_yr = 1981, 2010
 
 # Pressure selection (user inputs in hPa)
 p_min_hpa = args.p_min

@@ -1,6 +1,9 @@
 
 """
 This script computes the monthly climatology of the full AAM field (not zonal mean) for a given ensemble member and period, and stores it as a netCDF file.
+
+Usage:
+python make_climatology.py --member r1i1p1f3
 """
 import numpy as np
 import xarray as xr

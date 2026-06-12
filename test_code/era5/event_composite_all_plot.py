@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import numpy as np
 import os
+from dask.distributed import Client, LocalCluster
 import argparse
 import glob
 import gc
@@ -18,9 +19,10 @@ import pandas as pd
 import sys
 import dask
 sys.path.append(str(Path(__file__).resolve().parents[1]))
+from event_composite_lat_time import _infer_latitude_band_width_deg
 
 import event_composite_all as composite_core
-from plotting_utils import compute_monthly_climatology, plot_lat_lon_snapshots, plot_latitude_level_snapshots_HadGEN3
+from plotting_utils import compute_monthly_climatology, plot_lat_lon_snapshots, plot_latitude_level_snapshots_HadGEN3, compute_active_month_percent, add_active_month_percent_labels
 from scipy import stats as _stats
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -63,6 +65,74 @@ if 'REGION_BOUNDS' not in globals():
 # Climatology period
 clim_start_yr, clim_end_yr = 1981, 2010
 
+def _precompute_reduced_fields(
+    aam_anomalies: xr.DataArray,
+    u_anomalies: xr.DataArray,
+    args: argparse.Namespace,
+    level_pressure_hpa: xr.DataArray,
+):
+    """
+    Compute all expensive reductions once for the full time series
+    instead of once per ENSO event.
+    """
+
+    n_mid_levels = int(level_pressure_hpa.sizes["level"])
+
+    if int(aam_anomalies.sizes.get("level", 0)) > n_mid_levels:
+        aam_anomalies = aam_anomalies.isel(level=slice(0, n_mid_levels))
+
+    if int(u_anomalies.sizes.get("level", 0)) > n_mid_levels:
+        u_anomalies = u_anomalies.isel(level=slice(0, n_mid_levels))
+
+    level_pressure_vals = level_pressure_hpa.values[:n_mid_levels]
+
+    aam_anomalies = aam_anomalies.assign_coords(
+        level=(("level",), level_pressure_vals)
+    )
+
+    u_anomalies = u_anomalies.assign_coords(
+        level=(("level",), level_pressure_vals)
+    )
+
+    overlay_pressure_hpa = 250.0
+
+    u_overlay_idx = int(
+        np.nanargmin(
+            np.abs(level_pressure_vals - overlay_pressure_hpa)
+        )
+    )
+
+    print("Precomputing full-period reduced products...")
+
+    aam_lat_lon_all = vertical_sum_over_pressure_range(
+        aam_anomalies,
+        p_min_hpa=args.p_min,
+        p_max_hpa=args.p_max,
+        level_dim="level",
+    )
+    
+    lon_spacing_deg = np.abs(aam_anomalies['longitude'].values[1] - aam_anomalies['longitude'].values[0])
+    
+    # 2. Convert that single width to radians (dλ)
+    dlon_rad = np.radians(lon_spacing_deg)
+    
+    aam_height_lat_all = aam_anomalies.sum("longitude", skipna=True) * dlon_rad
+
+    u_height_lat_all = u_anomalies.mean(
+        "longitude",
+        skipna=True,
+    )
+
+    u_lat_lon_all = u_anomalies.isel(
+        level=u_overlay_idx
+    )
+
+    return (
+        aam_lat_lon_all,
+        aam_height_lat_all,
+        u_lat_lon_all,
+        u_height_lat_all,
+    )
 
 def plot_lat_lon_anomalies(start_year, end_year, variable, clim_start_yr=1980, clim_end_yr=2000, 
                            find_extremum='max', p_min=100, p_max=1000):
@@ -159,13 +229,22 @@ def plot_lat_lon_anomalies(start_year, end_year, variable, clim_start_yr=1980, c
     all_files.sort()
     
     # Load time series eagerly so the script can use available RAM instead of dask chunks.
-    datasets = []
-    for f in all_files:
-        ds = xr.open_dataset(f, decode_times=False)
-        if 'time' in ds.dims and 'time' not in ds.coords:
-            ds = ds.set_coords('time')
-        datasets.append(ds)
-    ds_timeseries = xr.concat(datasets, dim='time', coords='minimal', compat='override')
+    ds_timeseries = xr.open_mfdataset(
+    all_files,
+    combine="nested",
+    concat_dim="time",
+    decode_times=False,
+    coords="minimal",
+    compat="override",
+    chunks={
+        "time": -1,         # -1 means: do not split time within an individual file
+        "level": 5,         # Process 5 vertical pressure levels at a time
+        "latitude": -1,     # Keep the full horizontal map intact
+        "longitude": -1    # Keep the full horizontal map intact
+    }
+    )
+    if 'time' in ds_timeseries.dims and 'time' not in ds_timeseries.coords:
+        ds_timeseries = ds_timeseries.set_coords('time')
     try:
         import cftime
         ds_timeseries = xr.decode_cf(ds_timeseries)
@@ -468,7 +547,7 @@ def plot_lat_lon_anomalies(start_year, end_year, variable, clim_start_yr=1980, c
     plt.tight_layout(rect=[0, 0.04, 1, 0.97])  # Leave space for colorbar at bottom and title at top
     
     output_file = f"{output_dir}{variable}_anomalies_lat_lon_{start_year}-{end_year}_{p_min}-{p_max}hPa.png"
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    plt.savefig(output_file, dpi=500, bbox_inches='tight')
     print(f"Figure saved to: {output_file}")
     plt.close()
     
@@ -517,7 +596,7 @@ def parse_composite_args() -> argparse.Namespace:
         description="Build ENSO event composites for lat-lon and height-lat AAM anomaly plots."
     )
     parser.add_argument("--p-min", type=float, default=150.0, help="Minimum pressure level in hPa.")
-    parser.add_argument("--p-max", type=float, default=1000.0, help="Maximum pressure level in hPa.")
+    parser.add_argument("--p-max", type=float, default=700, help="Maximum pressure level in hPa.")
     parser.add_argument("--start-year", type=int, default=1979, help="First onset year to consider.")
     parser.add_argument("--end-year", type=int, default=2019, help="Last onset year to consider.")
     parser.add_argument("--clim-start-year", type=int, default=1981, help="Climatology start year.")
@@ -618,8 +697,19 @@ def _load_era5_full_field_lazy_for_years(
     if not files:
         raise FileNotFoundError(f"No ERA5 AAM files found in fixed directory: {composite_core.AAM_DATA_DIR}")
 
-    datasets = [xr.open_dataset(file_path).load() for file_path in files]
-    ds = xr.concat(datasets, dim="time", coords="minimal", compat="override").sortby("time")
+    ds = xr.open_mfdataset(
+    files,
+    combine="nested",
+    concat_dim="time",
+    coords="minimal",
+    compat="override",
+    chunks={
+        "time": -1,         # -1 means: do not split time within an individual file
+        "level": 5,         # Process 5 vertical pressure levels at a time
+        "latitude": -1,     # Keep the full horizontal map intact
+        "longitude": -1    # Keep the full horizontal map intact
+    }
+    ).sortby("time")
     da = composite_core._first_data_var(ds, ("AAM", "aam", "angular_momentum", "momentum", "AAMA"))
     da = composite_core._standardize_dims(da)
     if "time" not in da.dims:
@@ -654,36 +744,23 @@ def _load_era5_variable_full_field_lazy_for_years(
     if not files:
         raise FileNotFoundError(f"No ERA5 {variable} monthly files found in {sp_path_base}")
 
-    datasets = []
-    for file_path in files:
-        ds_single = xr.open_dataset(file_path).load()
-        match = re.search(r"(\d{4})-(\d{2})\.nc$", os.path.basename(file_path))
-        if match is None:
-            raise ValueError(f"Could not infer time from filename: {file_path}")
-        timestamp = pd.Timestamp(f"{match.group(1)}-{match.group(2)}-01")
-
-        if "time" in ds_single.dims:
-            if ds_single.sizes.get("time", 0) == 1:
-                ds_single = ds_single.assign_coords(time=[timestamp])
-            else:
-                raise ValueError(
-                    f"Expected monthly file with a single time step, got {ds_single.sizes.get('time', 0)} in {file_path}"
-                )
-        else:
-            ds_single = ds_single.expand_dims(time=[timestamp])
-
-        datasets.append(ds_single)
-
-    ds = xr.concat(datasets, dim="time", coords="minimal", compat="override").sortby("time")
-
+    ds = xr.open_mfdataset(
+    files,
+    combine="nested",
+    concat_dim="time",
+    coords="minimal",
+    compat="override",
+    parallel=True,
+    chunks="auto",
+)
     da = composite_core._first_data_var(ds, (variable, "u", "eastward_wind", "u_component_of_wind", "AAM", "aam"))
     da = composite_core._standardize_dims(da)
     if "time" not in da.dims:
         raise ValueError(f"ERA5 {variable} data must include a time dimension.")
 
     da = da.sel(time=slice(f"{start_year}-01-01", f"{end_year}-12-31"))
+    
     return da
-
 
 def _load_era5_full_field_climatology(args: argparse.Namespace) -> xr.DataArray:
     """Compute the ERA5 AAM monthly climatology on the fly from the full field."""
@@ -813,10 +890,10 @@ def _event_significance_mask(
     sig = np.zeros((n_month, *out_shape), dtype=bool)
 
     for m in range(n_month):
-        slab = stack.isel(month=m).transpose("event", *spatial_dims).astype(np.float32)
+        slab = stack.isel(month=m).transpose("event", *spatial_dims).astype(np.float64)
         slab_np = slab.values
         _, p_vals = _stats.ttest_1samp(slab_np, 0.0, axis=0, nan_policy="omit")
-        p_vals = np.asarray(p_vals, dtype=np.float32)
+        p_vals = np.asarray(p_vals, dtype=np.float64)
         sig[m, ...] = p_vals < 0.05
 
     dims = ("time",) + spatial_dims
@@ -880,7 +957,7 @@ def _accumulate_mean(target_sum: Optional[np.ndarray], target_count: int, values
 def _finalize_mean(total: np.ndarray, count: int, template: xr.DataArray) -> xr.DataArray:
     if count <= 0:
         raise RuntimeError("Cannot finalize an empty composite.")
-    mean_values = (total / float(count)).astype(np.float32)
+    mean_values = (total / float(count)).astype(np.float64)
     return xr.DataArray(mean_values, dims=template.dims, coords=template.coords, attrs=template.attrs, name=template.name)
 
 
@@ -900,7 +977,7 @@ def _plotting_utils_file_suffix(filename_suffix: str, dec_onset_month: str, onse
 def _composite_result_path(args: argparse.Namespace, output_dir: str) -> str:
     tag = (
         f"ERA5_event_composite_{args.enso_state}_{args.start_year}-{args.end_year}"
-        f"_{args.p_min:g}-{args.p_max:g}hPa_onset_{args.onset_season}"
+        f"_{args.p_min}-{args.p_max}hPa_onset_{args.onset_season}"
         f"_start_{args.composite_start}_region_{args.region}"
     )
     return os.path.join(output_dir, f"{tag}.nc")
@@ -931,16 +1008,50 @@ def _build_streamed_composites(
     list[str],
 ]:
     level_pressure_hpa = _load_mean_pressure_profile_hpa(args)
-    overlay_pressure_hpa = 250.0
 
     aam_da = _load_era5_full_field_lazy(args)
     aam_clim = _load_era5_full_field_climatology(args)
+
     u_da = _load_era5_variable_full_field_lazy("u", args)
     u_clim = _load_era5_variable_climatology("u", args)
 
-    aam_anomalies = _prepare_monthly_anomalies(aam_da, aam_clim, args, "AAM")
-    u_anomalies = _prepare_monthly_anomalies(u_da, u_clim, args, "u")
+    aam_anomalies = _prepare_monthly_anomalies(
+        aam_da,
+        aam_clim,
+        args,
+        "AAM",
+    )
 
+    u_anomalies = _prepare_monthly_anomalies(
+        u_da,
+        u_clim,
+        args,
+        "u",
+    )
+
+    (
+        aam_lat_lon_all,
+        aam_height_lat_all,
+        u_lat_lon_all,
+        u_height_lat_all,
+    ) = _precompute_reduced_fields(
+        aam_anomalies,
+        u_anomalies,
+        args,
+        level_pressure_hpa,
+    )
+    
+    # 🚀 FIX 1: COMPUTE INTO RAM ONCE
+    # This prevents the script from re-reading and re-calculating the 
+    # 40-year dataset for every single event in the loop below.
+    print("Computing full time-series into RAM (this will take a few minutes)...")
+    aam_lat_lon_all = aam_lat_lon_all.compute()
+    aam_height_lat_all = aam_height_lat_all.compute()
+    u_lat_lon_all = u_lat_lon_all.compute()
+    u_height_lat_all = u_height_lat_all.compute()
+    print("Done computing! Moving to event processing...")
+
+    lat_lon_sum = None
     lat_lon_sum = None
     height_lat_sum = None
     u_lat_lon_sum = None
@@ -967,54 +1078,69 @@ def _build_streamed_composites(
             print(f"Skipping onset {onset_ym}: incomplete u window.")
             continue
 
-        aam_event = composite_core._circular_rolling_mean(aam_event, dim="month", window=args.rolling_period).load()
-        u_event = composite_core._circular_rolling_mean(u_event, dim="month", window=args.rolling_period).load()
+        aam_event = composite_core._circular_rolling_mean(aam_event, dim="month", window=args.rolling_period)
+        u_event = composite_core._circular_rolling_mean(u_event, dim="month", window=args.rolling_period)
 
-        # Align the data to the 136 mid-level pressure values.
-        # The source files still carry 137 level entries, but the hybrid mid-level
-        # pressure profile is defined on 136 levels, so trim the data first.
-        n_mid_levels = int(level_pressure_hpa.sizes.get("level", 0))
-        if int(aam_event.sizes.get("level", 0)) > n_mid_levels:
-            aam_event = aam_event.isel(level=slice(0, n_mid_levels))
-        if int(u_event.sizes.get("level", 0)) > n_mid_levels:
-            u_event = u_event.isel(level=slice(0, n_mid_levels))
+        aam_lat_lon_event = _event_window_from_anomalies(
+            aam_lat_lon_all,
+            onset_str,
+            args,
+        )
 
-        # Extract the pressure values for the trimmed levels.
-        level_pressure_hpa_aam_values = level_pressure_hpa.values[: int(aam_event.sizes.get("level", 0))]
-        level_pressure_hpa_u_values = level_pressure_hpa.values[: int(u_event.sizes.get("level", 0))]
+        aam_height_lat_event = _event_window_from_anomalies(
+            aam_height_lat_all,
+            onset_str,
+            args,
+        )
+
+        u_lat_lon_event = _event_window_from_anomalies(
+            u_lat_lon_all,
+            onset_str,
+            args,
+        )
+
+        u_height_lat_event = _event_window_from_anomalies(
+            u_height_lat_all,
+            onset_str,
+            args,
+        )
+
+        if aam_lat_lon_event is None:
+            continue
+
+        if aam_height_lat_event is None:
+            continue
+
+        if u_lat_lon_event is None:
+            continue
+
+        if u_height_lat_event is None:
+            continue
+
+        aam_lat_lon_event = aam_lat_lon_event.transpose(
+            "month",
+            "latitude",
+            "longitude",
+        )
+
+        aam_height_lat_event = aam_height_lat_event.transpose(
+            "month",
+            "level",
+            "latitude",
+        )
+
+        u_lat_lon_event = u_lat_lon_event.transpose(
+            "month",
+            "latitude",
+            "longitude",
+        )
+
+        u_height_lat_event = u_height_lat_event.transpose(
+            "month",
+            "level",
+            "latitude",
+        )
         
-        # Assign pressure coordinates to the sliced data
-        aam_event = aam_event.assign_coords(
-            level=(("level",), level_pressure_hpa_aam_values)
-        )
-        aam_event["level"].attrs["units"] = "hPa"
-        
-        u_event = u_event.assign_coords(
-            level=(("level",), level_pressure_hpa_u_values)
-        )
-        u_event["level"].attrs["units"] = "hPa"
-
-        # The lat-lon wind overlay should show a single pressure slice, not a vertical integral.
-        # Use the nearest level to 250 hPa so the map overlay is directly interpretable.
-        u_overlay_idx = int(np.nanargmin(np.abs(level_pressure_hpa_u_values - overlay_pressure_hpa)))
-        u_lat_lon_event = u_event.isel(level=u_overlay_idx)
-
-        aam_lat_lon_event = vertical_sum_over_pressure_range(
-            aam_event,
-            p_min_hpa=args.p_min,
-            p_max_hpa=args.p_max,
-            level_dim="level",
-        )
-        # ZONALLY INTEGRATED AAM: integrate over longitude to produce latitude×level
-        aam_height_lat_event = aam_event.sum("longitude", skipna=True)
-
-        u_height_lat_event = u_event.mean("longitude", skipna=True)
-
-        aam_lat_lon_event = aam_lat_lon_event.transpose("month", "latitude", "longitude")
-        aam_height_lat_event = aam_height_lat_event.transpose("month", "level", "latitude")
-        u_lat_lon_event = u_lat_lon_event.transpose("month", "latitude", "longitude")
-        u_height_lat_event = u_height_lat_event.transpose("month", "level", "latitude")
-
         if lat_lon_sum is None:
             lat_lon_sum = np.zeros_like(np.asarray(aam_lat_lon_event.values, dtype=np.float64))
             height_lat_sum = np.zeros_like(np.asarray(aam_height_lat_event.values, dtype=np.float64))
@@ -1077,31 +1203,50 @@ def _build_streamed_composites(
             xr.DataArray(
                 lat_lon_sample_array,
                 dims=("month", "event", "latitude", "longitude"),
-                coords={"month": np.arange(1, len(lat_lon_samples) + 1)},
+                coords={
+                    "month": np.arange(1, len(lat_lon_samples) + 1),
+                    "latitude": lat_lon_composite.latitude,
+                    "longitude": lat_lon_composite.longitude,
+                },
             ),
             ("latitude", "longitude"),
         ).transpose("time", "latitude", "longitude")
+        
         height_lat_sig = _event_significance_mask(
             xr.DataArray(
                 height_lat_sample_array,
                 dims=("month", "event", "level", "latitude"),
-                coords={"month": np.arange(1, len(height_lat_samples) + 1)},
+                coords={
+                    "month": np.arange(1, len(height_lat_samples) + 1),
+                    "level": height_lat_composite.level,
+                    "latitude": height_lat_composite.latitude,
+                },
             ),
             ("level", "latitude"),
         ).transpose("time", "level", "latitude")
+        
         u_lat_lon_sig = _event_significance_mask(
             xr.DataArray(
                 u_lat_lon_sample_array,
                 dims=("month", "event", "latitude", "longitude"),
-                coords={"month": np.arange(1, len(u_lat_lon_samples) + 1)},
+                coords={
+                    "month": np.arange(1, len(u_lat_lon_samples) + 1),
+                    "latitude": u_lat_lon_composite.latitude,
+                    "longitude": u_lat_lon_composite.longitude,
+                },
             ),
             ("latitude", "longitude"),
         ).transpose("time", "latitude", "longitude")
+        
         u_height_lat_sig = _event_significance_mask(
             xr.DataArray(
                 u_height_lat_sample_array,
                 dims=("month", "event", "level", "latitude"),
-                coords={"month": np.arange(1, len(u_height_lat_samples) + 1)},
+                coords={
+                    "month": np.arange(1, len(u_height_lat_samples) + 1),
+                    "level": u_height_lat_composite.level,
+                    "latitude": u_height_lat_composite.latitude,
+                },
             ),
             ("level", "latitude"),
         ).transpose("time", "level", "latitude")
@@ -1132,7 +1277,7 @@ def save_composite_results(
     os.makedirs(output_dir, exist_ok=True)
     tag = (
         f"ERA5_event_composite_{args.enso_state}_{args.start_year}-{args.end_year}"
-        f"_{args.p_min:g}-{args.p_max:g}hPa_onset_{args.onset_season}"
+        f"_{args.p_min}-{args.p_max}hPa_onset_{args.onset_season}"
         f"_start_{args.composite_start}_region_{args.region}"
     )
     result_path = os.path.join(output_dir, f"{tag}.nc")
@@ -1186,11 +1331,14 @@ def _plot_composite_outputs(
     composite_output_dir: str,
     lat_lon_plot: str,
     height_lat_plot: str,
+    active_pct: np.ndarray,
 ) -> None:
+    
     try:
         _plot_lat_time_composite(
             lat_lon_composite,
             lat_lon_mask,
+            active_pct,
             args,
             lat_time_plot,
             event_count,
@@ -1281,6 +1429,7 @@ def _plot_composite_outputs(
 def _plot_lat_time_composite(
     lat_lon_composite: xr.DataArray,
     lat_lon_mask: Optional[xr.DataArray],
+    active_pct: np.ndarray,
     args: argparse.Namespace,
     output_path: str,
     event_count: int,
@@ -1288,17 +1437,38 @@ def _plot_lat_time_composite(
     if "longitude" not in lat_lon_composite.dims:
         raise ValueError("lat_lon_composite must contain a longitude dimension for lat-time plotting")
 
-    comp = lat_lon_composite.mean("longitude", skipna=True).transpose("latitude", "time")
+    # 1. Convert longitude to radians and integrate (calculates total momentum around the earth)
+    lon_rad = np.deg2rad(lat_lon_composite['longitude'].astype(float))
+    comp = lat_lon_composite.assign_coords(longitude=lon_rad).sortby('longitude')
+    comp = comp.integrate('longitude')
+
+    # 2. Get the latitude band width in radians
+    dphi_deg = _infer_latitude_band_width_deg(comp)
+    dphi_rad = np.radians(dphi_deg)
+
+    # 3. Multiply to get the absolute total AAM mass per latitude band
+    comp = comp * dphi_rad
+
+    # 4. Transpose for the plot
+    comp = comp.transpose("latitude", "time")
+    
     vals = comp.values
     lat_vals = comp["latitude"].values
     time_vals = comp["time"].values
+    
+    dphi_deg = _infer_latitude_band_width_deg(comp)
 
     vmax = float(np.nanpercentile(np.abs(vals), 99))
+    vmin = -vmax
     vmax = vmax if np.isfinite(vmax) and vmax > 0 else 1.0
     levels = np.linspace(-vmax, vmax, 13)
 
+    _abs = max(abs(vmin), abs(vmax))
+    order = int(np.floor(np.log10(_abs))) if _abs > 0 else 0
+    factor = 10 ** order
+    
     fig, ax = plt.subplots(figsize=(10, 6))
-    fig.subplots_adjust(bottom=0.22)
+    fig.subplots_adjust(bottom=0.30)
     cf = ax.contourf(time_vals, lat_vals, vals, levels=levels, cmap="RdBu_r", extend="both")
 
     sig_mask = None
@@ -1323,13 +1493,27 @@ def _plot_lat_time_composite(
 
     cax = fig.add_axes([0.125, 0.08, 0.775, 0.02])
     cbar = fig.colorbar(cf, cax=cax, orientation="horizontal", extend="both")
-    cbar.set_label("AAM anomaly (zonal mean)", size=12)
-    cbar.ax.tick_params(labelsize=10)
+    try:
+        cbar.formatter.set_useOffset(False)
+        #cbar.formatter.set_scientific(False)
+        cbar.update_ticks()
+    except Exception:
+        pass
+    cbar.ax.xaxis.get_offset_text().set_visible(False)
+    _sup = str.maketrans("0123456789-", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207b")
+    _order_sup = str(order).translate(_sup)
+    if np.isfinite(dphi_deg):
+        cbar.set_label(f"AAM anomaly (×10{_order_sup} kg m² s⁻¹ per {dphi_deg:g}° latitude band)", size=14)
+    else:
+        cbar.set_label(f"AAM anomaly (×10{_order_sup} kg m² s⁻¹ per 0.25° latitude band)", size=14)
+    cbar.ax.tick_params(labelsize=11)
 
     ax.axhline(0, color="black", linewidth=1.0, alpha=0.8)
     for lat in (-40, -20, 20, 40):
         ax.axhline(lat, color="gray", linestyle="--", linewidth=0.8, alpha=0.4, zorder=2)
 
+    add_active_month_percent_labels(ax, time_vals, active_pct)
+    
     ax.set_xlim(1, args.composite_months)
     ax.set_ylim(-60, 60)
     ax.xaxis.set_major_locator(mticker.MultipleLocator(1))
@@ -1341,13 +1525,24 @@ def _plot_lat_time_composite(
         f"({args.p_min:g}-{args.p_max:g} hPa) {event_count} events {args.start_year}-{args.end_year}"
     )
 
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    fig.savefig(output_path, format="svg", bbox_inches="tight")
     plt.close(fig)
     return output_path
 
 
 def run_event_composite_all_plot() -> None:
     args = parse_composite_args()
+    
+    active_pct = None
+    
+    nino34 = composite_core.load_nino34(args)
+    date_list = composite_core.detect_enso_state_windows(args, nino34)
+    
+    # 🚀 FIX 3: EXPLICITLY TELL DASK TO USE YOUR 8 SLURM CORES
+    cluster = LocalCluster(n_workers=8, threads_per_worker=1, memory_limit='100GB')
+    client = Client(cluster)
+    print(f"Dask dashboard available at: {client.dashboard_link}")
+    
     if args.min_enso_months < 1:
         raise ValueError("--min-enso-months must be >= 1")
     if args.composite_months < 1:
@@ -1372,13 +1567,34 @@ def run_event_composite_all_plot() -> None:
     )
     lat_time_plot = os.path.join(
         composite_output_dir,
-        f"AAM_anomalies_lat_time_ERA5_EVENT_MEAN_{args.start_year}-{args.end_year}_{args.p_min:.1f}-{args.p_max:.1f}hPa_{args.region}{rolling_tag}_{nino_thres_tag}{file_suffix}.png",
+        f"AAM_anomalies_lat_time_ERA5_EVENT_MEAN_{args.start_year}-{args.end_year}_{args.p_min:.1f}-{args.p_max:.1f}hPa_{args.region}{rolling_tag}_{nino_thres_tag}{file_suffix}.svg",
     )
     height_lat_plot = os.path.join(
         composite_output_dir,
         f"AAM_anomalies_lat_level_snapshots_ERA5_EVENT_MEAN_{args.start_year}-{args.end_year}_{args.region}{rolling_tag}_{nino_thres_tag}{file_suffix}.png",
     )
-
+    
+    (
+        lat_lon_composite,
+        lat_lon_mask,
+        height_lat_composite,
+        height_lat_mask,
+        u_lat_lon_composite,
+        u_height_lat_composite,
+        event_labels,
+    ) = _build_streamed_composites(
+        date_list,
+        args,
+    )
+    
+    active_pct = compute_active_month_percent(
+        nino34,
+        event_labels,
+        composite_months=args.composite_months,
+        composite_start=args.composite_start,
+        enso_state=args.enso_state,
+    )
+    
     if args.replot:
         if os.path.exists(result_path):
             print(f"Replot requested. Loading composite NetCDF from {result_path} and regenerating plots.")
@@ -1397,6 +1613,7 @@ def run_event_composite_all_plot() -> None:
                     composite_output_dir,
                     lat_lon_plot,
                     height_lat_plot,
+                    active_pct
                 )
             print(f"Replotted composite results from {result_path}")
             return
@@ -1420,33 +1637,40 @@ def run_event_composite_all_plot() -> None:
                 composite_output_dir,
                 lat_lon_plot,
                 height_lat_plot,
+                active_pct
             )
         print(f"Saved composite results to {result_path}")
         return
     elif os.path.exists(result_path):
         print(f"Existing composite NetCDF at {result_path} is stale; recomputing with pressure coordinates.")
 
-    nino34 = composite_core.load_nino34(args)
-    date_list = composite_core.detect_enso_state_windows(args, nino34)
+
     if not date_list:
         raise RuntimeError("No ENSO events matched the requested criteria.")
     print(f"Detected {len(date_list)} ENSO event onset(s): {[onset[:7] for onset, _ in date_list]}")
+    
 
-    (
-        lat_lon_composite,
-        lat_lon_mask,
-        height_lat_composite,
-        height_lat_mask,
-        u_lat_lon_composite,
-        u_height_lat_composite,
-        event_labels,
-    ) = _build_streamed_composites(
-        date_list,
-        args,
-    )
+    
+    active_pct = compute_active_month_percent(
+    nino34,
+    event_labels,
+    composite_months=args.composite_months,
+    composite_start=args.composite_start,
+    enso_state=args.enso_state,
+)
+    
     event_count = len(event_labels)
     print(f"Built streamed composites with {event_count} complete event(s): {event_labels}")
     gc.collect()
+    
+        # ---> ADD THIS CALCULATION <---
+    active_pct = compute_active_month_percent(
+        nino34,
+        event_labels,
+        composite_months=args.composite_months,
+        composite_start=args.composite_start,
+        enso_state=args.enso_state,
+    )
 
     result_path, stack_path = save_composite_results(
         event_count,
@@ -1474,6 +1698,7 @@ def run_event_composite_all_plot() -> None:
         composite_output_dir,
         lat_lon_plot,
         height_lat_plot,
+        active_pct
     )
 
     print(f"Saved composite results to {result_path}")

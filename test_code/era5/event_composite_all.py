@@ -680,7 +680,7 @@ def main() -> None:
     lat_dim = "latitude" if "latitude" in event_stack.dims else ("lat" if "lat" in event_stack.dims else None)
     if lat_dim is None:
         raise ValueError(f"No latitude dimension found in event stack with dims {event_stack.dims}")
-    aam_for_ttest = event_stack.transpose("event", lat_dim, "month").values
+    aam_for_ttest = event_stack.transpose("event", lat_dim, "month").values.astype(np.float64)
     _, p_vals = _stats.ttest_1samp(aam_for_ttest, 0.0, axis=0, nan_policy="omit")
     significant = xr.DataArray(
         p_vals < 0.05,

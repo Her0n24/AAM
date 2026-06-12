@@ -15,5 +15,5 @@ module load jaspy
 # Activate virtual environment if you have one
 
 ~/miniforge3/envs/snapsi/bin/python -u event_composite_lat_time.py \
-    --onset-season all --composite-start december_onset_year --p-max 700.0 --region atlantic 2>&1 | \
+    --onset-season all --composite-start december_onset_year --p-min 150.0 --p-max 700 --region all 2>&1 | \
     grep --line-buffered -v -E "H5[A-Z]|major:|minor:|Object not found|Error detected|failed|unable to|can't locate|can't open|#0[0-9]"

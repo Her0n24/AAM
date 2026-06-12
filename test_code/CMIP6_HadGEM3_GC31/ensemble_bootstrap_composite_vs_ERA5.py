@@ -101,22 +101,98 @@ def _safe_label_float(value):
     return f"{float(value):g}"
 
 
+def ml_to_pl_era5 (era5_regridded, m_da) -> xr.DataArray:
+    
+    # Ensure matching dimensions
+    m_da = m_da.copy()
+
+    # Match dimension names if target uses 'lat' instead of 'latitude'
+    if "lat" in m_da.dims and "latitude" not in m_da.dims:
+        m_da = m_da.rename({"lat": "latitude"})
+
+    # Convert target levels from Pascals (Pa) to hPa if they are in the 100,000 range
+    if m_da["level"].max() > 2000:
+        print("  [INFO] Target levels appear to be in Pascals (Pa). Converting to hPa...")
+        m_da = m_da.assign_coords(level=m_da["level"] / 100.0)
+
+    # CRITICAL: groupby_bins requires bins/coordinates to be strictly ascending (increasing)
+    m_da = m_da.sortby("level", ascending=True)
+    
+    
+    # Extract the raw level values from the netCDF
+    incoming_levels = era5_regridded['level'].values
+    
+    # Detect if the levels dimension is corrupted, if it is more than 137 levels
+    incoming_levels = era5_regridded['level'].values
+    
+    if len(incoming_levels) > 137:
+        print(f"  [INFO] Mangled ERA5 axis detected ({len(incoming_levels)} levels). Cleaning integer artifacts...")
+        valid_pressure_levels = [
+            lv for lv in incoming_levels 
+            if not (float(lv).is_integer() and 0 <= lv <= 137)
+        ]
+        era5_regridded = era5_regridded.sel(level=valid_pressure_levels)
+        print(f"  [INFO] Axis cleaned. Reduced to {len(era5_regridded['level'])} physical pressure levels.")
+    elif float(era5_regridded['level'].max()) <= 137:
+        print("  [INFO] Standard ERA5 model levels (1-137) detected. Applying CSV mapping...")
+        level_map_df = pd.read_csv("/home/users/hhhn2/AAM/test_code/era5/l137_a_b.csv")
+        level_to_hpa = dict(zip(level_map_df['n'], level_map_df['ph [hPa]']))
+        nominal_pressures = [level_to_hpa[int(lev)] for lev in era5_regridded['level'].values]
+        era5_regridded = era5_regridded.assign_coords(level=("level", nominal_pressures))
+
+    # Ensure ERA5 levels are also strictly ascending before binning
+    era5_regridded = era5_regridded.sortby("level", ascending=True)
+    
+    # -------------------------------------------------------------------------
+    # CONSERVATIVE BINNING: Group into HadGEM3 levels
+    # -------------------------------------------------------------------------
+    target_levels = m_da["level"].values
+
+    # Calculate edges for the HadGEM3 bins
+    midpoints = (target_levels[1:] + target_levels[:-1]) / 2.0
+    top_edge = target_levels[0] - (target_levels[1] - target_levels[0]) / 2.0
+    bottom_edge = target_levels[-1] + (target_levels[-1] - target_levels[-2]) / 2.0
+    bin_edges = np.concatenate(([top_edge], midpoints, [bottom_edge]))
+    bin_edges = np.sort(bin_edges) 
+
+    # Sum the mass-weighted ERA5 layers into the coarse HadGEM3 bins
+    era5_coarsened = era5_regridded.groupby_bins(
+        "level", 
+        bins=bin_edges, 
+        labels=np.sort(target_levels),  
+        right=False
+    ).sum(dim="level")
+
+    # Clean up dimensions to match HadGEM3 expectations
+    era5_coarsened = era5_coarsened.rename({"level_bins": "level"})
+    era5_coarsened["level"] = era5_coarsened["level"].astype(m_da["level"].dtype)
+    
+    return era5_coarsened
+    
 def _era5_composite_path_candidates(comp_type: str) -> list[Path]:
     """Return ERA5 composite candidates, preferring an exact run-argument match."""
-    if comp_type != "aam":
+    if comp_type not in ["aam", "latlon", "latlev"]:
         return []
 
     era5_dir = Path(ref_ERA5_composite_dir)
+    # Handle the filename convention split
+    if comp_type == "aam":
+        prefix = "ERA5_Composite_AAM"
+    else:
+        # Both latlon and latlev are stored in the event_composite file
+        prefix = "ERA5_event_composite"
+
     exact_path = era5_dir / (
-        f"ERA5_Composite_AAM_{args.enso_state}_{args.start_year}-{args.end_year}_"
+        f"{prefix}_{args.enso_state}_{args.start_year}-{args.end_year}_"
         f"{args.p_min:g}-{args.p_max:g}hPa_onset_{args.onset_season}"
         f"_start_{args.composite_start}_region_{args.region}.nc"
     )
 
     pattern = (
-        f"ERA5_Composite_AAM_{args.enso_state}_*hPa_onset_{args.onset_season}"
+        f"{prefix}_{args.enso_state}_*hPa_onset_{args.onset_season}"
         f"_start_{args.composite_start}_region_{args.region}.nc"
     )
+    
     candidates = [exact_path]
     if era5_dir.exists():
         candidates.extend(sorted(era5_dir.glob(pattern)))
@@ -168,21 +244,32 @@ def _load_era5_composite_truth(comp_type: str) -> Optional[xr.DataArray]:
 
     try:
         ds = xr.open_dataset(era5_path)
-        for var_name in ("composite_mean", "ens_mean", "AAMA", "aam_mean"):
+        
+        # Route to the exact variable name based on your ERA5 ncdump
+        target_vars = []
+        if comp_type == "latlon":
+            target_vars = ["lat_lon_composite"]
+        elif comp_type == "latlev":
+            target_vars = ["height_lat_composite"]
+        else: # aam
+            target_vars = ["composite_mean", "ens_mean", "AAMA", "aam_mean"]
+
+        for var_name in target_vars:
             if var_name in ds:
                 truth = ds[var_name].copy()
                 ds.close()
                 truth.attrs["source_path"] = str(era5_path)
                 return truth
+        # Fallback
         if len(ds.data_vars) == 1:
             var_name = next(iter(ds.data_vars))
             truth = ds[var_name].copy()
             ds.close()
             truth.attrs["source_path"] = str(era5_path)
-            return truth
+            return truth    
         available = list(ds.data_vars)
         ds.close()
-        print(f"Could not identify ERA5 truth variable in {era5_path}; variables={available}")
+        print(f"Could not identify ERA5 truth variable for {comp_type} in {era5_path}; variables={available}")
         return None
     except Exception as e:
         print(f"Error loading ERA5 truth from {era5_path}: {e}")
@@ -263,6 +350,10 @@ def _standardize_taylor_dims(da: xr.DataArray) -> xr.DataArray:
         rename_map["lon"] = "longitude"
     if "time" in da.dims and "month" not in da.dims:
         rename_map["time"] = "month"
+    # Ensure vertical pressure dimensions match
+    if "plev" in da.dims and "level" not in da.dims:
+        rename_map["plev"] = "level"
+        
     if rename_map:
         da = da.rename(rename_map)
     return da
@@ -559,6 +650,7 @@ def _plot_taylor_diagram_from_csv(
         min_corr=min_corr,
         min_std=min_std,
         max_std=max_std,
+        label_column="member"
     )
 
 def bootstrap_pooled_events(event_stack, dim='event', n_iterations=2000, confidence_level=0.95):
@@ -884,7 +976,7 @@ def compute_and_save_composite_significance(
     results_dir: str,
     active_month_percent: Optional[np.ndarray] = None,
     args: Optional[object] = None,
-) -> Tuple[np.ndarray, str]:
+) -> Tuple[np.ndarray, str, xr.DataArray]:
     """Compute bootstrap significance for a composite and save results.
     
     Parameters
@@ -953,7 +1045,13 @@ def compute_and_save_composite_significance(
             strength_label=strength_label,
             boot_ds=loaded_results.get("bootstrap_samples"),
         )
-        return significance_mask, "loaded_from_saved_results"
+        # ADD THIS: Extract the bootstrap mean from loaded results
+        bootstrap_mean = None
+        if loaded_results.get("bootstrap_samples") is not None:
+            bootstrap_mean = loaded_results["bootstrap_samples"].mean("iteration", skipna=True)
+            
+        return significance_mask, "loaded_from_saved_results", bootstrap_mean
+
     
     else:
         # 1. Run the Pooled Event Bootstrap
@@ -978,6 +1076,9 @@ def compute_and_save_composite_significance(
             strength_label=strength_label,
             boot_ds=boot_ds,
         )
+        
+        # Calculate the mean of the bootstrap iterations
+        bootstrap_mean = boot_ds.mean("iteration", skipna=True)
 
         # Save results to NetCDF (including the mask and bounds)
         filepath = save_composite_results(
@@ -995,7 +1096,7 @@ def compute_and_save_composite_significance(
         )
     
     # RETURN ONLY TWO THINGS: the bootstrap significance mask and the path.
-    return sig_mask.values, filepath
+    return sig_mask.values, filepath, bootstrap_mean
     
 
 def detect_enso_state_windows(
@@ -1206,6 +1307,8 @@ def _plot_and_save_ensemble_mean_aam_composite(
     import os
 
     ens_mean = ens_stack.mean("ensemble", skipna=True)
+    
+    #ens_mean = _to_per_latitude_band(ens_mean)
 
     print(
         f"Plotting ENSEMBLE MEAN {strength_label} composite from "
@@ -1236,7 +1339,7 @@ def _plot_and_save_ensemble_mean_aam_composite(
         )
         
         # Save strength-binned composite significance
-        sig_mask_saved, save_path = compute_and_save_composite_significance(
+        sig_mask_saved, save_path, _ = compute_and_save_composite_significance(
             ens_stack=ens_stack,
             composite_type='aam',
             strength_label=strength_label,
@@ -1491,7 +1594,11 @@ def _process_single_ensemble_member(
         'onset_members': [],
         'peak_amplitudes': [],
         'member_bootstrap_composite': None,
+        'member_bootstrap_lat_lev_composite': None,
+        'member_bootstrap_lat_lon_composite': None,
         'composites_by_strength': {label: None for label, _, _ in EVENT_STRENGTH_BINS},
+        'lat_lev_composites_by_strength': {label: None for label, _, _ in EVENT_STRENGTH_BINS},
+        'lat_lon_composites_by_strength': {label: None for label, _, _ in EVENT_STRENGTH_BINS},
         'enso_active_profile': np.zeros(int(args.composite_months), dtype=int),
         'enso_active_member_count': 0,
     }
@@ -1518,6 +1625,12 @@ def _process_single_ensemble_member(
         
         # Apply region selection BEFORE zonal integration so ensemble mean is also region-specific
         AAM_da = _select_region(AAM_da, args.region)
+        
+        print(AAM_da)
+        print(AAM_da.dims)
+        print(AAM_da.attrs)
+        
+        #import pdb; pdb.set_trace()
         
         if "longitude" in AAM_da.dims or "lon" in AAM_da.dims:
             AAM_da, _ = _to_per_latitude_band(AAM_da)
@@ -1745,6 +1858,52 @@ def _process_single_ensemble_member(
             if strength_comp is not None:
                 results['composites_by_strength'][strength_label] = strength_comp.expand_dims({"ensemble": [ensemble_member]})
         
+        def _extract_and_average_spatial_windows(anom_data, dates):
+            stacked = []
+            seen = set()
+            for onset_str, _ in dates:
+                if not isinstance(onset_str, str):
+                    onset_str = _time_value_to_ymd_string(onset_str)
+                ym = onset_str[:7]
+                if ym in seen: continue
+                seen.add(ym)
+                
+                w_start, w_end = _compute_composite_window_from_onset(
+                    onset_str,
+                    composite_months=int(args.composite_months),
+                    composite_start=str(args.composite_start),
+                )
+                
+                evt = anom_data.sel(time=slice(w_start, w_end))
+                if int(evt.sizes["time"]) < int(args.composite_months): continue
+                
+                evt = evt.isel(time=slice(0, int(args.composite_months)))
+                evt = evt.assign_coords(time=np.arange(1, int(args.composite_months) + 1, dtype=int))
+                if "month" in evt.coords: evt = evt.drop_vars("month")
+                evt = evt.rename({"time": "month"})
+                stacked.append(evt)
+            
+            if not stacked: return None
+            
+            stack = xr.concat(stacked, dim="event")
+            rp = int(args.rolling_period)
+            if rp > 1:
+                n_month = int(stack.sizes["month"])
+                if rp <= n_month:
+                    left = rp // 2
+                    right = rp - left - 1
+                    _rolled = [stack.roll(month=-offset, roll_coords=False) for offset in range(-left, right + 1)]
+                    stack = xr.concat(_rolled, dim="_roll").mean("_roll", skipna=True)
+            
+            comp = stack.mean("event", skipna=True)
+            comp = comp.rename({"month": "time"})
+            
+            # Normalize dims
+            if 'latitude' in comp.dims and 'lat' not in comp.dims: comp = comp.rename({'latitude': 'lat'})
+            if 'longitude' in comp.dims and 'lon' not in comp.dims: comp = comp.rename({'longitude': 'lon'})
+            
+            return comp.expand_dims({"ensemble": [ensemble_member]})
+        
         # Step 5: Latitude×level composite
         aam_full = AAM_da["AAM"] if isinstance(AAM_da, xr.Dataset) and "AAM" in AAM_da else AAM_da
         aam_full = _select_region(aam_full, args.region)
@@ -1759,62 +1918,28 @@ def _process_single_ensemble_member(
             clim_full = clim_full.rename({'longitude': 'lon'})
         
         aam_full_reindexed, clim_on_time_full = _reindex_to_climatology_dims(aam_full, clim_full)
-        anom_full = aam_full_reindexed - clim_on_time_full
+        anom_full_latlev = aam_full_reindexed - clim_on_time_full
         
-        stacked_full = []
-        seen_ev = set()
-        for onset_str, _ in date_list:
-            if not isinstance(onset_str, str):
-                onset_str = _time_value_to_ymd_string(onset_str)
-            ym = onset_str[:7]
-            if ym in seen_ev:
-                continue
-            seen_ev.add(ym)
-            window_start, window_end = _compute_composite_window_from_onset(
-                onset_str,
-                composite_months=int(args.composite_months),
-                composite_start=str(args.composite_start),
-            )
-            evt = anom_full.sel(time=slice(window_start, window_end))
-            if int(evt.sizes["time"]) < int(args.composite_months):
-                continue
-            evt = evt.isel(time=slice(0, int(args.composite_months)))
-            evt = evt.assign_coords(time=np.arange(1, int(args.composite_months) + 1, dtype=int))
-            if "month" in evt.coords:
-                evt = evt.drop_vars("month")
-            evt = evt.rename({"time": "month"})
-            stacked_full.append(evt)
+        # Generate 'all' events composite
+        results['lat_lev_composite'] = _extract_and_average_spatial_windows(anom_full_latlev, date_list)
         
-        if stacked_full:
-            full_stack = xr.concat(stacked_full, dim="event")
-            rp = int(args.rolling_period)
-            if rp > 1:
-                n_month = int(full_stack.sizes["month"])
-                if rp <= n_month:
-                    left = rp // 2
-                    right = rp - left - 1
-                    _rolled = [full_stack.roll(month=-offset, roll_coords=False) for offset in range(-left, right + 1)]
-                    full_stack = xr.concat(_rolled, dim="_roll").mean("_roll", skipna=True)
-            
-            composite_full = full_stack.mean("event", skipna=True)
-            composite_full = composite_full.rename({"month": "time"})
-            
-            # Normalize dimension names before storing in results
-            if 'latitude' in composite_full.dims and 'lat' not in composite_full.dims:
-                composite_full = composite_full.rename({'latitude': 'lat'})
-            
-            results['lat_lev_composite'] = composite_full.expand_dims({"ensemble": [ensemble_member]})
+        # Generate strength-binned composites
+        for label, dates in strength_date_lists.items():
+            if dates:
+                results['lat_lev_composites_by_strength'][label] = _extract_and_average_spatial_windows(anom_full_latlev, dates)
+        
+        # Explicit memory flush
+        del aam_full, clim_full, aam_full_reindexed, clim_on_time_full, anom_full_latlev
+        gc.collect()
         
         # Step 6: LAT×LON composite - RELOAD fresh data (AAM_da has been modified by earlier operations)
-        # We need the full unmodified data with longitude dimension for lat×lon composite
+
         try:
             aam_full_latlon_dataset = xr.open_dataset(f"{AAM_data_path_base}AAM_CMIP6_HadGEM3_GC31_{ensemble_member}_1850-01_2014-12.nc")
             aam_full_latlon = aam_full_latlon_dataset['AAM']
         except Exception as e:
             print(f"Error loading full AAM data for lat×lon composite for {ensemble_member}: {e}")
-            # Explicit cleanup even on error
-            if hasattr(aam_dataset, 'close'):
-                aam_dataset.close()
+            if hasattr(aam_dataset, 'close'): aam_dataset.close()
             del aam_dataset
             gc.collect()
             return results
@@ -1824,118 +1949,227 @@ def _process_single_ensemble_member(
             aam_full_latlon = aam_full_latlon.rename({'latitude': 'lat'})
         if 'longitude' in aam_full_latlon.dims and 'lon' not in aam_full_latlon.dims:
             aam_full_latlon = aam_full_latlon.rename({'longitude': 'lon'})
-        
-        # Load climatology for lat×lon composite
+            
         clim_latlon_dataset = xr.open_dataset(f"{climatology_path_base}AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_{clim_start_yr}-{clim_end_yr}.nc")
         clim_full_latlon = clim_latlon_dataset['AAM']
-        # Normalize dimension names immediately after loading
-        if 'latitude' in clim_full_latlon.dims and 'lat' not in clim_full_latlon.dims:
-            clim_full_latlon = clim_full_latlon.rename({'latitude': 'lat'})
-        if 'longitude' in clim_full_latlon.dims and 'lon' not in clim_full_latlon.dims:
-            clim_full_latlon = clim_full_latlon.rename({'longitude': 'lon'})
-        
-        if ensemble_member == "r1i1p1f3":
-            print(f"\n[LAT×LON DEBUG] Processing lat×lon composite for {ensemble_member}")
-            lon_coord = 'lon' if 'lon' in aam_full_latlon.dims else ('longitude' if 'longitude' in aam_full_latlon.dims else None)
-            if lon_coord:
-                print(f"  aam_full_latlon BEFORE region selection: shape={aam_full_latlon.shape}, lon range=[{float(aam_full_latlon[lon_coord].values.min()):.1f}, {float(aam_full_latlon[lon_coord].values.max()):.1f}]")
-            else:
-                print(f"  aam_full_latlon BEFORE region selection: shape={aam_full_latlon.shape}, dimensions={aam_full_latlon.dims}")
+        if 'latitude' in clim_full_latlon.dims and 'lat' not in clim_full_latlon.dims: clim_full_latlon = clim_full_latlon.rename({'latitude': 'lat'})
+        if 'longitude' in clim_full_latlon.dims and 'lon' not in clim_full_latlon.dims: clim_full_latlon = clim_full_latlon.rename({'longitude': 'lon'})
         
         aam_full_latlon = _select_region(aam_full_latlon, args.region)
-        
-        if ensemble_member == "r1i1p1f3":
-            lon_coord = 'lon' if 'lon' in aam_full_latlon.dims else ('longitude' if 'longitude' in aam_full_latlon.dims else None)
-            if lon_coord:
-                print(f"  aam_full_latlon AFTER region selection: shape={aam_full_latlon.shape}, lon range=[{float(aam_full_latlon[lon_coord].values.min()):.1f}, {float(aam_full_latlon[lon_coord].values.max()):.1f}]")
-            else:
-                print(f"  aam_full_latlon AFTER region selection: shape={aam_full_latlon.shape}, dimensions={aam_full_latlon.dims}")
         aam_vs = vertical_sum_over_pressure_range(aam_full_latlon, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
         
-        # CRITICAL: Apply region selection to climatology BEFORE vertical sum to match main data
-        clim_full_data = clim_full_latlon  # already extracted above
-        clim_full_data = _select_region(clim_full_data, args.region)
+        clim_full_data = _select_region(clim_full_latlon, args.region)
         clim_vs = vertical_sum_over_pressure_range(clim_full_data, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
         
-        # Explicitly close datasets to free memory
+        # Explicit file close to free RAM overhead
         aam_full_latlon_dataset.close()
         clim_latlon_dataset.close()
         del aam_full_latlon_dataset, clim_latlon_dataset
         
-        # Normalize dimensions to match main data
-        if 'latitude' in aam_vs.dims and 'lat' not in aam_vs.dims:
-            aam_vs = aam_vs.rename({'latitude': 'lat'})
-        if 'longitude' in aam_vs.dims and 'lon' not in aam_vs.dims:
-            aam_vs = aam_vs.rename({'longitude': 'lon'})
-        if 'latitude' in clim_vs.dims and 'lat' not in clim_vs.dims:
-            clim_vs = clim_vs.rename({'latitude': 'lat'})
-        if 'longitude' in clim_vs.dims and 'lon' not in clim_vs.dims:
-            clim_vs = clim_vs.rename({'longitude': 'lon'})
+        if 'latitude' in aam_vs.dims and 'lat' not in aam_vs.dims: aam_vs = aam_vs.rename({'latitude': 'lat'})
+        if 'longitude' in aam_vs.dims and 'lon' not in aam_vs.dims: aam_vs = aam_vs.rename({'longitude': 'lon'})
+        if 'latitude' in clim_vs.dims and 'lat' not in clim_vs.dims: clim_vs = clim_vs.rename({'latitude': 'lat'})
+        if 'longitude' in clim_vs.dims and 'lon' not in clim_vs.dims: clim_vs = clim_vs.rename({'longitude': 'lon'})
         
         aam_full_latlon_r, clim_on_time = _reindex_to_climatology_dims(aam_vs, clim_vs)
         anom_full_latlon = aam_full_latlon_r - clim_on_time
         
-        stacked_full = []
-        seen_ev = set()
-        for onset_str, _ in date_list:
-            if not isinstance(onset_str, str):
-                onset_str = _time_value_to_ymd_string(onset_str)
-            ym = onset_str[:7]
-            if ym in seen_ev:
-                continue
-            seen_ev.add(ym)
-            window_start, window_end = _compute_composite_window_from_onset(
-                onset_str,
-                composite_months=int(args.composite_months),
-                composite_start=str(args.composite_start),
-            )
-            evt = anom_full_latlon.sel(time=slice(window_start, window_end))
-            if int(evt.sizes["time"]) < int(args.composite_months):
-                continue
-            evt = evt.isel(time=slice(0, int(args.composite_months)))
-            evt = evt.assign_coords(time=np.arange(1, int(args.composite_months) + 1, dtype=int))
-            if "month" in evt.coords:
-                evt = evt.drop_vars("month")
-            evt = evt.rename({"time": "month"})
-            stacked_full.append(evt)
+        # Generate 'all' events composite
+        results['lat_lon_composite'] = _extract_and_average_spatial_windows(anom_full_latlon, date_list)
         
-        if stacked_full:
-            full_stack = xr.concat(stacked_full, dim="event")
-            rp = int(args.rolling_period)
-            if rp > 1:
-                n_month = int(full_stack.sizes["month"])
-                if rp <= n_month:
-                    left = rp // 2
-                    right = rp - left - 1
-                    _rolled = [full_stack.roll(month=-offset, roll_coords=False) for offset in range(-left, right + 1)]
-                    full_stack = xr.concat(_rolled, dim="_roll").mean("_roll", skipna=True)
-            
-            composite_full = full_stack.mean("event", skipna=True)
-            composite_full = composite_full.rename({"month": "time"})
-            
-            # Normalize dimension names before storing in results
-            if 'latitude' in composite_full.dims and 'lat' not in composite_full.dims:
-                composite_full = composite_full.rename({'latitude': 'lat'})
-            if 'longitude' in composite_full.dims and 'lon' not in composite_full.dims:
-                composite_full = composite_full.rename({'longitude': 'lon'})
-            
-            results['lat_lon_composite'] = composite_full.expand_dims({"ensemble": [ensemble_member]})
-        
+        # Generate strength-binned composites
+        for label, dates in strength_date_lists.items():
+            if dates:
+                results['lat_lon_composites_by_strength'][label] = _extract_and_average_spatial_windows(anom_full_latlon, dates)
+                
         # **Explicit cleanup to free memory before returning results**
-        # Close all opened datasets
+        del aam_full_latlon, clim_full_latlon, aam_vs, clim_vs, aam_full_latlon_r, clim_on_time, anom_full_latlon
         try:
-            if hasattr(aam_dataset, 'close'):
-                aam_dataset.close()
-        except:
-            pass
+            if hasattr(aam_dataset, 'close'): aam_dataset.close()
+        except: pass
         try:
-            if hasattr(clim_da, 'close'):
-                clim_da.close()
-        except:
-            pass
+            if hasattr(clim_da, 'close'): clim_da.close()
+        except: pass
         
-        # Force garbage collection to free intermediate arrays
-        gc.collect()
+        # Final GC run for the member
+        gc.collect()       
+        
+        # stacked_full = []
+        # seen_ev = set()
+        # for onset_str, _ in date_list:
+        #     if not isinstance(onset_str, str):
+        #         onset_str = _time_value_to_ymd_string(onset_str)
+        #     ym = onset_str[:7]
+        #     if ym in seen_ev:
+        #         continue
+        #     seen_ev.add(ym)
+        #     window_start, window_end = _compute_composite_window_from_onset(
+        #         onset_str,
+        #         composite_months=int(args.composite_months),
+        #         composite_start=str(args.composite_start),
+        #     )
+        #     evt = anom_full.sel(time=slice(window_start, window_end))
+        #     if int(evt.sizes["time"]) < int(args.composite_months):
+        #         continue
+        #     evt = evt.isel(time=slice(0, int(args.composite_months)))
+        #     evt = evt.assign_coords(time=np.arange(1, int(args.composite_months) + 1, dtype=int))
+        #     if "month" in evt.coords:
+        #         evt = evt.drop_vars("month")
+        #     evt = evt.rename({"time": "month"})
+        #     stacked_full.append(evt)
+        
+        # if stacked_full:
+        #     full_stack = xr.concat(stacked_full, dim="event")
+        #     rp = int(args.rolling_period)
+        #     if rp > 1:
+        #         n_month = int(full_stack.sizes["month"])
+        #         if rp <= n_month:
+        #             left = rp // 2
+        #             right = rp - left - 1
+        #             _rolled = [full_stack.roll(month=-offset, roll_coords=False) for offset in range(-left, right + 1)]
+        #             full_stack = xr.concat(_rolled, dim="_roll").mean("_roll", skipna=True)
+            
+        #     composite_full = full_stack.mean("event", skipna=True)
+        #     composite_full = composite_full.rename({"month": "time"})
+            
+        #     # Normalize dimension names before storing in results
+        #     if 'latitude' in composite_full.dims and 'lat' not in composite_full.dims:
+        #         composite_full = composite_full.rename({'latitude': 'lat'})
+            
+        #     results['lat_lev_composite'] = composite_full.expand_dims({"ensemble": [ensemble_member]})
+        
+        # # Step 6: LAT×LON composite - RELOAD fresh data (AAM_da has been modified by earlier operations)
+        # # We need the full unmodified data with longitude dimension for lat×lon composite
+        # try:
+        #     aam_full_latlon_dataset = xr.open_dataset(f"{AAM_data_path_base}AAM_CMIP6_HadGEM3_GC31_{ensemble_member}_1850-01_2014-12.nc")
+        #     aam_full_latlon = aam_full_latlon_dataset['AAM']
+        # except Exception as e:
+        #     print(f"Error loading full AAM data for lat×lon composite for {ensemble_member}: {e}")
+        #     # Explicit cleanup even on error
+        #     if hasattr(aam_dataset, 'close'):
+        #         aam_dataset.close()
+        #     del aam_dataset
+        #     gc.collect()
+        #     return results
+        
+        # # Normalize dimension names immediately after loading
+        # if 'latitude' in aam_full_latlon.dims and 'lat' not in aam_full_latlon.dims:
+        #     aam_full_latlon = aam_full_latlon.rename({'latitude': 'lat'})
+        # if 'longitude' in aam_full_latlon.dims and 'lon' not in aam_full_latlon.dims:
+        #     aam_full_latlon = aam_full_latlon.rename({'longitude': 'lon'})
+        
+        # # Load climatology for lat×lon composite
+        # clim_latlon_dataset = xr.open_dataset(f"{climatology_path_base}AAM_Climatology_CMIP6_HadGEM3_GC31_{ensemble_member}_{clim_start_yr}-{clim_end_yr}.nc")
+        # clim_full_latlon = clim_latlon_dataset['AAM']
+        # # Normalize dimension names immediately after loading
+        # if 'latitude' in clim_full_latlon.dims and 'lat' not in clim_full_latlon.dims:
+        #     clim_full_latlon = clim_full_latlon.rename({'latitude': 'lat'})
+        # if 'longitude' in clim_full_latlon.dims and 'lon' not in clim_full_latlon.dims:
+        #     clim_full_latlon = clim_full_latlon.rename({'longitude': 'lon'})
+        
+        # if ensemble_member == "r1i1p1f3":
+        #     print(f"\n[LAT×LON DEBUG] Processing lat×lon composite for {ensemble_member}")
+        #     lon_coord = 'lon' if 'lon' in aam_full_latlon.dims else ('longitude' if 'longitude' in aam_full_latlon.dims else None)
+        #     if lon_coord:
+        #         print(f"  aam_full_latlon BEFORE region selection: shape={aam_full_latlon.shape}, lon range=[{float(aam_full_latlon[lon_coord].values.min()):.1f}, {float(aam_full_latlon[lon_coord].values.max()):.1f}]")
+        #     else:
+        #         print(f"  aam_full_latlon BEFORE region selection: shape={aam_full_latlon.shape}, dimensions={aam_full_latlon.dims}")
+        
+        # aam_full_latlon = _select_region(aam_full_latlon, args.region)
+        
+        # if ensemble_member == "r1i1p1f3":
+        #     lon_coord = 'lon' if 'lon' in aam_full_latlon.dims else ('longitude' if 'longitude' in aam_full_latlon.dims else None)
+        #     if lon_coord:
+        #         print(f"  aam_full_latlon AFTER region selection: shape={aam_full_latlon.shape}, lon range=[{float(aam_full_latlon[lon_coord].values.min()):.1f}, {float(aam_full_latlon[lon_coord].values.max()):.1f}]")
+        #     else:
+        #         print(f"  aam_full_latlon AFTER region selection: shape={aam_full_latlon.shape}, dimensions={aam_full_latlon.dims}")
+        # aam_vs = vertical_sum_over_pressure_range(aam_full_latlon, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
+        
+        # # CRITICAL: Apply region selection to climatology BEFORE vertical sum to match main data
+        # clim_full_data = clim_full_latlon  # already extracted above
+        # clim_full_data = _select_region(clim_full_data, args.region)
+        # clim_vs = vertical_sum_over_pressure_range(clim_full_data, p_min_hpa=args.p_min, p_max_hpa=args.p_max, level_dim="level")
+        
+        # # Explicitly close datasets to free memory
+        # aam_full_latlon_dataset.close()
+        # clim_latlon_dataset.close()
+        # del aam_full_latlon_dataset, clim_latlon_dataset
+        
+        # # Normalize dimensions to match main data
+        # if 'latitude' in aam_vs.dims and 'lat' not in aam_vs.dims:
+        #     aam_vs = aam_vs.rename({'latitude': 'lat'})
+        # if 'longitude' in aam_vs.dims and 'lon' not in aam_vs.dims:
+        #     aam_vs = aam_vs.rename({'longitude': 'lon'})
+        # if 'latitude' in clim_vs.dims and 'lat' not in clim_vs.dims:
+        #     clim_vs = clim_vs.rename({'latitude': 'lat'})
+        # if 'longitude' in clim_vs.dims and 'lon' not in clim_vs.dims:
+        #     clim_vs = clim_vs.rename({'longitude': 'lon'})
+        
+        # aam_full_latlon_r, clim_on_time = _reindex_to_climatology_dims(aam_vs, clim_vs)
+        # anom_full_latlon = aam_full_latlon_r - clim_on_time
+        
+        # stacked_full = []
+        # seen_ev = set()
+        # for onset_str, _ in date_list:
+        #     if not isinstance(onset_str, str):
+        #         onset_str = _time_value_to_ymd_string(onset_str)
+        #     ym = onset_str[:7]
+        #     if ym in seen_ev:
+        #         continue
+        #     seen_ev.add(ym)
+        #     window_start, window_end = _compute_composite_window_from_onset(
+        #         onset_str,
+        #         composite_months=int(args.composite_months),
+        #         composite_start=str(args.composite_start),
+        #     )
+        #     evt = anom_full_latlon.sel(time=slice(window_start, window_end))
+        #     if int(evt.sizes["time"]) < int(args.composite_months):
+        #         continue
+        #     evt = evt.isel(time=slice(0, int(args.composite_months)))
+        #     evt = evt.assign_coords(time=np.arange(1, int(args.composite_months) + 1, dtype=int))
+        #     if "month" in evt.coords:
+        #         evt = evt.drop_vars("month")
+        #     evt = evt.rename({"time": "month"})
+        #     stacked_full.append(evt)
+        
+        # if stacked_full:
+        #     full_stack = xr.concat(stacked_full, dim="event")
+        #     rp = int(args.rolling_period)
+        #     if rp > 1:
+        #         n_month = int(full_stack.sizes["month"])
+        #         if rp <= n_month:
+        #             left = rp // 2
+        #             right = rp - left - 1
+        #             _rolled = [full_stack.roll(month=-offset, roll_coords=False) for offset in range(-left, right + 1)]
+        #             full_stack = xr.concat(_rolled, dim="_roll").mean("_roll", skipna=True)
+            
+        #     composite_full = full_stack.mean("event", skipna=True)
+        #     composite_full = composite_full.rename({"month": "time"})
+            
+        #     # Normalize dimension names before storing in results
+        #     if 'latitude' in composite_full.dims and 'lat' not in composite_full.dims:
+        #         composite_full = composite_full.rename({'latitude': 'lat'})
+        #     if 'longitude' in composite_full.dims and 'lon' not in composite_full.dims:
+        #         composite_full = composite_full.rename({'longitude': 'lon'})
+            
+        #     results['lat_lon_composite'] = composite_full.expand_dims({"ensemble": [ensemble_member]})
+        
+        # # **Explicit cleanup to free memory before returning results**
+        # # Close all opened datasets
+        # try:
+        #     if hasattr(aam_dataset, 'close'):
+        #         aam_dataset.close()
+        # except:
+        #     pass
+        # try:
+        #     if hasattr(clim_da, 'close'):
+        #         clim_da.close()
+        # except:
+        #     pass
+        
+        # # Force garbage collection to free intermediate arrays
+        # gc.collect()
+    
         
     except Exception as e:
         print(f"Error processing ensemble member {ensemble_member}: {e}")
@@ -1951,6 +2185,166 @@ def _process_single_ensemble_member(
     
     return results
 
+def compute_spatial_per_member_taylor(
+    *,
+    member_composites_list: list,
+    era5_reference: xr.DataArray,
+    comp_type: str,
+    output_dir: str,
+    strength_label: str = "all",
+) -> None:
+    """
+    Computes per-member Taylor statistics against ERA5 for 3D spatial fields 
+    (latlon or latlev) and outputs the corresponding Taylor diagram and CSVs.
+    """
+    import os
+    print(f"\n[SPATIAL MEMBER TAYLOR] Generating per-member Taylor stats for {comp_type}...")
+    
+    if not member_composites_list:
+        print(f"[SPATIAL MEMBER TAYLOR] No member composites available for {comp_type}. Skipping.")
+        return
+
+    member_stats = []
+    
+    # 1. Standardize and Regrid ERA5 to HadGEM3 grid ONCE
+    try:
+        print("  [SPATIAL MEMBER TAYLOR] Regridding ERA5 to match HadGEM3 resolution...")
+        template_da = _standardize_taylor_dims(member_composites_list[0].copy())
+        era5_std = _standardize_taylor_dims(era5_reference.copy())
+        
+        # Build interpolation dictionary for shared spatial dimensions
+        interp_coords = {}
+        for dim in era5_std.dims:
+            if dim in template_da.coords:
+                interp_coords[dim] = template_da[dim]
+                
+        # Interpolate ERA5 onto HadGEM3 coordinates
+        try:
+            era5_regridded = era5_std.interp(interp_coords, method="linear")
+        except Exception:
+            era5_regridded = era5_std.reindex(interp_coords, method="nearest")
+        
+        # Apply the exact same latitude trimming used in your AAM Taylor functions
+        if era5_regridded["latitude"].values[0] > era5_regridded["latitude"].values[-1]:
+            era5_regridded = era5_regridded.sel(latitude=slice(60, -60))
+        else:
+            era5_regridded = era5_regridded.sel(latitude=slice(-60, 60))
+            
+        if comp_type == "latlev":
+            try:
+                # template_da contains the 18 HadGEM3 levels
+                era5_regridded = ml_to_pl_era5(era5_regridded, template_da)
+                print("  [SPATIAL MEMBER TAYLOR] Vertically aligned ERA5 L137 to HadGEM3 pressure levels.")
+            except Exception as e:
+                print(f"  [WARNING] Vertical alignment failed for latlev: {e}")
+            
+    except Exception as e:
+        print(f"  [SPATIAL MEMBER TAYLOR] Regridding failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    # 2. Loop through every individual member composite
+    for idx, mem_da in enumerate(member_composites_list):
+        m_da = mem_da.copy()
+        m_da = _standardize_taylor_dims(m_da)
+        
+        # Apply the matching latitude trim to the HadGEM3 member
+        if m_da["latitude"].values[0] > m_da["latitude"].values[-1]:
+            m_da = m_da.sel(latitude=slice(60, -60))
+        else:
+            m_da = m_da.sel(latitude=slice(-60, 60))
+            
+        try:
+            #import pdb; pdb.set_trace()
+            # Align them precisely to guarantee flat arrays match point-for-point
+            m_da, ref_aligned = xr.align(m_da, era5_regridded, join="inner")
+            
+            # Flatten to 1D arrays for Taylor statistics
+            member_vector = m_da.values.flatten()
+            ref_vector = ref_aligned.values.flatten()
+            
+            # Remove any NaN values safely
+            valid_mask = ~np.isnan(member_vector) & ~np.isnan(ref_vector)
+            if not np.any(valid_mask):
+                continue
+            
+            
+            # 1. Reference array stays 1D over space ('points')
+            ref_da_wrapped = xr.DataArray(ref_vector[valid_mask], dims=("points",))
+            # 2. Expand member array to 2D: adding a dummy 'iteration' dimension of size 1
+            m_da_wrapped = xr.DataArray(
+                member_vector[valid_mask][np.newaxis, :], 
+                dims=("iteration", "points"),
+                coords={"iteration": [0]}
+            )
+            
+            # 3. Pass to the function in the correct order: (Reference, Sample)
+            stats_df = compute_taylor_stats_against_reference(
+                ref_da_wrapped, 
+                m_da_wrapped, 
+                sample_dim="iteration"
+            )
+            
+            # 2. Extract the first row as a Series
+            stats = stats_df.iloc[0]
+            
+            # 3. Safely read your function's actual keys ('corr' and 'std')
+            corr_val = float(stats["corr"])
+            std_val = float(stats["std"])
+            
+            # 4. Calculate the missing normalized RMSE geometrically
+            rmse_val = np.sqrt(max(0.0, 1.0 + std_val**2 - 2.0 * std_val * corr_val))
+            
+            member_stats.append({
+                "iteration": idx,
+                "corr": corr_val,
+                "std": std_val,
+                "rmse": rmse_val,
+                "centered_rms": np.nan,
+                "member": str(int(idx+1)),
+            })
+        except Exception as e:
+            print(f"  [SPATIAL MEMBER TAYLOR] Alignment failed for member {idx}: {e}")
+            continue
+
+    if not member_stats:
+        print(f"  [SPATIAL MEMBER TAYLOR] No valid stats calculated for {comp_type}.")
+        return
+
+    df_stats = pd.DataFrame(member_stats)
+    
+    # 3. Save Statistics to CSV
+    csv_path = os.path.join(
+        output_dir, 
+        f"Taylor_Stats_HadGEM3_member_bootstrap_vs_ERA5_{comp_type}_{strength_label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.csv"
+    )
+    df_stats.to_csv(csv_path, index=False)
+    print(f"  Saved member Taylor statistics to {csv_path}")
+    
+    # 4. Plot and Save Taylor Diagram SVG
+    svg_path = os.path.join(
+        output_dir, 
+        f"Taylor_HadGEM3_member_bootstrap_vs_ERA5_{comp_type}_{strength_label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.svg"
+    )
+    
+    try:
+        plot_taylor_diagram_from_stats(
+            stats_df=df_stats,
+            output_path=svg_path,
+            title=f"HadGEM3 Members vs ERA5 ({comp_type.upper()})",
+            reference_label="ERA5 Reanalysis",
+            sample_label="HadGEM3 Member",
+            min_corr=0.0,
+            min_std=0.0,
+            max_std=1.2,
+            sample_ms=3.5,
+            sample_alpha=0.85,
+            label_column="member"
+        )
+        print(f"  Saved member Taylor diagram to {svg_path}")
+    except Exception as e:
+        print(f"  Error plotting member Taylor diagram for {comp_type}: {e}")
 
 def composite_propagating_years_no_plot(
     AAM_da,
@@ -2175,8 +2569,12 @@ if __name__ == '__main__':
     ensemble_u_latlev = []
     ensemble_uv_vi_lat = []
     member_bootstrap_composites = []
+    member_bootstrap_lat_lev_composites = []
+    member_bootstrap_lat_lon_composites = []
     member_bootstrap_labels = []
     ensemble_composites_by_strength = {label: [] for label, _, _ in EVENT_STRENGTH_BINS}
+    ensemble_lat_lev_composites_by_strength = {label: [] for label, _, _ in EVENT_STRENGTH_BINS}
+    ensemble_lat_lon_composites_by_strength = {label: [] for label, _, _ in EVENT_STRENGTH_BINS}
     available_members = []
     # Collect onset dates across ensemble members for histogram plotting
     onset_dates = []
@@ -2282,22 +2680,97 @@ if __name__ == '__main__':
             # Accumulate per-strength active profiles as COUNTS, not OR operations
             strength_profiles = result.get('strength_active_profiles', {})
             strength_event_counts = result.get('strength_event_counts', {})
-            for strength_label, _, _ in EVENT_STRENGTH_BINS:
-                strength_profile = strength_profiles.get(strength_label, None)
-                if strength_profile is not None and np.any(strength_profile):
-                    active_profile_by_strength[strength_label] += np.asarray(strength_profile, dtype=int)
-                    active_event_count_by_strength[strength_label] += int(strength_event_counts.get(strength_label, 0))
-        
-        number_of_available_members = len(available_members)
 
-        if getattr(args, "member_bootstrap_taylor_vs_era5", False) and member_bootstrap_composites:
+            for strength_label, _, _ in EVENT_STRENGTH_BINS:
+
+                # Use the FULL key name: weak/moderate/strong
+                strength_profile = strength_profiles.get(strength_label, None)
+
+                latlev_strength = (
+                    result.get('lat_lev_composites_by_strength', {})
+                    .get(strength_label)
+                )
+
+                if latlev_strength is not None:
+                    ensemble_lat_lev_composites_by_strength[strength_label].append(
+                        latlev_strength
+                    )
+
+                latlon_strength = (
+                    result.get('lat_lon_composites_by_strength', {})
+                    .get(strength_label)
+                )
+
+                if latlon_strength is not None:
+                    ensemble_lat_lon_composites_by_strength[strength_label].append(
+                        latlon_strength
+                    )
+
+                if strength_profile is not None and np.any(strength_profile):
+                    active_profile_by_strength[strength_label] += np.asarray(
+                        strength_profile,
+                        dtype=int,
+                    )
+
+                    active_event_count_by_strength[strength_label] += int(
+                        strength_event_counts.get(strength_label, 0)
+                    )
+        
+        for lbl in ensemble_lat_lon_composites_by_strength:
+            print(
+                f"[DEBUG] {lbl}: "
+                f"{len(ensemble_lat_lon_composites_by_strength[lbl])} latlon members, "
+                f"{len(ensemble_lat_lev_composites_by_strength[lbl])} latlev members"
+            )
+        number_of_available_members = len(available_members)
+        print("number of weak events:", len(ensemble_lat_lev_composites_by_strength['weak']))
+
+        if getattr(args, "member_bootstrap_taylor_vs_era5", False):
+            for strength_label, _, _ in EVENT_STRENGTH_BINS:
+                print(f"\n=====================================================================")
+                print(f"[HOOK] FIRST LOOP HERE - Generating Spatial Per-Member Taylor Diagrams for {strength_label.upper()}...")
+                
+                era5_latlon_truth = _load_era5_composite_truth("latlon")
+                era5_latlev_truth = _load_era5_composite_truth("latlev")
+                
+                # 1. LAT-LON SPATIAL TAYLOR
+                latlon_list = ensemble_lat_lon_composites_by_strength[strength_label]
+                if len(latlon_list) > 0:
+                    compute_spatial_per_member_taylor(
+                        member_composites_list=latlon_list,
+                        era5_reference=era5_latlon_truth,
+                        comp_type="latlon",
+                        output_dir=ensemble_results_dir,
+                        strength_label=strength_label
+                    )
+                elif len(latlon_list) == 0:
+                    print(f"  [SKIP] No latlon member composites found for '{strength_label}'.")
+
+                # 2. LAT-LEV SPATIAL TAYLOR
+                latlev_list = ensemble_lat_lev_composites_by_strength[strength_label]
+                if len(latlev_list) > 0:
+                    compute_spatial_per_member_taylor(
+                        member_composites_list=latlev_list,
+                        era5_reference=era5_latlev_truth,
+                        comp_type="latlev",
+                        output_dir=ensemble_results_dir,
+                        strength_label=strength_label,
+                    )
+                elif len(latlev_list) == 0:
+                    print(f"  [SKIP] No latlev member composites found for '{strength_label}'.")
+                    
             member_bootstrap_stack = xr.concat(
                 member_bootstrap_composites,
-                dim=xr.IndexVariable("iteration", np.arange(len(member_bootstrap_composites))),
-            )
+                dim=xr.IndexVariable("iteration", np.arange(len(member_bootstrap_composites))))
             member_bootstrap_stack = member_bootstrap_stack.assign_coords(
                 member=("iteration", member_bootstrap_labels)
             )
+            
+            # svg_path = os.path.join(
+            #     ensemble_results_dir, 
+            #     f"Taylor_HadGEM3_member_bootstrap_vs_ERA5_new_{strength_label}_onset_{args.onset_season}_start_{args.composite_start}_region_{args.region}.svg"
+            # )
+            
             plot_member_bootstrap_taylor_vs_era5(
                 member_bootstrap_stack,
                 "aam",
@@ -2421,7 +2894,7 @@ if __name__ == '__main__':
                         100.0 * np.asarray(enso_active_profile_total, dtype=float) / float(enso_active_event_total)
                     ).astype(int)
 
-                significance_mask_aam, aam_save_path = compute_and_save_composite_significance(
+                significance_mask_aam, aam_save_path, _ = compute_and_save_composite_significance(
                     ens_stack=ens_stack,
                     composite_type='aam',
                     strength_label='all',
@@ -2622,10 +3095,24 @@ if __name__ == '__main__':
     
     if ensemble_lat_lev_composites:
         try:
+            print("\n[HOOK] Loading ERA5 truth for lat-lev Taylor...")
+            era5_latlev_truth = _load_era5_composite_truth("latlev")
+            
+            if era5_latlev_truth is not None:
+                compute_spatial_per_member_taylor(
+                    member_composites_list=ensemble_lat_lev_composites,
+                    era5_reference=era5_latlev_truth,
+                    comp_type="latlev",
+                    output_dir=ensemble_results_dir,
+                    strength_label="all"
+                )
+            
+            #import pdb; pdb.set_trace()
+            
             ens_stack = xr.concat(ensemble_lat_lev_composites, dim="ensemble")
-            ens_mean = ens_stack.mean("ensemble", skipna=True)
+            #ens_mean = ens_stack.mean("ensemble", skipna=True)
             if not replot:
-                sig_mask_latlev, _ = compute_and_save_composite_significance(
+                sig_mask_latlev, _, boot_mean_latlev = compute_and_save_composite_significance(
                     ens_stack=ens_stack,
                     composite_type='latlev',
                     strength_label='all',
@@ -2635,6 +3122,8 @@ if __name__ == '__main__':
                 )
             else:
                 sig_mask_latlev = significance_mask_latlev if 'significance_mask_latlev' in locals() else None
+                # If you want to use it in replot, make sure you loaded it above!
+                #boot_mean_latlev = loaded_latlev_results['bootstrap_samples'].mean('iteration') if loaded_latlev_results else ens_mean
 
             ens_mean_u_latlev = None
             if ensemble_u_latlev:
@@ -2643,14 +3132,16 @@ if __name__ == '__main__':
                 if "month" in ens_mean_u_latlev.coords and "time" not in ens_mean_u_latlev.coords:
                     ens_mean_u_latlev = ens_mean_u_latlev.rename({"month": "time"})
 
-            print(f"Plotting ENSEMBLE MEAN lat×level composite from {ens_stack.sizes['ensemble']} members...")
+            print(f"Plotting BOOTSTRAP COMPOSITE lat×level composite from {ens_stack.sizes['ensemble']} members...")
 
+            boot_mean_latlev = boot_mean_latlev.rename({"month": "time"}) if "month" in boot_mean_latlev.dims else boot_mean_latlev
+            
             plot_latitude_level_snapshots_HadGEN3(
-                ens_mean,
+                boot_mean_latlev,
                 zonal_wind_da=ens_mean_u_latlev,
                 p_values=None,
                 significance_mask=sig_mask_latlev,
-                ensemble_member="ENSEMBLE_MEAN",
+                ensemble_member="BOOTSTRAP_MEAN",
                 start_year=args.start_year,
                 end_year=args.end_year,
                 clim_start_yr=clim_start_yr,
@@ -2658,7 +3149,7 @@ if __name__ == '__main__':
                 output_dir=output_dir,
                 title_suffix= f"{number_of_available_members} BOOTSTRAP {region_label} | " + _snap_suffix,
                 rolling_period=int(args.rolling_period),
-                filename_suffix=f"_ensemble_mean_{args.enso_state}_{region_label.lower()}{reinitiation_suffix}",
+                filename_suffix=f"_bootstrap_composite_{args.enso_state}_{region_label.lower()}{reinitiation_suffix}",
                 dec_onset_month=args.composite_start,
                 onset_season_ndjfm=args.onset_season,
                 nino_threshold=float(ACTIVE_MONTH_EL_NINO_THRESHOLD),
@@ -2668,11 +3159,11 @@ if __name__ == '__main__':
                 # Output the ensemble mean composite data as netCDF for future analysis
                 out_nc_path = os.path.join(
                     ensemble_mean_output_path,
-                    f"AAM_lat_lev_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_region_{args.region}{reinitiation_suffix}.nc",
+                    f"AAM_lat_lev_composite_BOOTSTRAP_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_region_{args.region}{reinitiation_suffix}.nc",
                 )
-                ens_mean.name = "AAMA"
-                ens_mean.attrs["n_ensemble_members"] = int(ens_stack.sizes["ensemble"])
-                ens_mean.to_netcdf(out_nc_path)
+                boot_mean_latlev.name = "AAMA"
+                boot_mean_latlev.attrs["n_ensemble_members"] = int(ens_stack.sizes["ensemble"])
+                boot_mean_latlev.to_netcdf(out_nc_path)
                 print(f"Ensemble mean composite data saved to {out_nc_path}")
 
                 out_nc_path = os.path.join(
@@ -2695,11 +3186,21 @@ if __name__ == '__main__':
     # %%
     if ensemble_lat_lon_composites:
         try:
+            print("\n[HOOK] Loading ERA5 truth for lat-lon Taylor...")
+            era5_latlon_truth = _load_era5_composite_truth("latlon")
+            if era5_latlon_truth is not None:
+                compute_spatial_per_member_taylor(
+                    member_composites_list=ensemble_lat_lon_composites,
+                    era5_reference=era5_latlon_truth,
+                    comp_type="latlon",
+                    output_dir=ensemble_results_dir,
+                    strength_label="all"
+                )
             ens_stack = xr.concat(ensemble_lat_lon_composites, dim="ensemble")
-            ens_mean = ens_stack.mean("ensemble", skipna=True)
+            #ens_mean = ens_stack.mean("ensemble", skipna=True)
             
             if not replot:
-                sig_mask_latlon, _ = compute_and_save_composite_significance(
+                sig_mask_latlon, _, boot_mean_latlon = compute_and_save_composite_significance(
                     ens_stack=ens_stack,
                     composite_type='latlon',
                     strength_label='all',
@@ -2737,60 +3238,73 @@ if __name__ == '__main__':
             
             # Normalize dimension names (region selection was already applied in _process_single_ensemble_member)
             # Rename longitude → lon
-            if 'longitude' in ens_mean.dims:
-                ens_mean = ens_mean.rename({'longitude': 'lon'})
+            if 'longitude' in boot_mean_latlon.dims:
+                boot_mean_latlon = boot_mean_latlon.rename({'longitude': 'lon'})
             if ens_mean_u_latlon is not None and 'longitude' in ens_mean_u_latlon.dims:
                 ens_mean_u_latlon = ens_mean_u_latlon.rename({'longitude': 'lon'})
             if ens_mean_uv_latlev is not None and 'longitude' in ens_mean_uv_latlev.dims:
                 ens_mean_uv_latlev = ens_mean_uv_latlev.rename({'longitude': 'lon'})
             
             # Rename latitude → lat
-            if 'latitude' in ens_mean.dims:
-                ens_mean = ens_mean.rename({'latitude': 'lat'})
+            if 'latitude' in boot_mean_latlon.dims:
+                boot_mean_latlon = boot_mean_latlon.rename({'latitude': 'lat'})
             if ens_mean_u_latlon is not None and 'latitude' in ens_mean_u_latlon.dims:
                 ens_mean_u_latlon = ens_mean_u_latlon.rename({'latitude': 'lat'})
             if ens_mean_uv_latlev is not None and 'latitude' in ens_mean_uv_latlev.dims:
                 ens_mean_uv_latlev = ens_mean_uv_latlev.rename({'latitude': 'lat'})
             
             # Force region selection immediately before plotting to guarantee slice correctness.
-            if args.region != 'all' and 'lon' in ens_mean.dims:
-                ens_mean = _select_region(ens_mean, args.region)
+            if args.region != 'all' and 'lon' in boot_mean_latlon.dims:
+                boot_mean_latlon = _select_region(boot_mean_latlon, args.region)
                 if ens_mean_u_latlon is not None and 'lon' in ens_mean_u_latlon.dims:
                     ens_mean_u_latlon = _select_region(ens_mean_u_latlon, args.region)
                 if ens_mean_uv_latlev is not None and 'lon' in ens_mean_uv_latlev.dims:
                     ens_mean_uv_latlev = _select_region(ens_mean_uv_latlev, args.region)
 
-                lon_actual_min = float(ens_mean['lon'].values.min())
-                lon_actual_max = float(ens_mean['lon'].values.max())
-                n_lon_actual = int(ens_mean.sizes['lon'])
+                lon_actual_min = float(boot_mean_latlon['lon'].values.min())
+                lon_actual_max = float(boot_mean_latlon['lon'].values.max())
+                n_lon_actual = int(boot_mean_latlon.sizes['lon'])
                 print(f"\n[REGION DEBUG] Region requested: {args.region}")
                 print(f"[REGION DEBUG] Final plot slice lon range [{lon_actual_min:.1f}, {lon_actual_max:.1f}], n_lon={n_lon_actual}")
 
             print(f"\n[PRE-PLOT CHECK] About to plot lat×lon composite:")
-            print(f"  ens_mean shape: {ens_mean.shape}")
-            print(f"  ens_mean lon range: [{float(ens_mean['lon'].values.min()):.1f}, {float(ens_mean['lon'].values.max()):.1f}]")
-            print(f"  ens_mean lat range: [{float(ens_mean['lat'].values.min()):.1f}, {float(ens_mean['lat'].values.max()):.1f}]")
-            print(f"  ens_mean_u_latlon shape: {None if ens_mean_u_latlon is None else ens_mean_u_latlon.shape}")
-            print(f"  ens_mean_uv_latlev shape: {None if ens_mean_uv_latlev is None else ens_mean_uv_latlev.shape}")
+            # print(f"  bootstrap shape: {boot_mean_latlon.shape}")
+            # print(f"  bootstrap lon range: [{float(boot_mean_latlon['lon'].values.min()):.1f}, {float(boot_mean_latlon['lon'].values.max()):.1f}]")
+            # print(f"  bootstrap lat range: [{float(boot_mean_latlon['lat'].values.min()):.1f}, {float(boot_mean_latlon['lat'].values.max()):.1f}]")
+            # print(f"  ens_mean_u_latlon shape: {None if ens_mean_u_latlon is None else ens_mean_u_latlon.shape}")
+            # print(f"  ens_mean_uv_latlev shape: {None if ens_mean_uv_latlev is None else ens_mean_uv_latlev.shape}")
             print(f"  Passing region='{args.region}' to plot_lat_lon_snapshots()")
-
+            
+            boot_mean_latlon = boot_mean_latlon.rename({"month": "time"}) if "month" in boot_mean_latlon.dims else boot_mean_latlon
+            
             print(f"Plotting ENSEMBLE MEAN lat×lon composite from {ens_stack.sizes['ensemble']} members...")
             
+            # --- Slice both AAM and U arrays to -60 to 60 latitude ---
+            # Check if latitude goes north-to-south or south-to-north to prevent empty slices
+            if boot_mean_latlon.latitude[0] > boot_mean_latlon.latitude[-1]:
+                lat_slice = slice(60, -60)
+            else:
+                lat_slice = slice(-60, 60)
+                
+            boot_mean_latlon = boot_mean_latlon.sel(latitude=lat_slice)
+            if ens_mean_u_latlon is not None:
+                ens_mean_u_latlon = ens_mean_u_latlon.sel(latitude=lat_slice)
+            
             plot_lat_lon_snapshots(
-                ens_mean,
+                boot_mean_latlon,
                 zonal_wind_da=ens_mean_u_latlon,
                 uv_latlev_profile=ens_mean_uv_latlev,
                 p_values=None,
                 significance_mask=sig_mask_latlon,
                 output_dir=output_dir,
-                ensemble_member="ENSEMBLE_MEAN",
+                ensemble_member="BOOTSTRAP_MEAN",
                 start_year=args.start_year,
                 end_year=args.end_year,
                 clim_start_yr=clim_start_yr,
                 clim_end_yr=clim_end_yr,
                 title_suffix=f"{number_of_available_members} BOOTSTRAP {region_label} | " + _snap_suffix,
                 rolling_period=int(args.rolling_period),
-                filename_suffix=f"_ensemble_mean_{args.enso_state}_{region_label.lower()}{reinitiation_suffix}",
+                filename_suffix=f"_bootstrap_composite_{args.enso_state}_{region_label.lower()}_start_{args.composite_start}",
                 pmin=float(args.p_min),
                 pmax=float(args.p_max),
                 nino_threshold=float(ACTIVE_MONTH_EL_NINO_THRESHOLD),
@@ -2802,9 +3316,9 @@ if __name__ == '__main__':
                 ensemble_mean_output_path,
                 f"AAM_lat_lon_composite_ENSEMBLE_MEAN_{args.enso_state}_state_{args.start_year}-{args.end_year}_{args.p_min}-{args.p_max}hPa_{args.onset_season}_start_{args.composite_start}_region_{args.region}{reinitiation_suffix}.nc",
                 )
-                ens_mean.name = "AAMA"
-                ens_mean.attrs["n_ensemble_members"] = int(ens_stack.sizes["ensemble"])
-                ens_mean.to_netcdf(out_nc_path)
+                boot_mean_latlon.name = "AAMA"
+                boot_mean_latlon.attrs["n_ensemble_members"] = int(ens_stack.sizes["ensemble"])
+                boot_mean_latlon.to_netcdf(out_nc_path)
                 print(f"Ensemble mean composite data saved to {out_nc_path}")
 
                 out_nc_path = os.path.join(
@@ -2837,6 +3351,40 @@ if __name__ == '__main__':
     }
     strength_outputs_found = False
     for strength_label, _, _ in EVENT_STRENGTH_BINS:
+        print(f"\n  SECOND LOOP HERE --- Processing Spatial Taylor for strength: {strength_label.upper()} ---")
+        # Load the specific ERA5 truth for this strength bin
+        era5_latlon_truth = _load_era5_composite_truth("latlon")
+        era5_latlev_truth = _load_era5_composite_truth("latlev")
+
+        # Get the populated list from your new dictionary
+        latlon_list = ensemble_lat_lon_composites_by_strength[strength_label]
+        latlev_list = ensemble_lat_lev_composites_by_strength[strength_label]
+        
+        # Compute LatLon if data exists
+        if era5_latlon_truth is not None and len(latlon_list) > 0:
+            compute_spatial_per_member_taylor(
+                member_composites_list=latlon_list,
+                era5_reference=era5_latlon_truth,
+                comp_type="latlon",
+                output_dir=output_dir,
+                strength_label=strength_label
+            )
+        elif len(latlon_list) == 0:
+            print(f"  [SKIP] No latlon member composites found for '{strength_label}'.")
+
+        # Compute LatLev if data exists
+        if era5_latlev_truth is not None and len(latlev_list) > 0:
+            compute_spatial_per_member_taylor(
+                member_composites_list=latlev_list,
+                era5_reference=era5_latlev_truth,
+                comp_type="latlev",
+                output_dir=output_dir,
+                strength_label=strength_label
+            )
+        elif len(latlev_list) == 0:
+            print(f"  [SKIP] No latlev member composites found for '{strength_label}'.")
+    
+        
         strength_composites = ensemble_composites_by_strength.get(strength_label, [])
         if not strength_composites:
             continue

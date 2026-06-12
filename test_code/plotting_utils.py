@@ -548,6 +548,12 @@ region: str = "all",
         anomalies = anomalies.rename({lat_dim: "latitude", lon_dim: "longitude"})
         lat_dim, lon_dim = "latitude", "longitude"
 
+    # Crop the data to 60N - 60S so Matplotlib doesn't even try to draw the poles
+    if anomalies["latitude"].values[0] > anomalies["latitude"].values[-1]:
+        anomalies = anomalies.sel(latitude=slice(60, -60))
+    else:
+        anomalies = anomalies.sel(latitude=slice(-60, 60))
+        
     lat_vals = anomalies["latitude"].values
     lon_vals = anomalies["longitude"].values
     time_vals = anomalies["time"].values
@@ -652,7 +658,8 @@ region: str = "all",
         if data_values.shape != (len(lat_vals), len(lon_vals)) and data_values.T.shape == (len(lat_vals), len(lon_vals)):
             data_values = data_values.T
 
-        im = ax.contourf(lon_vals, lat_vals, data_values, levels=levels, cmap=cmap_name, extend="both", transform=data_crs)
+        im = ax.contourf(lon_vals, lat_vals, data_values, levels=levels, 
+                         cmap=cmap_name, extend="both", transform=data_crs)
         
         # -------------------------------
         # SIGNIFICANCE HATCHING (IPCC STYLE)
@@ -726,7 +733,7 @@ region: str = "all",
                 hatches=['/'],  # Dense hatches
                 colors='none',     # No background fill
                 zorder=10,
-                transform=ccrs.PlateCarree() # Ensure transform is included for Cartopy
+                transform=ccrs.PlateCarree()# Ensure transform is included for Cartopy
             )
 
             # Style the hatches and remove the contour boundaries
@@ -895,15 +902,16 @@ region: str = "all",
         file_suffix += "_onset_season_all"
         
     nino_thres_tag = "nino_thres" + str(float(nino_threshold)) if nino_threshold is not None else ""
-
+    
     # Compose filename including region explicitly and ensure output directory exists
     fname = (
-        f'AAM_anomalies_lat_lon_snapshots_{ensemble_member}_{start_year}-{end_year}_{pmin:.1f}-{pmax:.1f}hPa_{region}{rolling_tag}_{nino_thres_tag}{file_suffix}.svg'
+        f'AAM_anomalies_lat_lon_snapshots_{ensemble_member}_{start_year}-{end_year}_{pmin:.1f}-{pmax:.1f}hPa_{region}{rolling_tag}_{nino_thres_tag}{file_suffix}.png'
     )
+    
     output_path = Path(output_dir) / fname
     ensure_dir(output_path.parent)
     plt.tight_layout(rect=[0, 0.04, 1, 0.97])  # Leave space for colorbar at bottom and title at top
-    plt.savefig(output_path, format = "svg", bbox_inches="tight")
+    plt.savefig(output_path, dpi=400, bbox_inches="tight")
     print(f"Lat-lon snapshot figure saved to: {output_path}")
     print(f"Lat-lon snapshot figure saved to: {output_path}")
     plt.close(fig)
@@ -1534,9 +1542,9 @@ def plot_latitude_level_snapshots_HadGEN3(
     nino_thres_tag = "nino_thres" + str(float(nino_threshold)) if nino_threshold is not None else ""
 
     output_file = (
-        f'{output_dir}AAM_anomalies_lat_level_snapshots_{ensemble_member}_{start_year}-{end_year}{rolling_tag}_{nino_thres_tag}{file_suffix}.svg'
+        f'{output_dir}AAM_anomalies_lat_level_snapshots_{ensemble_member}_{start_year}-{end_year}{rolling_tag}_{nino_thres_tag}{file_suffix}.png'
     )
-    plt.savefig(output_file, format="svg", bbox_inches='tight')
+    plt.savefig(output_file, dpi=400, bbox_inches='tight')
     print(f"Snapshot figure saved to: {output_file}")
     plt.close()
 
@@ -2068,6 +2076,7 @@ def plot_lat_time_postage_stamp_all_members(
     enso_state: str = "el_nino",
     nino_threshold: float = 0.5,
     title_suffix: str = "",
+    member_pvals: dict | None = None,  # Added to accept per-member or ensemble p-values
 ) -> None:
     """Create a postage stamp grid of lat×time composites for all ensemble members.
     
@@ -2077,6 +2086,9 @@ def plot_lat_time_postage_stamp_all_members(
         Each composite_da has dims (lat, time/month) or (time/month, lat)
     output_dir : str | Path
         Directory to save the figure
+    member_pvals : dict or xr.DataArray, optional
+        A dictionary mapping member_name -> p_value_da, or a single shared xr.DataArray 
+        representing the ensemble mean p-values to overlay across all plots.
     """
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
@@ -2085,6 +2097,7 @@ def plot_lat_time_postage_stamp_all_members(
     import numpy as np
     from pathlib import Path
     import math
+    import xarray as xr
     
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2149,6 +2162,40 @@ def plot_lat_time_postage_stamp_all_members(
             data_vals = data_vals.T
             
         cf = ax.contourf(time_vals, lat_vals, data_vals, levels=levels, cmap="RdBu_r", extend="both")
+        
+        # --- APPLICATION OF SIGNIFICANCE HATCHING ---
+        p_da = None
+        if isinstance(member_pvals, dict) and member_name in member_pvals:
+            p_da = member_pvals[member_name]
+        elif isinstance(member_pvals, xr.DataArray):
+            p_da = member_pvals
+            
+        if p_da is not None:
+            if "latitude" in p_da.dims and "lat" not in p_da.dims:
+                p_da = p_da.rename({"latitude": "lat"})
+            
+            p_vals = p_da.values
+            if p_da.dims[0] == time_dim:
+                p_vals = p_vals.T
+                
+            # Create the insignificance mask (1 where p >= 0.05, 0 where significant)
+            insig = np.where(p_vals >= 0.05, 1.0, 0.0)
+            
+            # Plot the hatching for non-significant areas
+            hatches = ax.contourf(
+                time_vals, lat_vals, insig, 
+                levels=[0.5, 1.5], 
+                colors="none", 
+                hatches=["//"]
+            )
+            
+            # Apply style and cleanup logic (set linewidth to 0.4 to prevent it vanishing)
+            for collection in getattr(hatches, "collections", []):
+                collection.set_facecolor("none")
+                collection.set_edgecolor((0.4, 0.4, 0.4, 0.35))
+                collection.set_linewidth(0.4)
+        # ---------------------------------------------
+
         ax.set_ylabel("Latitude (°N)", fontsize=8)
         
         if row == n_rows - 1 or idx >= n_members - n_cols:
@@ -2163,7 +2210,7 @@ def plot_lat_time_postage_stamp_all_members(
         
         # Grid and equator
         ax.grid(axis='x', alpha=0.3, linestyle='--')
-        ax.axhline(0, color='black', lw=0.8, ls='--', alpha=0.6)
+        ax.axhline(0, color='black', lw=1, ls='-', alpha=0.8)
         
         ax.set_title(member_name, fontsize=9, fontweight="bold")
         ax.tick_params(labelsize=8)
@@ -2203,7 +2250,7 @@ def plot_lat_time_postage_stamp_all_members(
     fig.tight_layout(rect=[0, 0.05, 1, 0.94])
     
     out_path = output_dir / f"postage_stamp_lat_time_ensemble_{enso_state}_{region_label.lower()}_{n_members}members.svg"
-    fig.savefig(out_path, format="svg", bbox_inches="tight")
+    fig.savefig(out_path, format="svg", dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Lat×time evolution postage stamp saved to {out_path}")
 
@@ -2377,8 +2424,8 @@ def plot_lat_lon_monthly_stamps_10col(
         )
         fig.tight_layout(rect=[0, 0.05, 1, 0.95])
         
-        out_path = output_dir / f"postage_stamp_lat_lon_month{month_idx+1:02d}_{region_label.lower()}_{enso_state}.svg"
-        fig.savefig(out_path, format="svg", bbox_inches="tight")
+        out_path = output_dir / f"postage_stamp_lat_lon_month{month_idx+1:02d}_{region_label.lower()}_{enso_state}.png"
+        fig.savefig(out_path, dpi=400, bbox_inches="tight")
         plt.close(fig)
         print(f"Month {month_idx+1:02d} lat×lon stamps saved to {out_path}")
 
